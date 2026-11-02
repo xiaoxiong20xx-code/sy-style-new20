@@ -1,0 +1,586 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>26 立体书 · Pop-up Book</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 26 立体书 · POP-UP BOOK =====
+   A cloth-bound picture book on a walnut desk under a warm desk lamp. Everything is ray traced analytically in cm:
+   the two halves of the book (board + page block, the left half hinging on the spine), die-cut card layers standing on
+   the spread (printed illustration + alpha cut-out from an atlas painted in setup, white card core along the cut,
+   plain paper backs, translucency), soft lamp shadows from an area light, contact shadows at every fold, depth of field.
+   0.3 the cover swings open · layers rise one by one on the half-beats (sky, castle, forest, trees, deer, ferns) ·
+   4.5 the camera drops to paper height and flies through the gaps of the forest to the castle · back out, a pull-tab
+   slides and the title banner stands up. */
+const { E, clamp, lerp, inv } = Reel;
+// ★ 改光色改这里：着色器里的 LIGHT_COL（搜 LIGHT_COL）。它乘在台灯（照到书、卡片、桌面的漫反射、高光、透光）上。
+//   vec3(1.) = 原样（和成片一模一样）；偏冷例如 vec3(.8, .95, 1.3)，更暖例如 vec3(1., .9, .75)；冷色补光在 shadeAt() 末尾，窗灯是城堡自己的灯。只想换物体/纸/颜料的颜色是“配色”，不是光，见 SKILL 的对照表。
+const stage = Reel.makeStage('#0a0806');
+const C = Reel.cfg({ tab: 'PULL' });
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+Reel.ownJitter = true;
+const SERIF = '"Noto Serif CJK SC"', SANS = '"Noto Sans CJK SC"';
+const R = Reel.rng(2626), rr = (a, b) => a + (b - a) * R();
+
+// ================= atlas: every printed surface =================
+const AW = 4096, AH = 6144, PX = 56;                      // atlas px per cm (cards); spread / cover use their own scale
+const atlas = document.createElement('canvas'); atlas.width = AW; atlas.height = AH;
+const ag = atlas.getContext('2d', { willReadFrequently: true });
+const SHELVES = [];
+function region(wcm, hcm, ppc = PX) {        // first-fit shelf packing
+  const w = Math.ceil(wcm * ppc) + 8, h = Math.ceil(hcm * ppc) + 8;
+  let sh = SHELVES.find((q) => q.x + w <= AW && h <= q.h);
+  if (!sh) { const y = SHELVES.reduce((a, q) => Math.max(a, q.y + q.h), 0); sh = { x: 0, y, h }; SHELVES.push(sh); if (y + h > AH) console.error('atlas overflow'); }
+  const r = { x: sh.x + 4, y: sh.y + 4, w: w - 8, h: h - 8, ppc, wcm, hcm };
+  sh.x += w;
+  return r;
+}
+// draw helper in card space: origin at bottom-centre, x right (cm), y up (cm)
+function paint(r, fn) {
+  ag.save(); ag.beginPath(); ag.rect(r.x, r.y, r.w, r.h); ag.clip();
+  ag.translate(r.x + r.w / 2, r.y + r.h); ag.scale(r.ppc, -r.ppc);
+  fn(ag); ag.restore();
+}
+const P = (g, pts) => { g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); };
+function grain(g, x0, y0, x1, y1, n, cols, rmax = 0.06) { for (let i = 0; i < n; i++) { g.fillStyle = cols[i % cols.length]; g.beginPath(); g.arc(rr(x0, x1), rr(y0, y1), rr(0.01, rmax), 0, 6.283); g.fill(); } }
+function pine(g, x, y, h, w, col, hi) {
+  // layered picture-book pine: drooping tiers, a lighter rim on the lamp side
+  const tiers = 4 + Math.floor(h / 4);
+  g.fillStyle = '#3b2a1e'; g.fillRect(x - w * 0.06, y, w * 0.12, h * 0.15);
+  for (let i = 0; i < tiers; i++) {
+    const k = i / tiers, ty = y + h * (0.12 + k * 0.8), tw = w * (1 - k * 0.78) * 0.5, th = h * 0.26;
+    g.fillStyle = col; g.beginPath(); g.moveTo(x - tw, ty); g.quadraticCurveTo(x - tw * 0.4, ty + th * 0.25, x, ty + th); g.quadraticCurveTo(x + tw * 0.4, ty + th * 0.25, x + tw, ty);
+    g.quadraticCurveTo(x + tw * 0.5, ty - th * 0.12, x + tw * 0.2, ty + th * 0.05); g.quadraticCurveTo(x, ty - th * 0.1, x - tw * 0.2, ty + th * 0.05); g.quadraticCurveTo(x - tw * 0.5, ty - th * 0.12, x - tw, ty); g.fill();
+    g.strokeStyle = hi; g.lineWidth = w * 0.035; g.beginPath(); g.moveTo(x - tw * 0.92, ty + th * 0.03); g.quadraticCurveTo(x - tw * 0.4, ty + th * 0.28, x - tw * 0.05, ty + th * 0.85); g.stroke();
+  }
+}
+const CARD = {};
+const WINS = [[-5.2, 9.5], [-1.5, 8], [0, 9.3], [3, 8.8], [-5.2, 8], [1.5, 8], [5.4, 9.2], [-2.6, 9], [0, 11]];   // castle windows, in the order they light   // name -> { r: atlas rect, w, h (cm) }
+function buildAtlas() {
+  ag.clearRect(0, 0, AW, AH);
+  // ---------- spread (both pages), printed ground ----------
+  const SP = region(57, 23, 50); CARD.spread = SP;
+  paint(SP, (g) => {
+    g.translate(0, 0);
+    const gr = g.createLinearGradient(0, 0, 0, 23); gr.addColorStop(0, '#26453a'); gr.addColorStop(1, '#1b3047');
+    g.fillStyle = gr; g.fillRect(-29, 0, 58, 23);
+    // the winding path to the castle (y = 0 is the reader's edge, 23 the far edge)
+    g.fillStyle = '#c9b48a';
+    g.beginPath(); g.moveTo(-3.2, 0); g.bezierCurveTo(-3.5, 6, 2.5, 9, 1.2, 14); g.bezierCurveTo(0.4, 17, -0.6, 19, -0.4, 21); g.lineTo(0.6, 21); g.bezierCurveTo(0.6, 19, 1.8, 17, 2.6, 14); g.bezierCurveTo(4.4, 8.5, -1.4, 6, 3.2, 0); g.closePath(); g.fill();
+    g.fillStyle = 'rgba(120,96,64,.45)'; for (let i = 0; i < 70; i++) { g.beginPath(); g.arc(rr(-3, 3), rr(0, 14), rr(0.04, 0.14), 0, 6.3); g.fill(); }
+    // grass tufts, flowers
+    for (let i = 0; i < 520; i++) {
+      const x = rr(-28, 28), y = rr(0.3, 22.5); if (Math.abs(x - (y < 14 ? Math.sin(y * 0.3) * 1.2 : 1)) < 3.4) continue;
+      g.strokeStyle = R() < 0.5 ? '#3f6b4c' : '#2e5640'; g.lineWidth = 0.05; g.beginPath(); g.moveTo(x, y); g.lineTo(x + rr(-0.2, 0.2), y + rr(0.3, 0.7)); g.stroke();
+    }
+    for (let i = 0; i < 90; i++) { const x = rr(-27, 27), y = rr(0.5, 18); if (Math.abs(x) < 4) continue; g.fillStyle = ['#f3e6c4', '#f2b8c6', '#ffd56b', '#bcd6ff'][i % 4]; g.beginPath(); g.arc(x, y, rr(0.07, 0.16), 0, 6.3); g.fill(); }
+    // the slot the pull-tab strip runs through
+    g.fillStyle = '#1a140e'; g.fillRect(-1.35, 2.02, 2.7, 0.14);
+    // a little pond on the left page
+    g.fillStyle = '#2c4f7a'; g.beginPath(); g.ellipse(-16, 9, 4.2, 1.6, 0.1, 0, 6.3); g.fill();
+    g.strokeStyle = '#9fc2f0'; g.lineWidth = 0.08; g.beginPath(); g.ellipse(-16.4, 9.3, 2.6, 0.7, 0.1, 3.5, 5.8); g.stroke();
+    // credit, printed small at the corner of the right page
+    grain(g, -28.5, 0, 28.5, 23, 2600, ['rgba(255,255,255,.035)', 'rgba(0,0,0,.05)'], 0.05);
+  });
+  // ---------- cover (navy cloth, gold foil moon + stars + border) ----------
+  const CV = region(28.6, 23.2, 40); CARD.cover = CV;
+  paint(CV, (g) => {
+    g.fillStyle = '#1d2c55'; g.fillRect(-15, 0, 30, 24);
+    g.strokeStyle = '#d9b45a'; g.lineWidth = 0.18; g.strokeRect(-12.8, 1.4, 25.6, 20.4); g.lineWidth = 0.06; g.strokeRect(-12.3, 1.9, 24.6, 19.4);
+    g.fillStyle = '#d9b45a'; g.beginPath(); g.arc(0, 13.5, 4.2, 0, 6.3); g.fill();
+    g.fillStyle = '#1d2c55'; g.beginPath(); g.arc(1.6, 14.4, 3.7, 0, 6.3); g.fill();
+    for (let i = 0; i < 14; i++) { const x = rr(-11, 11), y = rr(3, 20), s = rr(0.15, 0.4); g.fillStyle = '#d9b45a'; g.beginPath(); for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4, rad = k % 2 ? s * 0.35 : s; g.lineTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad); } g.closePath(); g.fill(); }
+    for (let i = 0; i < 4; i++) pineGold(g, -6 + i * 4, 3.2, 3 + (i % 2) * 1.4);
+  });
+  function pineGold(g, x, y, h) { g.fillStyle = '#d9b45a'; g.beginPath(); g.moveTo(x, y + h); g.lineTo(x - h * 0.32, y); g.lineTo(x + h * 0.32, y); g.closePath(); g.fill(); }
+  // ---------- L0 night sky backdrop with a moon ----------
+  const L0 = region(50, 21); CARD.L0 = L0;
+  paint(L0, (g) => {
+    const top = []; for (let i = 0; i <= 40; i++) { const x = -25 + i * 1.25; top.push([x, 15.5 + Math.sin(i * 0.7) * 0.8 + Math.sin(i * 0.23 + 1) * 1.6]); }
+    g.beginPath(); g.moveTo(-25, 0); top.forEach(([x, y]) => g.lineTo(x, y)); g.lineTo(25, 0); g.closePath();
+    const gr = g.createLinearGradient(0, 0, 0, 20); gr.addColorStop(0, '#2b3a6e'); gr.addColorStop(0.6, '#1c2552'); gr.addColorStop(1, '#141a3e');
+    g.fillStyle = gr; g.fill();
+    // stars
+    for (let i = 0; i < 160; i++) { const x = rr(-24.5, 24.5), y = rr(4, 16); g.fillStyle = `rgba(255,244,214,${rr(0.4, 1)})`; g.beginPath(); g.arc(x, y, rr(0.03, 0.09), 0, 6.3); g.fill(); }
+    for (let i = 0; i < 12; i++) { const x = rr(-23, 10), y = rr(8, 15), s = rr(0.2, 0.45); g.fillStyle = '#ffeec2'; g.beginPath(); for (let k = 0; k < 8; k++) { const a = k * Math.PI / 4, rad = k % 2 ? s * 0.22 : s; g.lineTo(x + Math.cos(a) * rad, y + Math.sin(a) * rad); } g.closePath(); g.fill(); }
+
+    // far hills printed at the bottom
+    g.fillStyle = '#22406a'; g.beginPath(); g.moveTo(-25, 0); for (let i = 0; i <= 25; i++) g.lineTo(-25 + i * 2, 4 + Math.sin(i * 0.9) * 1.2 + Math.sin(i * 0.31) * 1.5); g.lineTo(25, 0); g.fill();
+    // clouds
+    g.strokeStyle = 'rgba(190,200,240,.45)'; g.lineWidth = 0.35; g.lineCap = 'round';
+    for (let i = 0; i < 6; i++) { const x = rr(-22, 18), y = rr(9, 14); g.beginPath(); g.moveTo(x, y); g.bezierCurveTo(x + 1.5, y + 0.6, x + 3, y - 0.3, x + 4.5, y + 0.2); g.stroke(); }
+  });
+  // ---------- the moon: its own round card on a slider behind the sky (the pull-tab raises it) ----------
+  const MO = region(9.6, 9.6); CARD.MO = MO;
+  paint(MO, (g) => {
+    g.fillStyle = '#e9d39a'; g.beginPath(); g.arc(0, 4.8, 4.7, 0, 6.3); g.fill();
+    const mg = g.createRadialGradient(-0.9, 5.8, 0.5, 0, 4.8, 4.7); mg.addColorStop(0, '#fff6d8'); mg.addColorStop(1, '#efd897');
+    g.fillStyle = mg; g.beginPath(); g.arc(0, 4.8, 4.35, 0, 6.3); g.fill();
+    g.fillStyle = 'rgba(200,170,110,.35)'; [[-1.3, 6.2, 0.8], [1.3, 4.0, 0.6], [0.1, 2.8, 0.45], [-1.7, 3.8, 0.35]].forEach(([x, y, r]) => { g.beginPath(); g.arc(x, y, r, 0, 6.3); g.fill(); });
+  });
+  // ---------- L1 hill + castle ----------
+  const L1 = region(44, 17); CARD.L1 = L1;
+  paint(L1, (g) => {
+    // hill
+    g.fillStyle = '#2d5a4c'; g.beginPath(); g.moveTo(-22, 0); g.bezierCurveTo(-16, 3.5, -9, 6.3, 0, 6.6); g.bezierCurveTo(9, 6.3, 16, 3.5, 22, 0); g.closePath(); g.fill();
+    g.fillStyle = '#3f735c'; g.beginPath(); g.moveTo(-22, 0); g.bezierCurveTo(-16, 3.3, -9, 6, -1, 6.3); g.bezierCurveTo(-8, 5, -14, 2.5, -18, 0); g.closePath(); g.fill();
+    // castle
+    const stone = '#a9a5c6', dark = '#7c7aa3', roof = '#c2473a', roofD = '#8e2f2a';
+    const tower = (x, w, h, rh) => {
+      g.fillStyle = stone; g.fillRect(x - w / 2, 6, w, h - 6);
+      g.fillStyle = dark; g.fillRect(x + w * 0.18, 6, w * 0.32, h - 6);
+      for (let i = 0; i < 4; i++) { g.fillStyle = stone; g.fillRect(x - w / 2 + i * w / 3.5, h, w / 7, 0.45); }
+      g.fillStyle = roof; g.beginPath(); g.moveTo(x - w * 0.62, h + 0.35); g.lineTo(x, h + rh); g.lineTo(x + w * 0.62, h + 0.35); g.closePath(); g.fill();
+      g.fillStyle = roofD; g.beginPath(); g.moveTo(x, h + rh); g.lineTo(x + w * 0.62, h + 0.35); g.lineTo(x + w * 0.15, h + 0.35); g.closePath(); g.fill();
+      g.strokeStyle = '#4a4a5e'; g.lineWidth = 0.06; g.beginPath(); g.moveTo(x, h + rh); g.lineTo(x, h + rh + 1.1); g.stroke();
+      g.fillStyle = '#ffd36b'; g.beginPath(); g.moveTo(x, h + rh + 1.1); g.lineTo(x + 0.8, h + rh + 0.85); g.lineTo(x, h + rh + 0.6); g.fill();
+    };
+    g.fillStyle = stone; g.fillRect(-4.5, 6, 9, 4.6);
+    for (let i = 0; i < 7; i++) g.fillRect(-4.5 + i * 1.35, 10.6, 0.7, 0.5);
+    tower(-5.2, 2.3, 12.2, 3.0); tower(5.4, 2.1, 11.6, 2.8); tower(0, 2.8, 13.2, 3.4); tower(-2.6, 1.5, 10.6, 2.0); tower(3.0, 1.5, 10.4, 1.9);
+    // windows: printed dark; a second sheet (CARD.LW) holds the light that shines through them, one window at a time
+    g.fillStyle = '#2a2c4e';
+    WINS.forEach(([x, y]) => { g.beginPath(); g.moveTo(x - 0.25, y - 0.45); g.lineTo(x - 0.25, y + 0.15); g.arc(x, y + 0.15, 0.25, Math.PI, 0, true); g.lineTo(x + 0.25, y - 0.45); g.closePath(); g.fill(); });
+    g.fillStyle = '#3a2a24'; g.beginPath(); g.moveTo(-0.8, 6); g.lineTo(-0.8, 7.4); g.arc(0, 7.4, 0.8, Math.PI, 0, true); g.lineTo(0.8, 6); g.fill();
+    // bricks hint
+    g.strokeStyle = 'rgba(70,66,100,.35)'; g.lineWidth = 0.035;
+    for (let y = 6.5; y < 10.5; y += 0.6) { g.beginPath(); g.moveTo(-4.4, y); g.lineTo(4.4, y); g.stroke(); }
+    // small trees on the hill
+    for (const x of [-15, -12.5, -10, 10.5, 13, 16]) pine(g, x, Math.max(0, 6.3 - Math.abs(x) * 0.3) - 0.3, rr(2.6, 3.6), rr(1.4, 1.8), '#24493f', '#3f7563');
+  });
+  // ---------- L2 mid forest with a gap for the path ----------
+  const L2 = region(52, 13); CARD.L2 = L2;
+  paint(L2, (g) => {
+    const xs = []; for (let x = -25.5; x <= 25.5; x += rr(1.6, 2.6)) if (Math.abs(x) > 4.6) xs.push(x);
+    g.fillStyle = '#1f4a45'; g.beginPath(); g.moveTo(-26, 0); g.lineTo(-26, 2.2); g.lineTo(-4.4, 1.8); g.lineTo(-4.4, 0); g.closePath(); g.fill();
+    g.beginPath(); g.moveTo(26, 0); g.lineTo(26, 2.2); g.lineTo(4.4, 1.8); g.lineTo(4.4, 0); g.closePath(); g.fill();
+    xs.sort((a, b) => Math.abs(b) - Math.abs(a));
+    xs.forEach((x) => pine(g, x, 0.4, rr(7.5, 12) - Math.max(0, 6 - Math.abs(x)) * 0.5, rr(2.6, 3.6), R() < 0.5 ? '#245a50' : '#1d4c46', '#4d8f78'));
+  });
+  // ---------- L3 big framing trees (left / right) ----------
+  for (const side of [-1, 1]) {
+    const r = region(13, 15); CARD['L3' + (side < 0 ? 'a' : 'b')] = r;
+    paint(r, (g) => {
+      g.fillStyle = '#1a3c2f'; g.fillRect(-6.5, 0, 13, 1.2);
+      pine(g, -2.8 * side, 0.6, 14, 5.4, '#1d4a37', '#3f8063'); pine(g, 2.6 * side, 0.4, 10.5, 4.4, '#245640', '#4c9070'); pine(g, 0.2, 0.2, 7.5, 3.6, '#2b6447', '#57a07a');
+    });
+  }
+  // ---------- L4 deer (left) + mushrooms and bush (right) ----------
+  const L4a = region(10, 10); CARD.L4a = L4a;
+  paint(L4a, (g) => {
+    g.fillStyle = '#c47a3e';
+    g.beginPath(); g.ellipse(0, 4.4, 2.9, 1.5, 0.05, 0, 6.3); g.fill();                // body
+    const leg = (x, a) => { g.beginPath(); g.moveTo(x - 0.28, 4); g.lineTo(x - 0.18 + a, 0.2); g.lineTo(x + 0.12 + a, 0.2); g.lineTo(x + 0.3, 4); g.fill(); };
+    leg(-2, -0.2); leg(-1.3, 0.1); leg(1.4, 0.15); leg(2.0, -0.1);
+    g.beginPath(); g.moveTo(1.8, 5.2); g.quadraticCurveTo(2.6, 6.8, 2.9, 7.6); g.lineTo(3.6, 7.4); g.quadraticCurveTo(3.1, 6.2, 2.7, 4.4); g.fill();   // neck
+    g.beginPath(); g.ellipse(3.55, 7.85, 0.95, 0.55, -0.35, 0, 6.3); g.fill();           // head
+    g.beginPath(); g.ellipse(4.35, 7.5, 0.42, 0.3, -0.35, 0, 6.3); g.fill();
+    g.fillStyle = '#e3b07c'; g.beginPath(); g.ellipse(-0.4, 3.75, 2.2, 0.6, 0, 0, 6.3); g.fill();   // belly light
+    g.fillStyle = '#f4e6cc'; for (let i = 0; i < 9; i++) { g.beginPath(); g.arc(rr(-2, 1.6), rr(4.6, 5.4), 0.13, 0, 6.3); g.fill(); }
+    g.fillStyle = '#2a1a12'; g.beginPath(); g.arc(3.6, 8.0, 0.11, 0, 6.3); g.fill(); g.beginPath(); g.arc(4.72, 7.42, 0.12, 0, 6.3); g.fill();
+    g.fillStyle = '#c47a3e'; g.beginPath(); g.ellipse(2.95, 8.45, 0.45, 0.2, 0.9, 0, 6.3); g.fill();  // ear
+    g.strokeStyle = '#e9d2a8'; g.lineWidth = 0.18; g.lineCap = 'round';                   // antlers
+    const ant = (x, y, s) => { g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x - 0.4 * s, y + 1.2, x - 0.1 * s, y + 2.2); g.moveTo(x - 0.25 * s, y + 0.8); g.lineTo(x - 0.9 * s, y + 1.4); g.moveTo(x - 0.2 * s, y + 1.6); g.lineTo(x + 0.4 * s, y + 2.1); g.stroke(); };
+    ant(3.3, 8.3, 1); ant(3.75, 8.35, -0.8);
+    g.fillStyle = '#c47a3e'; g.beginPath(); g.moveTo(-2.8, 4.8); g.lineTo(-3.4, 5.3); g.lineTo(-2.9, 4.3); g.fill();  // tail
+    g.fillStyle = '#2b5a3c'; g.beginPath(); g.ellipse(-3, 0.5, 2.4, 0.9, 0, 0, 6.3); g.fill();  // grass at the hooves
+    g.beginPath(); g.ellipse(2.4, 0.4, 2.2, 0.7, 0, 0, 6.3); g.fill();
+  });
+  const L4b = region(10, 7); CARD.L4b = L4b;
+  paint(L4b, (g) => {
+    g.fillStyle = '#2f6a45'; [[-1.5, 2.6, 2.6], [1.2, 3.1, 2.9], [3.4, 2.2, 2], [-3.6, 1.9, 1.8]].forEach(([x, y, r]) => { g.beginPath(); g.arc(x, y, r, 0, 6.3); g.fill(); });
+    g.fillStyle = '#4b955f'; [[-2.2, 3.6, 1.1], [0.6, 4.4, 1.2], [2.8, 3.2, 0.8]].forEach(([x, y, r]) => { g.beginPath(); g.arc(x, y, r, 0, 6.3); g.fill(); });
+    g.fillStyle = '#2f6a45'; g.fillRect(-5, 0, 10, 1.8);
+    const mush = (x, h, r) => { g.fillStyle = '#efe2c8'; g.fillRect(x - r * 0.22, 0, r * 0.44, h); g.fillStyle = '#d4473b'; g.beginPath(); g.ellipse(x, h, r, r * 0.62, 0, Math.PI, 0, true); g.lineTo(x - r, h); g.fill(); g.fillStyle = '#fff1e0'; [[-0.4, 0.3], [0.35, 0.22], [0, 0.45]].forEach(([dx, dy]) => { g.beginPath(); g.arc(x + dx * r, h + dy * r, r * 0.12, 0, 6.3); g.fill(); }); };
+    mush(-2.6, 1.6, 0.95); mush(-1.1, 1.0, 0.65); mush(3.5, 1.3, 0.8);
+  });
+  // ---------- L5 ferns and grass in front (gap in the middle) ----------
+  const L5 = region(52, 5); CARD.L5 = L5;
+  paint(L5, (g) => {
+    for (let i = 0; i < 170; i++) {
+      const x = rr(-25.5, 25.5); if (Math.abs(x) < 3.6) continue;
+      const h = rr(1.4, 4.4) * (1 - Math.max(0, 5 - Math.abs(x)) * 0.12), lean = rr(-0.6, 0.6);
+      g.fillStyle = ['#1f4a33', '#2a5e3e', '#376f48', '#1a3f2c'][i % 4];
+      g.beginPath(); g.moveTo(x - 0.26, 0); g.quadraticCurveTo(x + lean * 0.5 - 0.05, h * 0.6, x + lean, h); g.quadraticCurveTo(x + lean * 0.4 + 0.15, h * 0.5, x + 0.26, 0); g.fill();
+    }
+    g.fillStyle = '#1f4a33'; g.fillRect(-26, 0, 22.4, 0.9); g.fillRect(3.6, 0, 22.4, 0.9);
+    for (let i = 0; i < 40; i++) { const x = rr(-25, 25); if (Math.abs(x) < 4.2) continue; g.fillStyle = ['#ffe9b0', '#f6b3c4', '#ffffff'][i % 3]; g.beginPath(); g.arc(x, rr(1.2, 3.4), rr(0.12, 0.22), 0, 6.3); g.fill(); }
+  });
+  // ---------- the lit windows (alpha = window shape, red = the order they light in) ----------
+  const LW = region(44, 17); CARD.LW = LW;
+  paint(LW, (g) => {
+    WINS.forEach(([x, y], k) => { g.fillStyle = `rgb(${Math.round((k + 1) / WINS.length * 255)},200,90)`; g.beginPath(); g.moveTo(x - 0.25, y - 0.45); g.lineTo(x - 0.25, y + 0.15); g.arc(x, y + 0.15, 0.25, Math.PI, 0, true); g.lineTo(x + 0.25, y - 0.45); g.closePath(); g.fill(); });
+  });
+  // ---------- the pull tab (1.5x) on a long paper strip that slides out of a slot ----------
+  const PT = region(5.1, 9.0); CARD.PT = PT;
+  paint(PT, (g) => {
+    g.fillStyle = '#d9cdb0'; g.fillRect(-1.1, 3.2, 2.2, 5.8);                                   // the strip (comes out of the slot)
+    g.strokeStyle = 'rgba(120,100,70,.35)'; g.lineWidth = 0.04; for (let y = 4.2; y < 9; y += 0.9) { g.beginPath(); g.moveTo(-1.1, y); g.lineTo(1.1, y); g.stroke(); }
+    g.fillStyle = '#e8dcc0'; g.beginPath(); g.moveTo(-2.55, 3.6); g.lineTo(-2.55, 1.2); g.quadraticCurveTo(-2.55, 0, -1.3, 0); g.lineTo(1.3, 0); g.quadraticCurveTo(2.55, 0, 2.55, 1.2); g.lineTo(2.55, 3.6); g.fill();
+    g.fillStyle = '#9a2a26'; g.beginPath(); g.moveTo(0, 0.55); g.lineTo(0.8, 1.35); g.lineTo(-0.8, 1.35); g.fill();
+    g.save(); g.scale(1, -1); g.fillStyle = '#7a4a2a'; g.font = `700 0.9px ${SANS}`; g.textAlign = 'center'; g.fillText(C.tab, 0, -2.25); g.restore();
+  });
+}
+
+// ================= GL =================
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float');
+const HD = '#version 300 es\nprecision highp float;\n';
+const NC = 10;   // cards: L0 L1 L2 L3a L3b L4a L4b L5 MO PT
+const pShade = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o;
+uniform sampler2D ATL;
+uniform vec2 res, jit; uniform vec3 ro, cf, cr, cu; uniform float tanF, theta, seed;
+uniform vec4 cA[${NC}], cB[${NC}], cR[${NC}];   // card: origin.xyz + rise angle; size w,h + kind, visible; atlas rect
+uniform vec4 rSpread, rCover;
+uniform vec3 Lp; uniform float Lr; uniform float dbg;
+uniform vec4 rLit; uniform float winT;      // castle windows: atlas rect of the light sheet, how many are lit (0..1)
+${SG.GLSL_NOISE}
+const float BT = 1.5, PGT = 1.25;           // half-book thickness, page block top (board below)
+const vec3 LIGHT_COL = vec3(1.);   // light colour, vec3(1.) = as delivered (see the Chinese note at the top of the script)
+const vec3 HB = vec3(28.7, 0., 11.7);       // half-book extent in x and z
+// ---- left half rotation about the spine (z axis through the origin): open state angle a = PI - theta
+vec3 rotZ(vec3 p, float a){ float c = cos(a), s = sin(a); return vec3(c*p.x - s*p.y, s*p.x + c*p.y, p.z); }
+vec2 boxT(vec3 o, vec3 d, vec3 bmin, vec3 bmax, out vec3 n){
+  vec3 iv = 1./d, t0 = (bmin - o)*iv, t1 = (bmax - o)*iv, tn = min(t0, t1), tf = max(t0, t1);
+  float a = max(max(tn.x, tn.y), tn.z), b = min(min(tf.x, tf.y), tf.z);
+  n = a == tn.x ? vec3(-sign(d.x), 0., 0.) : a == tn.y ? vec3(0., -sign(d.y), 0.) : vec3(0., 0., -sign(d.z));
+  return vec2(a, b);
+}
+// half book in its own open-state frame: x in [-HB.x, 0] (left) — right half uses x in [0, HB.x]
+float hitHalf(vec3 o, vec3 d, float sx, out vec3 n){
+  vec3 bmin = sx > 0. ? vec3(0., -BT, -HB.z) : vec3(-HB.x, -BT, -HB.z);
+  vec3 bmax = sx > 0. ? vec3(HB.x, 0., HB.z) : vec3(0., 0., HB.z);
+  vec2 t = boxT(o, d, bmin, bmax, n);
+  if (t.x < t.y && t.y > 0. && t.x > 1e-3) return t.x;
+  return -1.;
+}
+mat3 cardFrame(int i, out vec3 org){
+  vec4 A = cA[i]; org = A.xyz; float ph = A.w;
+  vec3 ux = vec3(1., 0., 0.), uy = vec3(0., sin(ph), -cos(ph)), n = vec3(0., cos(ph), sin(ph));
+  return mat3(ux, uy, n);
+}
+float cardAlpha(int i, vec2 c, out vec2 auv){   // c = (u 0..1 across, v 0..1 up)
+  vec4 r = cR[i]; auv = r.xy + c*r.zw;
+  return textureLod(ATL, auv, 0.).a;
+}
+// a card is glued to both pages: the part left of the gutter (x < 0) rides on the left page, so every layer that
+// crosses the gutter folds there (a parallel fold) and only lies flat when the book is fully open
+float hitCardSide(int i, vec3 o, vec3 d, float side, out vec2 c, out float facing){
+  vec4 B = cB[i];
+  vec3 org; mat3 F = cardFrame(i, org);
+  float dn = dot(d, F[2]); if (abs(dn) < 1e-6) return -1.;
+  float t = dot(org - o, F[2])/dn; if (t < 1e-3) return -1.;
+  vec3 p = o + d*t - org; c = vec2(dot(p, F[0])/B.x + .5, dot(p, F[1])/B.y);
+  if (c.x < 0. || c.x > 1. || c.y < 0. || c.y > 1.) return -1.;
+  float wx = org.x + (c.x - .5)*B.x;                  // page x of this point
+  if (B.z != 0. && (o + d*t).z < B.z) return -1.;     // the pull-tab strip is hidden inside the page behind its slot
+  if (side > 0. ? wx < 0. : wx >= 0.) return -1.;
+  vec2 auv; if (cardAlpha(i, c, auv) < .5) return -1.;
+  facing = -sign(dn);
+  return t;
+}
+float hitCard(int i, vec3 o, vec3 d, out vec2 c, out float facing){
+  vec4 B = cB[i]; if (B.w < .5) return -1.;
+  float t1 = hitCardSide(i, o, d, 1., c, facing);
+  float a = theta - 3.14159265;
+  vec2 c2; float f2;
+  float t2 = hitCardSide(i, rotZ(o, -a), rotZ(d, -a), -1., c2, f2);
+  if (t2 > 0. && (t1 < 0. || t2 < t1)) { c = c2; facing = f2; return t2; }
+  return t1;
+}
+// ---- scene query: returns t and an id (0 desk, 1 right half, 2 left half, 10+i card)
+float trace(vec3 o, vec3 d, out float id, out vec3 n, out vec2 cc, out float face){
+  float tb = 1e9; id = -1.; n = vec3(0., 1., 0.); face = 1.;
+  // desk
+  if (d.y < 0.) { float t = (-BT - o.y)/d.y; if (t > 0.) { tb = t; id = 0.; n = vec3(0., 1., 0.); } }
+  vec3 nn;
+  float t1 = hitHalf(o, d, 1., nn); if (t1 > 0. && t1 < tb) { tb = t1; id = 1.; n = nn; }
+  float a = theta - 3.14159265;
+  vec3 ol = rotZ(o, -a), dl = rotZ(d, -a);
+  float t2 = hitHalf(ol, dl, -1., nn); if (t2 > 0. && t2 < tb) { tb = t2; id = 2.; n = rotZ(nn, a); }
+  for (int i = 0; i < ${NC}; i++) { vec2 c; float f; float t = hitCard(i, o, d, c, f); if (t > 0. && t < tb) { tb = t; id = 10. + float(i); cc = c; face = f; } }
+  return tb;
+}
+float occl(vec3 o, vec3 d, float tmax){
+  vec3 nn;
+  float t1 = hitHalf(o, d, 1., nn); if (t1 > 0. && t1 < tmax) return 0.;
+  float a = theta - 3.14159265; float t2 = hitHalf(rotZ(o, -a), rotZ(d, -a), -1., nn); if (t2 > 0. && t2 < tmax) return 0.;
+  float tr = 1.;
+  for (int i = 0; i < ${NC}; i++) { vec2 c; float f; float t = hitCard(i, o, d, c, f); if (t > 0. && t < tmax) tr *= .08; }
+  return tr;
+}
+vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
+vec3 spreadCol(vec2 xz){   // printed spread, x in [-28.5, 28.5], z in [-11.5, 11.5] (z+ = reader)
+  vec2 c = vec2(xz.x/57. + .5, (11.5 - xz.y)/23.);
+  return texture(ATL, rSpread.xy + clamp(c, 0., 1.)*rSpread.zw).rgb;
+}
+float lampSpot(vec3 p){ vec3 ax = normalize(vec3(0., -1.5, 0.) - Lp); float c = dot(normalize(p - Lp), ax); return .12 + .88*smoothstep(.86, .975, c); }
+vec3 shadeAt(vec3 p, vec3 n, vec3 alb, float rough, float spec, vec3 V, float trans){
+  vec3 Lc = LIGHT_COL*vec3(1., .79, .55)*3.4;
+  vec3 col = vec3(0.);
+  vec3 toL = Lp - p; float dist = length(toL); vec3 Ld = toL/dist;
+  // soft shadow: 8 samples on the lamp's disc
+  float vis = 0.;
+  vec3 tu = normalize(cross(Ld, vec3(0., 1., 0.))), tv = cross(tu, Ld);
+  float rot = hash12(gl_FragCoord.xy + seed*31.)*6.283;
+  for (int k = 0; k < 8; k++) {
+    float fk = float(k) + .5; float rr2 = sqrt(fk/8.)*Lr; float an = fk*2.39996 + rot;
+    vec3 lp = Lp + (tu*cos(an) + tv*sin(an))*rr2;
+    vec3 ld = lp - p; float dl = length(ld);
+    vis += occl(p + n*.012, ld/dl, dl);
+  }
+  vis /= 8.;
+  float spot = lampSpot(p);
+  float att = 5200./(dist*dist);
+  float ndl = dot(n, Ld);
+  float dif = max(ndl, 0.) + trans*max(-ndl, 0.)*.35;
+  vec3 Hh = normalize(Ld + V);
+  float sp = pow(max(dot(n, Hh), 0.), 2./(rough*rough) ) * spec * (1./(rough*rough))*.08;
+  col += (alb*dif + vec3(sp)*max(ndl, 0.))*Lc*vis*spot*att;
+  // cool moonlit fill from the window and a warm bounce off the desk
+  col += alb*(vec3(.06, .075, .12)*(.6 + .4*n.y) + vec3(.05, .03, .015)*max(-n.y, 0.)*.5);
+  return col;
+}
+void main(){
+  vec2 fc = gl_FragCoord.xy + jit;
+  vec2 sp = (fc - res*.5)/(res.y*.5);
+  vec3 rd = normalize(cf + cr*sp.x*tanF + cu*sp.y*tanF);
+  float id; vec3 n; vec2 cc; float face;
+  float t = trace(ro, rd, id, n, cc, face);
+  vec3 col;
+  float depth = t;
+  if (id < -.5) { col = vec3(.004, .003, .002); depth = 1e4; }
+  else {
+    vec3 p = ro + rd*t, V = -rd;
+    vec3 alb; float rough = .6, spec = .04, trans = 0.;
+    if (id < .5) {                                   // walnut desk, varnished
+      vec2 q = p.xz;
+      // walnut, fine straight grain at this distance: low contrast, pores, a soft sheen along the grain
+      float g = fbm(vec2(q.x*.02, q.y*.6));
+      float ring = .5 + .5*sin(q.y*3.1 + g*4. + q.x*.01);
+      float pores = smoothstep(.75, .95, vn(vec2(q.x*2.5, q.y*14.)));
+      alb = lin(mix(vec3(.2, .11, .06), vec3(.26, .15, .08), ring*.35 + .4*vn(q*vec2(.25, 4.)) + .25*g));
+      alb *= 1. - .25*pores;
+      rough = .22; spec = .5;
+      // contact shadow of the book on the desk
+      float bx = max(abs(p.x) - 28.7, 0.), bz = max(abs(p.z) - 11.7, 0.);
+      alb *= mix(.45, 1., smoothstep(0., 1.6, length(vec2(bx, bz))));
+      col = shadeAt(p, n, alb, rough, spec, V, 0.);
+    } else if (id < 2.5) {                           // book halves
+      float sx = id < 1.5 ? 1. : -1.;
+      vec3 lp = p, ln = n;
+      if (sx < 0.) { float a = theta - 3.14159265; lp = rotZ(p, -a); ln = rotZ(n, -a); }
+      if (ln.y > .5) {                               // printed page
+        alb = lin(spreadCol(lp.xz));
+        float gut = exp(-abs(lp.x)/1.1);
+        alb *= 1. - .45*gut;
+        alb *= .94 + .08*vn(lp.xz*24.);
+        rough = .7; spec = .03;
+      } else if (ln.y < -.5) {                       // cover cloth (gold foil)
+        vec2 c = vec2((sx > 0. ? lp.x : -lp.x)/28.7, (lp.z + 11.7)/23.4);
+        vec3 cvc = texture(ATL, rCover.xy + clamp(vec2(c.x, 1. - c.y), 0., 1.)*rCover.zw).rgb;
+        bool gold = cvc.r > .6 && cvc.b < .5;
+        float weave = .9 + .1*sin(lp.x*60.)*sin(lp.z*60.);
+        alb = lin(cvc)*weave; rough = gold ? .25 : .8; spec = gold ? .9 : .02;
+      } else {
+        float y = lp.y;
+        if (y > -PGT) {                              // page edges: thin stripes
+          float st = .85 + .15*sin(y*180. + vn(lp.xz*3.)*3.);
+          alb = lin(vec3(.88, .84, .74))*st*(1. - .25*smoothstep(-.1, 0., y));
+        } else alb = lin(vec3(.12, .17, .33))*(.9 + .1*sin(lp.x*50.));
+        rough = .7;
+      }
+      // pop-up layers cast contact shadows on the spread
+      if (ln.y > .5 && sx > -2.) {
+        float ao = 1.;
+        for (int i = 0; i < ${NC}; i++) {
+          vec4 B = cB[i]; if (B.w < .5) continue;
+          vec4 A = cA[i]; float dz = p.z - A.z; float dx = max(abs(p.x - A.x) - B.x*.5, 0.);
+          ao *= 1. - .45*sin(A.w)*exp(-max(-dz, 0.)*2.2 - max(dz, 0.)*3.5 - dx*2.)*step(abs(dz), 3.);
+        }
+        alb *= ao;
+      }
+      col = shadeAt(p, n, alb, rough, spec, V, 0.);
+    } else {                                         // card
+      int ci = int(id - 10. + .5);
+      vec2 auv; vec4 r = cR[ci];
+      auv = r.xy + cc*r.zw;
+      vec4 tx = texture(ATL, auv);
+      vec3 front = lin(tx.rgb);
+      // white card core along the die-cut, plain cream backs
+      vec2 ex = vec2(1.0/${AW}., 0.), ey = vec2(0., 1.0/${AH}.);
+      float a1 = textureLod(ATL, auv + ex, 0.).a, a2 = textureLod(ATL, auv - ex, 0.).a;
+      float a3 = textureLod(ATL, auv + ey, 0.).a, a4 = textureLod(ATL, auv - ey, 0.).a;
+      float edge = 1. - min(min(a1, a2), min(a3, a4));
+      vec3 back = lin(vec3(.86, .82, .74));
+      alb = face > 0. ? front : back;
+      alb = mix(alb, lin(vec3(.93, .91, .86)), smoothstep(.45, .95, edge)*.55);
+      vec2 pc = cc*cB[ci].xy;                          // card cm
+      alb *= .93 + .07*vn(pc*38.) + .04*vn(pc*9. + 3.) - .03*smoothstep(.55, .8, vn(pc*1.3 + float(ci)*7.));
+      vec3 org; mat3 F = cardFrame(ci, org);
+      vec3 nn = normalize(F[2] + (F[0]*(vn(pc*.35 + float(ci)*3.1) - .5) + F[1]*(vn(pc*.3 + float(ci)*5.7) - .5))*.22)*face;
+      float wxp = org.x + (cc.x - .5)*cB[ci].x;
+      if (wxp < 0.) nn = rotZ(nn, theta - 3.14159265);
+      // the gutter crease: one side catches the lamp, the other falls into shade
+      alb *= 1. + .12*smoothstep(.35, 0., abs(wxp))*sign(wxp)*(-1.);
+      alb *= 1. - .25*exp(-abs(wxp)*14.);
+      // castle windows: light from behind the card shows through, one window after another
+      if (ci == 1) {
+        vec4 lw = texture(ATL, rLit.xy + cc*rLit.zw);
+        float on = lw.a*step(lw.r, winT + .001)*step(.001, winT);
+        col = shadeAt(p, nn, alb, .65, .04, V, 1.);
+        col += lin(vec3(1., .78, .42))*on*7.;
+        o = vec4(col, t); return;
+      }
+      // contact darkening at the fold line
+      float v01 = cc.y*cB[ci].y;
+      alb *= mix(.55, 1., smoothstep(0., 1.2, v01));
+      trans = 1.;
+      col = shadeAt(p, nn, alb, .65, .04, V, trans);
+    }
+  }
+  if (dbg > .5) col = id < -.5 ? vec3(0.) : id < .5 ? vec3(.2,.1,0.) : id < 1.5 ? vec3(0.,1.,0.) : id < 2.5 ? vec3(1.,0.,0.) : vec3(0.,0.,1.);
+  o = vec4(col, depth);
+}`);
+const pDof = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float focus, aper, maxC;
+float coc(float z){ return clamp(abs(1. - focus/max(z, .01))*aper, 0., maxC); }
+void main(){
+  vec4 c0 = texture(S, uv); float cc = coc(c0.a);
+  vec3 acc = c0.rgb; float ws = 1.;
+  for (int i = 0; i < 64; i++){
+    float fi = float(i) + .5; float r = sqrt(fi/64.)*maxC; float a = fi*2.39996;
+    vec4 sm = texture(S, uv + vec2(cos(a), sin(a))*r/res);
+    float sc = coc(sm.a); if (sm.a > c0.a) sc = min(sc, cc*1.5 + .5);
+    float wg = clamp(sc - r + 1., 0., 1.); acc += sm.rgb*wg; ws += wg;
+  }
+  o = vec4(acc/ws, c0.a);
+}`);
+const pBright = SG.prog(gl, SG.VS_QUAD, HD + `in vec2 uv; out vec4 o; uniform sampler2D S; uniform float th;
+void main(){ vec3 c = texture(S, uv).rgb; float l = max(c.r, max(c.g, c.b)); o = vec4(c*smoothstep(th, th*2.5, l), 1.); }`);
+const pBlur = SG.prog(gl, SG.VS_QUAD, HD + `in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 dir;
+void main(){ vec3 c = texture(S, uv).rgb*.227; c += texture(S, uv + dir*1.385).rgb*.316; c += texture(S, uv - dir*1.385).rgb*.316;
+  c += texture(S, uv + dir*3.231).rgb*.07; c += texture(S, uv - dir*3.231).rgb*.07; o = vec4(c, 1.); }`);
+const pComp = SG.prog(gl, SG.VS_QUAD, HD + `in vec2 uv; out vec4 o; uniform sampler2D S, B; uniform vec2 res; uniform float seed, expo;
+${SG.GLSL_NOISE}
+vec3 aces(vec3 x){ return clamp((x*(2.51*x + .03))/(x*(2.43*x + .59) + .14), 0., 1.); }
+void main(){ vec2 d = uv - .5; vec3 c = vec3(texture(S, uv - d*.0015).r, texture(S, uv).g, texture(S, uv + d*.0015).b);
+  c += texture(B, uv).rgb*.18; c *= expo; c = aces(c); c = pow(c, vec3(1./2.2));
+  float l = dot(c, vec3(.3, .59, .11)); c += vec3(.02, .008, -.015)*smoothstep(.3, .9, l) + vec3(-.008, 0., .012)*(1. - smoothstep(0., .3, l));
+  c *= 1. - .42*smoothstep(.25, 1.05, length(d*vec2(1.3, 1.)));
+  c += (hash12(uv*res + seed*71.) - .5)*.03; o = vec4(clamp(c, 0., 1.), 1.); }`);
+const tATL = SG.tex(gl, AW, AH, { mips: true, aniso: 8 });
+const tSH = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fSH = SG.fbo(gl, [tSH]);
+const tDF = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fDF = SG.fbo(gl, [tDF]);
+const bw = W >> 2, bh = H >> 2;
+const tB1 = SG.tex(gl, bw, bh, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fB1 = SG.fbo(gl, [tB1]);
+const tB2 = SG.tex(gl, bw, bh, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fB2 = SG.fbo(gl, [tB2]);
+const QUAD = SG.quad(gl);
+
+// ================= cards: placement and rise =================
+// [name, x centre, z (base line), w, h, the time the layer locks upright]
+// every layer is pulled up by the opening of the book itself: its angle is a function of the spread angle θ, starting once
+// θ passes 95° (so nothing can hit the other page) and locking upright at its own moment on the quarter-beats
+const CARDS = [['L0', 0, -10.4, 50, 21, 1.5], ['L1', 0, -7.2, 44, 17, 1.75], ['L2', 0, -3.6, 52, 13, 2.0], ['L3a', -12.5, -0.4, 13, 15, 2.25], ['L3b', 12.5, -0.4, 13, 15, 2.25],
+  ['L4a', -9.5, 3.4, 10, 10, 2.5], ['L4b', 9.6, 3.6, 10, 7, 2.5], ['L5', 0, 6.6, 52, 5, 2.5], ['MO', 14.5, -10.9, 9.6, 9.6, 1.5], ['PT', 0, 13.2, 5.1, 9.0, 99]];
+const T_OPEN0 = 0.3, T_OPEN1 = 2.5;
+const thetaAt = (t) => Math.PI * E.outCubic(inv(T_OPEN0, T_OPEN1, t));
+const TH_START = (95 / 180) * Math.PI;
+const layerAngle = (t, tLock) => {
+  const th = thetaAt(t), the = thetaAt(tLock), ths = Math.min(TH_START + 0.02, the - 0.2);
+  const u = clamp((th - ths) / (the - ths));
+  return (Math.PI / 2) * Math.sin(u * Math.PI / 2);
+};
+const PULL = (t) => E.inOutCubic(inv(7.0, 7.5, t));                       // the tab comes out 7 cm
+const MOONY = (t) => { const k = PULL(t); const os = t > 7.5 ? 0.03 * Math.sin(Math.min(1, (t - 7.5) / 0.25) * Math.PI) : 0; return lerp(4.5, 12.4, k) * (1 + os); };
+const WINT = (t) => clamp((t - 7.75) / 0.25);                             // windows light one after another, the last on 8.0
+function cardUniforms(t) {
+  const A = new Float32Array(NC * 4), B = new Float32Array(NC * 4), Rr = new Float32Array(NC * 4);
+  CARDS.forEach(([nm, x, z, w, h, tl], i) => {
+    const r = CARD[nm];
+    let ph = layerAngle(t, tl), zz = z, yy = 0, vis = 1;
+    if (nm === 'MO') { const m = MOONY(t); yy = m * Math.sin(ph); zz = z - m * Math.cos(ph); }   // slides up along its own rail
+    if (nm === 'PT') { zz = 13.2 + 4.5 * PULL(t); yy = 0.03; }
+    if (nm === 'PT') { A.set([x, yy, zz, 0], i * 4); B.set([w, h, 9.4, vis], i * 4); }
+    else { A.set([x, yy, zz, ph], i * 4); B.set([w, h, 0, ph > 0.01 ? 1 : 0], i * 4); }
+    Rr.set([r.x / AW, 1 - (r.y + r.h) / AH, r.w / AW, r.h / AH], i * 4);
+  });
+  return { A, B, Rr };
+}
+
+// ================= camera =================
+const V3 = { add: (a, b) => a.map((x, i) => x + b[i]), sub: (a, b) => a.map((x, i) => x - b[i]), mul: (a, k) => a.map((x) => x * k), lerp: (a, b, k) => a.map((x, i) => lerp(x, b[i], k)),
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]], norm: (a) => { const l = Math.hypot(...a) || 1; return a.map((x) => x / l); } };
+// one continuous camera curve: monotone Hermite per channel, so velocity carries through the keys (only a true reversal
+// of a channel slows it) — [t, ro, ta, tanF, aperture]
+const KEYS = [
+  [0.0, [24, 40, 38], [12, 0, 0], 0.42, 0.6],
+  [1.6, [8, 42, 47], [1, 3, -1], 0.42, 0.5],
+  [3.3, [0, 27, 44], [0, 5, -2], 0.41, 0.8],
+  [4.15, [0, 5.0, 19.5], [0, 4.4, -6], 0.53, 1.6],
+  [5.0, [-2.2, 4.0, 8.2], [-0.5, 6.6, -8], 0.53, 2.0],
+  [5.9, [-2.6, 5.4, 3.6], [-0.3, 9.4, -8], 0.5, 1.8],
+  [6.05, [-2.6, 5.5, 3.3], [-0.3, 9.6, -8], 0.5, 1.8],              // a small push forward before the pull back
+  [7.25, [0, 31.5, 47.5], [0, 7.0, 0.6], 0.4, 0.5],
+  [8.5, [0, 29.0, 45.0], [0, 7.4, 0.8], 0.4, 0.5],
+];
+const TAN = KEYS.map((k, i) => { const v = [...k[1], ...k[2], k[3], k[4]]; return v.map((x, d) => {
+  if (i === 0 || i === KEYS.length - 1) return 0;
+  const g = (j) => [...KEYS[j][1], ...KEYS[j][2], KEYS[j][3], KEYS[j][4]][d];
+  const a = (x - g(i - 1)) / (k[0] - KEYS[i - 1][0]), b = (g(i + 1) - x) / (KEYS[i + 1][0] - k[0]);
+  if (a * b <= 0) return 0;
+  const m = (a * (KEYS[i + 1][0] - k[0]) + b * (k[0] - KEYS[i - 1][0])) / (KEYS[i + 1][0] - KEYS[i - 1][0]);
+  return Math.sign(m) * Math.min(Math.abs(m), 3 * Math.min(Math.abs(a), Math.abs(b)));
+}); });
+function camAt(t) {
+  let i = 0; while (i < KEYS.length - 2 && t > KEYS[i + 1][0]) i++;
+  const A = KEYS[i], B = KEYS[i + 1], h = B[0] - A[0], u = clamp((t - A[0]) / h);
+  const va = [...A[1], ...A[2], A[3], A[4]], vb = [...B[1], ...B[2], B[3], B[4]];
+  const u2 = u * u, u3 = u2 * u, h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+  const v = va.map((x, d) => h00 * x + h10 * h * TAN[i][d] + h01 * vb[d] + h11 * h * TAN[i + 1][d]);
+  // the book lands flat on 2.5: a small thump
+  const th = t > T_OPEN1 ? 0.05 * Math.exp(-(t - T_OPEN1) / 0.15) * Math.sin((t - T_OPEN1) * 60) : 0;
+  return { ro: [v[0], v[1] + th, v[2]], ta: [v[3], v[4] + th, v[5]], tanF: v[6], ap: v[7] };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  fonts: [`700 40px ${SANS}`],
+  async setup() { buildAtlas(); if (Reel.Q.get('atlas')) { const im = document.createElement('canvas'); im.width = 1920; im.height = 1080; const ig = im.getContext('2d'); ig.fillStyle = '#f0f'; ig.fillRect(0, 0, 1920, 1080); ig.drawImage(atlas, 0, 0, 4096, 6144, 0, 0, 720, 1080); ig.drawImage(atlas, 0, 0, 4096, 2048, 760, 0, 1160, 580); im.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px;z-index:9'; stage.appendChild(im); } gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); SG.upload(gl, tATL, atlas); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); },
+  cues: [
+    { t: 0.3, sfx: 'book_open', gain: 0.8 },
+    { t: 1.5, sfx: 'flap', gain: 0.55 }, { t: 1.75, sfx: 'flap', gain: 0.5 }, { t: 2.0, sfx: 'flap', gain: 0.55 }, { t: 2.25, sfx: 'flap', gain: 0.5 }, { t: 2.5, sfx: 'flap', gain: 0.6 }, { t: 2.5, sfx: 'thud', gain: 0.35 },
+    { t: 4.0, sfx: 'whoosh', gain: 0.45 }, { t: 4.5, sfx: 'paper_pass', gain: 0.7 }, { t: 5.0, sfx: 'paper_pass', gain: 0.55 }, { t: 5.5, sfx: 'paper_pass', gain: 0.45 },
+    { t: 6.05, sfx: 'whoosh', gain: 0.3 },
+    { t: 7.0, sfx: 'tab_slide', gain: 0.7 }, { t: 7.5, sfx: 'moon_set', gain: 0.6 }, { t: 7.75, sfx: 'sparkle', gain: 0.4 }, { t: 8.0, sfx: 'chime', gain: 0.4 },
+  ],
+  render(t) {
+    const jit = Reel.jit || [0, 0];
+    const cam = camAt(t);
+    const fwd = V3.norm(V3.sub(cam.ta, cam.ro)), right = V3.norm(V3.cross(fwd, [0, 1, 0])), up = V3.cross(right, fwd);
+    const cu = cardUniforms(t);
+    SG.bind(gl, fSH);
+    const S = pShade.use().t('ATL', tATL).f('res', W, H).f('jit', jit[0], -jit[1]).v('ro', cam.ro).v('cf', fwd).v('cr', right).v('cu', up).f('tanF', cam.tanF)
+      .f('theta', thetaAt(t)).f('seed', (Math.floor(t * 30) * 7 + Math.round((jit[0] + 0.5) * 13)) % 97).arr4('cA', cu.A).arr4('cB', cu.B).arr4('cR', cu.Rr)
+      .f('Lp', -30, 52, 24).f('Lr', 4.0).f('dbg', +(Reel.Q.get('dbg') || 0));
+    const rs = CARD.spread, rc = CARD.cover;
+    S.f('rSpread', rs.x / AW, 1 - (rs.y + rs.h) / AH, rs.w / AW, rs.h / AH).f('rCover', rc.x / AW, 1 - (rc.y + rc.h) / AH, rc.w / AW, rc.h / AH);
+    const rl = CARD.LW; S.f('rLit', rl.x / AW, 1 - (rl.y + rl.h) / AH, rl.w / AW, rl.h / AH).f('winT', WINT(t));
+    QUAD.draw();
+    let src = tSH;
+    if (cam.ap > 0.05) {
+      const focus = Math.hypot(...V3.sub(cam.ta, cam.ro));
+      SG.bind(gl, fDF); pDof.use().t('S', tSH).f('res', W, H).f('focus', focus).f('aper', cam.ap * 7 * RS).f('maxC', cam.ap * 7 * RS + 0.01); QUAD.draw(); src = tDF;
+    }
+    SG.bind(gl, fB1); pBright.use().t('S', src).f('th', 1.6); QUAD.draw();
+    SG.bind(gl, fB2); pBlur.use().t('S', tB1).f('dir', 1.5 / bw, 0); QUAD.draw();
+    SG.bind(gl, fB1); pBlur.use().t('S', tB2).f('dir', 0, 1.5 / bh); QUAD.draw();
+    SG.bind(gl, null); gl.viewport(0, 0, W, H);
+    pComp.use().t('S', src).t('B', tB1).f('res', W, H).f('seed', Math.floor(t * 30) % 97).f('expo', 1.0); QUAD.draw();
+    gl.finish();
+  },
+});
+</script></body></html>

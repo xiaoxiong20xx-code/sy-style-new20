@@ -1,0 +1,668 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>27 拼插积木 · Toy Bricks</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 27 拼插积木 · TOY BRICKS, SHOT LIKE MACRO TOY PHOTOGRAPHY =====
+   Generic ABS bricks (no brand marks anywhere: plain studs, no figures) on a blue baseplate: a rock island,
+   a striped lighthouse that is stacked brick by brick on the beat, layered plate waves that bob in stop-motion,
+   a tan beach and printed tiles that click in as the title.
+   Renderer: grid DDA (1 stud x 1 plate cells) + per-brick SDF sphere tracing (rounded edges, 0.1 mm seams,
+   studs with bevelled tops), falling bricks as dynamic SDFs, soft sun shadows through the grid, occupancy AO,
+   glossy ABS (GGX + sky reflections + a hint of subsurface), trans-yellow lantern with a light beam in the haze,
+   thin-lens depth of field with a focus pull, ACES + grain. */
+const { E, clamp, lerp, inv } = Reel;
+const stage = Reel.makeStage('#9cc3e0');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+const RS = Reel.RS, OW = Math.round(1920 * RS), OH = Math.round(1080 * RS);
+const GX = 32, GY = 40, GZ = 32, PL = 0.4;
+const hsh = Reel.hash;
+const sRGB = (h) => { const n = parseInt(h.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((c) => Math.pow(c / 255, 2.2)); };
+
+/* ------------------------------------------------------------------ GL */
+const cv = document.createElement('canvas'); cv.width = OW; cv.height = OH;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true, alpha: false });
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear');
+function shd(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const e = gl.getShaderInfoLog(s); console.error(e + '\n' + src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n')); throw new Error(e); } return s; }
+function prog(vs, fs) { const p = gl.createProgram(); gl.attachShader(p, shd(gl.VERTEX_SHADER, vs)); gl.attachShader(p, shd(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); const L = {}; p.loc = (n) => (n in L ? L[n] : (L[n] = gl.getUniformLocation(p, n))); return p; }
+function U(p, n, v) { const l = p.loc(n); if (l === null) return; if (typeof v === 'number') gl.uniform1f(l, v); else if (v.length === 2) gl.uniform2fv(l, v); else if (v.length === 3) gl.uniform3fv(l, v); else if (v.length === 4) gl.uniform4fv(l, v); }
+function tex2(w, h, ifmt, fmt, type, filt) { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filt); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filt);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE); return t; }
+function fbo(t) { const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return f; }
+const bindTex = (p, n, t, unit, target = gl.TEXTURE_2D) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(target, t); const l = p.loc(n); if (l !== null) gl.uniform1i(l, unit); };
+const tMain = tex2(OW, OH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR), fMain = fbo(tMain);
+const tDof = tex2(OW, OH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR), fDof = fbo(tDof);
+const BW = OW >> 2, BH = OH >> 2;
+const tB1 = tex2(BW, BH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR), fB1 = fbo(tB1), tB2 = tex2(BW, BH, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, gl.LINEAR), fB2 = fbo(tB2);
+// grid (brick id + 1 per cell) and occupancy (for AO)
+const tGrid = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, tGrid);
+gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texImage3D(gl.TEXTURE_3D, 0, gl.R16UI, GX, GY, GZ, 0, gl.RED_INTEGER, gl.UNSIGNED_SHORT, null);
+const tOcc = gl.createTexture(); gl.bindTexture(gl.TEXTURE_3D, tOcc);
+gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+for (const w of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T, gl.TEXTURE_WRAP_R]) gl.texParameteri(gl.TEXTURE_3D, w, gl.CLAMP_TO_EDGE);
+gl.texImage3D(gl.TEXTURE_3D, 0, gl.R8, GX, GY, GZ, 0, gl.RED, gl.UNSIGNED_BYTE, null);
+const BKW = 1024; let BKH = 1;
+const tBk = gl.createTexture();
+let tPrint = null;
+const vaoFS = gl.createVertexArray(); gl.bindVertexArray(vaoFS);
+{ const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0); }
+const VSFS = `#version 300 es
+layout(location=0) in vec2 p; out vec2 vUV; void main(){ vUV = p*.5+.5; gl_Position = vec4(p,0.,1.); }`;
+
+/* ------------------------------------------------------------------ scene shader */
+const fsScene = `#version 300 es
+precision highp float; precision highp int; precision highp usampler3D; precision highp sampler3D;
+in vec2 vUV; out vec4 o;
+uniform vec3 uCam, uCR, uCU, uCF; uniform float uTanH, uAsp; uniform vec2 uRes, uJn;
+uniform usampler3D uGrid; uniform sampler3D uOcc; uniform sampler2D uBk; uniform sampler2D uPrint;
+uniform int uDyn[24]; uniform int uNDyn;
+uniform vec4 uPR[6];
+uniform vec3 uSun, uSunC; uniform float uT, uLamp, uBeamA; uniform vec3 uLampP;
+const vec3 GD = vec3(${GX}., ${GY * PL}, ${GZ}.); const vec3 CS = vec3(1., ${PL}, 1.);
+const float GAP = .012, RB = .028;
+#define PI 3.14159265
+float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+float hash13(vec3 p3){ p3=fract(p3*.1031); p3+=dot(p3,p3.zyx+31.32); return fract((p3.x+p3.y)*p3.z); }
+float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(hash12(i),hash12(i+vec2(1,0)),f.x), mix(hash12(i+vec2(0,1)),hash12(i+vec2(1,1)),f.x), f.y); }
+struct Bk { vec3 pos; vec3 size; int type; int flags; vec3 col; float rough; float print; float yaw; vec2 cl; };
+Bk getB(int id){ int x = (id % 256)*4, y = id / 256;
+  vec4 a = texelFetch(uBk, ivec2(x,y), 0), b = texelFetch(uBk, ivec2(x+1,y), 0), c = texelFetch(uBk, ivec2(x+2,y), 0), d = texelFetch(uBk, ivec2(x+3,y), 0);
+  Bk k; k.pos = a.xyz; k.type = int(a.w); k.size = b.xyz; k.flags = int(b.w); k.col = c.rgb; k.rough = c.a; k.print = d.x; k.yaw = d.y; k.cl = d.zw; return k; }
+vec3 toLocal(Bk b, vec3 p){ vec3 c = b.pos + b.size*.5; vec3 q = p - c; if (b.yaw != 0.) { float cs = cos(b.yaw), sn = sin(b.yaw); q.xz = mat2(cs, -sn, sn, cs)*q.xz; } return q; }
+float sdStud(vec3 s){ vec2 d = vec2(length(s.xz) - .30 + .03, abs(s.y - .106) - .106 + .03); return min(max(d.x,d.y),0.) + length(max(d,0.)) - .03; }
+float sdBody(Bk b, vec3 q){
+  vec3 hs = b.size*.5 - vec3(GAP, GAP*.35, GAP);
+  if (b.type == 1 || b.type == 4) { vec2 d = vec2(length(q.xz) - hs.x + RB, abs(q.y) - hs.y + RB); return min(max(d.x,d.y),0.) + length(max(d,0.)) - RB; }
+  if (b.type == 2) { float h = clamp((q.y + hs.y)/(2.*hs.y), 0., 1.); float r = mix(hs.x, .62, h);
+    vec2 d = vec2((length(q.xz) - r)*.9, abs(q.y) - hs.y); return min(max(d.x,d.y),0.) + length(max(d,0.)); }
+  vec3 d = abs(q) - hs + RB; float bx = length(max(d,0.)) + min(max(d.x,max(d.y,d.z)),0.) - RB;
+  if (b.type == 5) return max(bx, dot(vec2(cos(b.cl.x), sin(b.cl.x)), q.xy) - b.cl.y);                  // wedge plate: one straight cut across its face (the sails)
+  if (b.type == 7) return max(bx, dot(vec2(cos(b.cl.x), sin(b.cl.x)), vec2(q.x, abs(q.y))) - b.cl.y);    // a flat triangle (the pennant)
+  if (b.type == 6) {                                                                                     // bow: pointed in plan, raked stem in profile (toward +x)
+    float pp = dot(normalize(vec2(hs.z - .1, 2.*hs.x)), vec2(q.x - hs.x, abs(q.z) - .1));
+    float pr = dot(normalize(vec2(2.*hs.y, -.95)), vec2(q.x - hs.x, q.y - hs.y));
+    return max(bx, max(pp, pr)); }
+  return bx;
+}
+float sdStuds(Bk b, vec3 q){
+  if ((b.flags & 4) != 0 || b.type == 3) return 1e3;
+  q.y -= b.size.y*.5;
+  if (b.type == 2) return sdStud(q);
+  vec2 xz = q.xz + b.size.xz*.5; vec2 cell = clamp(floor(xz), vec2(0.), b.size.xz - 1.);
+  if (b.type == 4 && length(cell + .5 - b.size.xz*.5) > b.size.x*.5 - .55) return 1e3;
+  return sdStud(vec3(xz.x - cell.x - .5, q.y, xz.y - cell.y - .5));
+}
+float sdFull(Bk b, vec3 p){ vec3 q = toLocal(b, p); return min(sdBody(b, q), sdStuds(b, q)); }
+// baseplate stud field
+float sdBaseStud(vec3 p){ vec2 c = floor(p.xz); return sdStud(vec3(p.x - c.x - .5, p.y, p.z - c.y - .5)); }
+uint cellAt(ivec3 c){ if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(${GX},${GY},${GZ})))) return 0u; return texelFetch(uGrid, c, 0).r; }
+vec2 boxHit(vec3 ro, vec3 rd, vec3 mn, vec3 mx){ vec3 iv = 1./rd, t0 = (mn - ro)*iv, t1 = (mx - ro)*iv; vec3 a = min(t0,t1), b = max(t0,t1);
+  return vec2(max(max(a.x,a.y),a.z), min(min(b.x,b.y),b.z)); }
+// trace: returns t, id (-1 none, -2 baseplate studs/top, -3 table), skipping transparent bricks if skipT
+vec2 trace(vec3 ro, vec3 rd, bool skipT, float tmax){
+  float tBest = tmax; float idBest = -1.;
+  // ground: an endless sea of blue baseplates (stud field) behind z=32, the table in front of it
+  if (rd.y < 0.) {
+    float tBot = -ro.y/rd.y; vec3 pb = ro + rd*tBot;
+    if (pb.z < ${GZ}.) {
+      float ts = max((.2125 - ro.y)/rd.y, 0.);
+      if (ts < tBest) {
+        bool hitS = false;
+        for (int s=0;s<40;s++){ vec3 q = ro + rd*ts; float d = min(sdBaseStud(q), q.y); if (d < 6e-4) { hitS = true; break; } ts += min(d, .22); if (ts >= tBot) break; }
+        ts = hitS ? ts : tBot;
+        if (ts < tBest && (ro + rd*ts).z < ${GZ}.) { tBest = ts; idBest = -2.; }
+      }
+    } else {
+      float t1 = (-.32 - ro.y)/rd.y; if (t1 < tBest) { tBest = t1; idBest = -3.; }
+      vec2 hb = boxHit(ro, rd, vec3(-500., -.32, 0.), vec3(500., 0., ${GZ}.)); if (hb.x < hb.y && hb.x > 0. && hb.x < tBest) { tBest = hb.x; idBest = -4.; }
+    }
+  }
+  // grid DDA
+  vec2 gb = boxHit(ro, rd, vec3(0.), GD);
+  if (gb.x < gb.y && gb.y > 0.) {
+    float t = max(gb.x, 0.) + 1e-4;
+    vec3 p = (ro + rd*t)/CS; ivec3 c = ivec3(floor(p)); c = clamp(c, ivec3(0), ivec3(${GX - 1},${GY - 1},${GZ - 1}));
+    vec3 st = sign(rd); ivec3 sti = ivec3(st);
+    vec3 nb = (vec3(c) + max(st, 0.))*CS;
+    vec3 tMax = (nb - ro)/rd, tD = abs(CS/rd);
+    float tc = t;
+    for (int i=0;i<180;i++){
+      float tn = min(tMax.x, min(tMax.y, tMax.z));
+      if (tc > tBest) break;
+      uint id = cellAt(c);
+      int bid = -1; bool studOnly = false; bool base = false;
+      if (id > 0u) bid = int(id) - 1;
+      else if (c.y > 0) { uint dn = cellAt(c - ivec3(0,1,0)); if (dn > 0u) { Bk bb = getB(int(dn) - 1); if (abs(bb.pos.y + bb.size.y - float(c.y)*${PL}) < .05) { bid = int(dn) - 1; studOnly = true; } } }
+      if (bid >= 0 || base) {
+        Bk b; bool ok = true; if (bid >= 0) { b = getB(bid); if (skipT && (b.flags & 1) != 0) ok = false; }
+        if (ok) {
+          float ts = tc; float te = min(tn, tBest);
+          for (int s=0;s<28;s++){
+            vec3 q = ro + rd*ts; float d;
+            if (base) d = sdBaseStud(q); else { vec3 l = toLocal(b, q); d = studOnly ? sdStuds(b, l) : sdBody(b, l); }
+            if (d < 6e-4) { tBest = ts; idBest = base ? -2. : float(bid); break; }
+            ts += d; if (ts > te) break;
+          }
+        }
+      }
+      if (tn > gb.y) break;
+      if (tMax.x < tMax.y && tMax.x < tMax.z) { c.x += sti.x; tMax.x += tD.x; }
+      else if (tMax.y < tMax.z) { c.y += sti.y; tMax.y += tD.y; }
+      else { c.z += sti.z; tMax.z += tD.z; }
+      tc = tn;
+      if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(${GX},${GY},${GZ})))) break;
+    }
+  }
+  // dynamic (falling) bricks
+  for (int k=0;k<24;k++){ if (k >= uNDyn) break; int id = uDyn[k]; Bk b = getB(id); if (skipT && (b.flags & 1) != 0) continue;
+    float rad = length(b.size)*.5 + .3; vec3 cc = b.pos + b.size*.5;
+    vec2 hb = boxHit(ro, rd, cc - vec3(rad, b.size.y*.5 + .05, rad), cc + vec3(rad, b.size.y*.5 + .3, rad));
+    if (hb.x < hb.y && hb.y > 0. && hb.x < tBest) { float ts = max(hb.x, 0.);
+      for (int s=0;s<40;s++){ float d = sdFull(b, ro + rd*ts); if (d < 6e-4) { tBest = ts; idBest = float(id); break; } ts += d; if (ts > hb.y || ts > tBest) break; } }
+  }
+  return vec2(tBest, idBest);
+}
+float shadowRay(vec3 ro, vec3 rd){
+  float res = 1.;
+  vec2 gb = boxHit(ro, rd, vec3(0.), GD);
+  if (gb.x < gb.y && gb.y > 0.) {
+    float t = max(gb.x, 0.) + 1e-4;
+    vec3 p = (ro + rd*t)/CS; ivec3 c = clamp(ivec3(floor(p)), ivec3(0), ivec3(${GX - 1},${GY - 1},${GZ - 1}));
+    vec3 st = sign(rd); ivec3 sti = ivec3(st); vec3 nb = (vec3(c) + max(st,0.))*CS; vec3 tMax = (nb - ro)/rd, tD = abs(CS/rd); float tc = t;
+    for (int i=0;i<120;i++){
+      float tn = min(tMax.x, min(tMax.y, tMax.z));
+      uint id = cellAt(c);
+      if (id > 0u) { Bk b = getB(int(id) - 1);
+        if ((b.flags & 1) == 0) for (int s=0;s<3;s++){ float ts = mix(tc, tn, (float(s) + .5)/3.); if (ts < .02) continue; float d = sdBody(b, toLocal(b, ro + rd*ts)); res = min(res, 9.*d/ts); }
+        if (res < .01) return 0.; }
+      if (tn > gb.y) break;
+      if (tMax.x < tMax.y && tMax.x < tMax.z) { c.x += sti.x; tMax.x += tD.x; } else if (tMax.y < tMax.z) { c.y += sti.y; tMax.y += tD.y; } else { c.z += sti.z; tMax.z += tD.z; }
+      tc = tn;
+      if (any(lessThan(c, ivec3(0))) || any(greaterThanEqual(c, ivec3(${GX},${GY},${GZ})))) break;
+    }
+  }
+  for (int k=0;k<24;k++){ if (k >= uNDyn) break; Bk b = getB(uDyn[k]); vec3 cc = b.pos + b.size*.5; float rad = length(b.size)*.5 + .3;
+    vec2 hb = boxHit(ro, rd, cc - rad, cc + rad); if (hb.x < hb.y && hb.y > 0.) for (int s=0;s<6;s++){ float ts = mix(max(hb.x,.02), hb.y, (float(s)+.5)/6.); res = min(res, 9.*sdFull(b, ro + rd*ts)/ts); } }
+  return clamp(res, 0., 1.);
+}
+float occAt(vec3 p){ return texture(uOcc, p/GD).r; }
+vec3 sky(vec3 d){
+  float h = d.y;
+  vec3 c = mix(vec3(.80,.80,.78), vec3(.36,.56,.88), smoothstep(-.03, .2, h));
+  c = mix(c, vec3(.14,.30,.70), smoothstep(.28, .9, h));
+  c += vec3(1.,.86,.62)*pow(max(dot(d, uSun), 0.), 10.)*.4;
+  vec2 cp = d.xz/(max(h, .02) + .15)*1.6;
+  float cl = smoothstep(.45, .8, vnoise(cp + 2.) * .65 + vnoise(cp*2.3 + 7.) * .35) * smoothstep(.02, .2, h);
+  c = mix(c, vec3(1.,.93,.85), cl*.35);
+  return c;
+}
+vec3 envRefl(vec3 r, float rough){
+  if (r.y < 0.) { return mix(vec3(.02,.06,.16), vec3(.25,.3,.35), smoothstep(-.6, 0., r.y))*.6; }
+  return sky(normalize(r + vec3(0., rough*.3, 0.)));
+}
+float D_ggx(float nh, float a){ float a2 = a*a; float d = nh*nh*(a2 - 1.) + 1.; return a2/(PI*d*d); }
+vec3 shade(vec3 p, vec3 n, vec3 v, vec3 alb, float rough, float sh, float ao, float trans){
+  vec3 L = uSun; vec3 h = normalize(L + v);
+  float ndl = max(dot(n, L), 0.), ndv = max(dot(n, v), 1e-3), nh = max(dot(n, h), 0.);
+  float F = .045 + .955*pow(1. - ndv, 5.);
+  float a = rough*rough;
+  float k = a*.5; float G = ndl/(ndl*(1. - k) + k) * ndv/(ndv*(1. - k) + k);
+  float Fh = .045 + .955*pow(1. - max(dot(h, v), 0.), 5.);
+  float spec = D_ggx(nh, max(a, .002)) * Fh * G / max(4.*ndl*ndv, 1e-3) * ndl;
+  vec3 skyIrr = mix(vec3(.10,.09,.085), vec3(.22,.32,.52), n.y*.5 + .5) * .8;
+  vec3 col = alb*(uSunC*ndl*sh + skyIrr*ao) * (1. - F*.5);
+  col += alb*uSunC*.08*max(dot(-n, L)*.5 + .5, 0.)*trans;                     // light through thin plastic
+  col += uSunC*spec*sh + envRefl(reflect(-v, n), rough)*F*ao*1.1;
+  // warm lamp light once lit
+  vec3 lv = uLampP - p; float ld = length(lv); col += alb*vec3(1.,.72,.35)*uLamp*max(dot(n, lv/ld), 0.)*2.2/(1. + ld*ld*.5);
+  return col;
+}
+vec3 normalOf(float id, vec3 p){
+  const vec2 e = vec2(1.,-1.)*6e-4;
+  if (id == -2.) {
+    float d0 = sdBaseStud(p); if (d0 > .01 && p.y < .01) return vec3(0.,1.,0.);
+    return normalize(e.xyy*sdBaseStud(p+e.xyy) + e.yyx*sdBaseStud(p+e.yyx) + e.yxy*sdBaseStud(p+e.yxy) + e.xxx*sdBaseStud(p+e.xxx)); }
+  Bk b = getB(int(id));
+  return normalize(e.xyy*sdFull(b,p+e.xyy) + e.yyx*sdFull(b,p+e.yyx) + e.yxy*sdFull(b,p+e.yxy) + e.xxx*sdFull(b,p+e.xxx));
+}
+vec3 surfaceB(vec3 ro, vec3 rd, vec2 hit, bool second){
+  float t = hit.x, id = hit.y; vec3 p = ro + rd*t; vec3 v = -rd;
+  if (id == -1.) return sky(rd);
+  vec3 n, alb; float rough = .22; float trans = .5; bool glass = false; bool lamp = false;
+  if (id <= -2.) {
+    if (id == -3.) { // table (white seamless) fading to sky
+      n = vec3(0.,1.,0.); alb = vec3(.62,.66,.70); rough = .5;
+      float sh = shadowRay(p + n*.01, uSun);
+      vec3 c = shade(p, n, v, alb, rough, sh, 1., 0.);
+      return mix(c, sky(normalize(vec3(rd.x, .02, rd.z))), smoothstep(30., 90., t));
+    }
+    n = id == -4. ? vec3(0., 0., 1.) : normalOf(-2., p);
+    alb = vec3(.020,.105,.42);    // blue baseplate
+    rough = .26;
+  } else {
+    Bk b = getB(int(id)); n = normalOf(id, p); alb = b.col; rough = b.rough;
+    glass = (b.flags & 1) != 0; lamp = (b.flags & 2) != 0;
+    if (b.print >= 0. && n.z > .9) {
+      vec3 l = toLocal(b, p); vec2 uv = vec2((l.x + b.size.x*.5)/b.size.x, 1. - (l.y + b.size.y*.5)/b.size.y);
+      vec4 R = uPR[int(b.print)];
+      vec4 pr = texture(uPrint, mix(R.xy, R.zw, uv));
+      alb = mix(alb, pow(pr.rgb, vec3(2.2)), pr.a); rough = mix(rough, .3, pr.a);
+    }
+    // faint moulding wear: micro scratches & scuffs
+    vec3 q = p*vec3(3.,9.,3.);
+    float sc = smoothstep(.985, 1., vnoise(vec2(dot(p.xz, vec2(.8,.6))*22., p.y*3. + id))) * .5;
+    rough = clamp(rough + sc*.25 + (vnoise(p.xz*14. + id)*.06 - .03), .08, .6);
+  }
+  float sh = shadowRay(p + n*.004, uSun);
+  float ao = 1. - .5*occAt(p + n*.35) - .35*occAt(p + n*.8);
+  ao *= .65 + .35*smoothstep(0., .45, p.y - (id == -2. ? 0. : -1.));
+  ao = clamp(ao, .25, 1.);
+  vec3 col = shade(p, n, v, alb, rough, sh, ao, trans);
+  if (lamp) col += vec3(1.,.55,.12)*uLamp*1.4;
+  return col;
+}
+vec3 surface(vec3 ro, vec3 rd, vec2 hit, bool second){
+  float t = hit.x, id = hit.y; vec3 p = ro + rd*t; vec3 v = -rd;
+  if (id == -1.) return sky(rd);
+  vec3 n, alb; float rough = .22; float trans = .5; bool glass = false; bool lamp = false;
+  if (id <= -2.) {
+    if (id == -3.) { // table (white seamless) fading to sky
+      n = vec3(0.,1.,0.); alb = vec3(.62,.66,.70); rough = .5;
+      float sh = shadowRay(p + n*.01, uSun);
+      vec3 c = shade(p, n, v, alb, rough, sh, 1., 0.);
+      return mix(c, sky(normalize(vec3(rd.x, .02, rd.z))), smoothstep(30., 90., t));
+    }
+    n = id == -4. ? vec3(0., 0., 1.) : normalOf(-2., p);
+    alb = vec3(.020,.105,.42);    // blue baseplate
+    rough = .26;
+  } else {
+    Bk b = getB(int(id)); n = normalOf(id, p); alb = b.col; rough = b.rough;
+    glass = (b.flags & 1) != 0; lamp = (b.flags & 2) != 0;
+    if (b.print >= 0. && n.z > .9) {
+      vec3 l = toLocal(b, p); vec2 uv = vec2((l.x + b.size.x*.5)/b.size.x, 1. - (l.y + b.size.y*.5)/b.size.y);
+      vec4 R = uPR[int(b.print)];
+      vec4 pr = texture(uPrint, mix(R.xy, R.zw, uv));
+      alb = mix(alb, pow(pr.rgb, vec3(2.2)), pr.a); rough = mix(rough, .3, pr.a);
+    }
+    // faint moulding wear: micro scratches & scuffs
+    vec3 q = p*vec3(3.,9.,3.);
+    float sc = smoothstep(.985, 1., vnoise(vec2(dot(p.xz, vec2(.8,.6))*22., p.y*3. + id))) * .5;
+    rough = clamp(rough + sc*.25 + (vnoise(p.xz*14. + id)*.06 - .03), .08, .6);
+  }
+  float sh = shadowRay(p + n*.004, uSun);
+  float ao = 1. - .5*occAt(p + n*.35) - .35*occAt(p + n*.8);
+  ao *= .65 + .35*smoothstep(0., .45, p.y - (id == -2. ? 0. : -1.));
+  ao = clamp(ao, .25, 1.);
+  if (glass && !second) {
+    float F = .04 + .96*pow(1. - max(dot(n, v), 0.), 5.);
+    vec3 rdr = normalize(refract(rd, n, .7) + rd*.4);
+    vec2 h2 = trace(p + rd*.02, rdr, true, 200.);
+    vec3 behind = surfaceB(p + rd*.02, rdr, h2, true);
+    vec3 col = behind*alb*alb*1.6 + envRefl(reflect(rd, n), .05)*F;
+    if (lamp) col += vec3(1.,.55,.12)*uLamp*1.7*(.55 + .45*pow(max(dot(n, v), 0.), .5));
+    return col;
+  }
+  vec3 col = shade(p, n, v, alb, rough, sh, ao, trans);
+  if (lamp) col += vec3(1.,.55,.12)*uLamp*1.4;
+  return col;
+}
+void main(){
+  vec2 ndc = gl_FragCoord.xy/uRes*2. - 1. - uJn;
+  vec3 rd = normalize(uCF + uCR*ndc.x*uTanH*uAsp + uCU*ndc.y*uTanH), ro = uCam;
+  vec2 hit = trace(ro, rd, false, 400.);
+  vec3 col = surface(ro, rd, hit, false);
+  float depth = hit.y == -1. ? 400. : hit.x;
+  col = mix(col, sky(normalize(vec3(rd.x, max(rd.y, .03), rd.z))), (1. - exp(-max(depth - 38., 0.)*.012))*(hit.y == -1. ? 0. : 1.));
+  // lighthouse beam in the haze
+  if (uLamp > 0.) {
+    vec3 bd = normalize(vec3(cos(uBeamA), -.03, sin(uBeamA)));
+    vec3 w0 = ro - uLampP; float b = dot(rd, bd), d = dot(rd, w0), e = dot(bd, w0); float den = 1. - b*b;
+    float sc = (b*e - d)/max(den, 1e-4), tc = (e - b*d)/max(den, 1e-4);
+    if (sc > 0. && sc < depth && tc > 0.) { vec3 pa = ro + rd*sc, pb = uLampP + bd*tc; float dist = length(pa - pb);
+      float wdt = .25 + tc*.12; col += vec3(1.,.82,.5)*uLamp*.45*exp(-dist*dist/(wdt*wdt))*exp(-tc*.05)*smoothstep(0., 1.5, tc); }
+    // glow around the lantern
+    vec3 w = uLampP - ro; float tl = dot(w, rd); if (tl > 0. && tl < depth + .6) { float dd = length(w - rd*tl); col += vec3(1.,.75,.4)*uLamp*.35*exp(-dd*dd*1.2); }
+  }
+  if (any(isnan(col))) col = vec3(0.);
+  o = vec4(col, depth);
+}`;
+const fsDof = `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uS; uniform vec2 uRes; uniform float uFocus, uAper, uMaxC;
+float coc(float z){ return clamp(uAper*abs(z - uFocus)/max(z, 1e-3), 0., uMaxC); }
+void main(){ vec4 c0 = texture(uS, vUV); float cc = coc(c0.a); vec3 acc = c0.rgb; float w = 1.;
+  for (int i=0;i<72;i++){ float fi = float(i) + .5; float r = sqrt(fi/72.)*uMaxC; float a = fi*2.39996323;
+    vec4 sm = texture(uS, vUV + vec2(cos(a), sin(a))*r/uRes); float sc = coc(sm.a); if (sm.a > c0.a) sc = min(sc, cc*1.5 + .5);
+    float wg = clamp(sc - r + 1., 0., 1.); acc += sm.rgb*wg*(1. + .8*smoothstep(1.5, 4., dot(sm.rgb, vec3(.33)))); w += wg*(1. + .8*smoothstep(1.5, 4., dot(sm.rgb, vec3(.33)))); }
+  o = vec4(acc/w, c0.a); }`;
+const fsBright = `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uS; uniform vec2 uPx;
+void main(){ vec3 c = vec3(0.); for(int i=-1;i<=1;i++) for(int j=-1;j<=1;j++) c += texture(uS, vUV + vec2(i,j)*uPx*1.5).rgb; c /= 9.;
+  float l = max(c.r, max(c.g, c.b)); o = vec4(c*smoothstep(1.2, 3., l), 1.); }`;
+const fsBlur = `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uS; uniform vec2 uDir;
+void main(){ vec3 c = texture(uS, vUV).rgb*.227; c += texture(uS, vUV + uDir*1.385).rgb*.316; c += texture(uS, vUV - uDir*1.385).rgb*.316;
+  c += texture(uS, vUV + uDir*3.231).rgb*.070; c += texture(uS, vUV - uDir*3.231).rgb*.070; o = vec4(c, 1.); }`;
+const fsFinal = `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uS, uB; uniform float uExpo, uFrame, uBloom, uFade, uFlare; uniform vec2 uFlareP;
+float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14), 0., 1.); }
+void main(){ vec2 d = vUV - .5; float ca = .0012;
+  vec3 c = vec3(texture(uS, vUV - d*ca).r, texture(uS, vUV).g, texture(uS, vUV + d*ca).b);
+  c += texture(uB, vUV).rgb*uBloom; c *= uExpo; c *= 1. - .3*smoothstep(.3, 1.05, length(d*vec2(1.25, 1.)));
+  if (uFlare > .002) { vec2 fq = (vUV - uFlareP)*vec2(1.78, 1.);
+    c += vec3(1.,.78,.45)*uFlare*(.9*exp(-length(fq)*7.) + .3*exp(-length(fq)*1.6) + .16);                 // glow and veil
+    c += vec3(1.,.7,.4)*uFlare*.35*exp(-abs(fq.y)*55.)*exp(-abs(fq.x)*1.2);                              // a horizontal streak
+    vec2 gq = (vUV - (1. - uFlareP))*vec2(1.78, 1.); c += vec3(.5,.7,1.)*uFlare*.08*exp(-length(gq)*14.); }  // a faint ghost opposite
+  c = aces(c); c = pow(c, vec3(1./2.2));
+  c = clamp((c - .5)*1.08 + .5, 0., 1.); float l = dot(c, vec3(.2126,.7152,.0722)); c = mix(vec3(l), c, 1.1);
+  c += (hash12(gl_FragCoord.xy + uFrame*17.31) - .5)*.02; c *= uFade; o = vec4(clamp(c, 0., 1.), 1.); }`;
+const pScene = prog(VSFS, fsScene), pDof = prog(VSFS, fsDof), pBright = prog(VSFS, fsBright), pBlur = prog(VSFS, fsBlur), pFinal = prog(VSFS, fsFinal);
+
+/* ------------------------------------------------------------------ the build */
+const COL = {
+  red: sRGB('#c4180c'), white: sRGB('#f2f1ec'), blue: sRGB('#0a57b8'), azure: sRGB('#2fa5c4'), lazure: sRGB('#7fd0e0'),
+  lgray: sRGB('#a3a8ac'), dgray: sRGB('#62676a'), tan: sRGB('#e2c895'), dtan: sRGB('#9a8a6a'), sgreen: sRGB('#8fb49c'),
+  green: sRGB('#2a8a44'), yellow: sRGB('#f3c623'), black: sRGB('#20262b'), tyellow: sRGB('#f5b11a'), brown: sRGB('#7a4a2a'), rbrown: sRGB('#5e3524'), tblue: sRGB('#9fd8f0'), orange: sRGB('#f2861c'),
+};
+const BR = [];   // bricks
+const occupied = new Set();
+const key = (x, y, z) => x + ',' + y + ',' + z;
+function add(x, y, z, w, h, d, col, o = {}) {
+  const b = { x, y, z, w, h, d, col, type: o.type || 0, flags: o.flags || 0, tl: o.tl ?? -1, print: o.print ?? -1, rough: o.rough ?? 0.2, wave: o.wave || null, drop: o.drop ?? 7, yaw0: o.yaw ?? 0, cl: o.cl || [0, 0], id: BR.length };
+  BR.push(b);
+  for (let i = x; i < x + w; i++) for (let j = y; j < y + h; j++) for (let k = z; k < z + d; k++) occupied.add(key(i, j, k));
+  return b;
+}
+const free = (x, y, z, w, h, d) => { for (let i = x; i < x + w; i++) for (let j = y; j < y + h; j++) for (let k = z; k < z + d; k++) if (occupied.has(key(i, j, k)) || i < 0 || k < 0 || i >= GX || k >= GZ) return false; return true; };
+const LH = { x: 15, z: 8 };          // lighthouse 2x2 footprint
+let LAMP = [16, 0, 9];
+function build() {
+  const R = Reel.rng(2727);
+  // --- island: a rock mound of grey bricks (3 courses), grass/sand plates on top
+  const isl = (i, k) => { const dx = (i + 0.5 - 16) / 7.6, dz = (k + 0.5 - 9) / 5.2; const r = Math.sqrt(dx * dx + dz * dz) + Reel.noise2(i * 0.4, k * 0.4) * 0.18; return r; };
+  const sizes = [[2, 4], [4, 2], [2, 3], [3, 2], [2, 2], [1, 3], [3, 1], [1, 2], [2, 1], [1, 1]];
+  for (let L = 0; L < 2; L++) {
+    const lim = [1.0, 0.6][L];
+    const cells = [];
+    for (let i = 0; i < GX; i++) for (let k = 0; k < GZ; k++) if (isl(i, k) < lim) cells.push([i, k]);
+    cells.sort((a, b) => hsh(a[0] * 13.1 + a[1] * 7.7 + L) - hsh(b[0] * 13.1 + b[1] * 7.7 + L));
+    for (const [i, k] of cells) {
+      if (!free(i, L * 3, k, 1, 3, 1)) continue;
+      for (const [w, d] of sizes) {
+        let ok = true; for (let a = 0; a < w && ok; a++) for (let c = 0; c < d && ok; c++) if (isl(i + a, k + c) >= lim || !free(i + a, L * 3, k + c, 1, 3, 1)) ok = false;
+        if (ok) { const pal = [COL.dgray, COL.lgray, COL.dgray, COL.dtan, COL.lgray]; add(i, L * 3, k, w, 3, d, pal[(R() * pal.length) | 0], { rough: 0.24 }); break; }
+      }
+    }
+  }
+  // grass and sand patches on the top course (leave the lighthouse footprint free)
+  for (let i = 0; i < GX; i++) for (let k = 0; k < GZ; k++) {
+    const r = isl(i, k);
+    if (r < 0.6 && free(i, 6, k, 1, 1, 1) && !(i >= 14 && i < 18 && k >= 7 && k < 11) && occupied.has(key(i, 5, k)) && hsh(i * 3.3 + k * 5.1) < 0.6) {
+      const w = (i % 2 === 0 && free(i + 1, 6, k, 1, 1, 1) && occupied.has(key(i + 1, 5, k)) && !(i + 1 >= 14 && i + 1 < 18 && k >= 7 && k < 11)) ? 2 : 1;
+      add(i, 6, k, w, 1, 1, hsh(i + k * 9) < 0.7 ? COL.sgreen : COL.green, { rough: 0.3 });
+    }
+  }
+  // keeper's hut
+  // --- lighthouse: built on the beat (tl filled in later)
+  const tower = [];
+  for (let k = 0; k < 5; k++) tower.push(add(LH.x, 6 + k * 3, LH.z, 2, 3, 2, k % 2 ? COL.white : COL.red, { type: 1, rough: 0.16 }));
+  const gal = add(LH.x - 1, 21, LH.z - 1, 4, 1, 4, COL.black, { type: 4, rough: 0.22 });
+  const lan = add(LH.x, 22, LH.z, 2, 3, 2, COL.tyellow, { type: 1, flags: 1 | 2 | 4, rough: 0.05 });
+  const roof = add(LH.x, 25, LH.z, 2, 3, 2, COL.red, { type: 2, rough: 0.16 });
+  LAMP = [LH.x + 1, 23.5 * PL, LH.z + 1];
+  const tTower = [0.5, 1.0, 1.5, 2.0, 2.5];
+  tower.forEach((b, i) => { b.tl = tTower[i]; b.drop = 5 + i * 0.3; b.yaw0 = (hsh(i * 3.1) - 0.5) * 0.5; b.tower = true; });
+  gal.tl = 3.0; lan.tl = 3.25; roof.tl = 3.5; gal.yaw0 = 0.4; lan.yaw0 = -0.3; roof.yaw0 = 0.5; [gal, lan, roof].forEach((b) => { b.tower = true; b.drop = 4; });
+  // --- pier in front of the island: brown planks, the title tiles click onto it at the end
+  for (let k = 14; k < 21; k++) for (let i = 10; i < 25; ) {
+    if (!free(i, 0, k, 1, 1, 1)) { i++; continue; }
+    let w = 1; while (w < 4 && i + w < 25 && free(i + w, 0, k, 1, 1, 1)) w++;
+    add(i, 0, k, w, 1, 1, hsh(i * 3.7 + k) < 0.5 ? COL.brown : COL.rbrown, { rough: 0.32 }); i += w;
+  }
+  // --- a little sailboat on open water beside the island, clicked together on the beats:
+  //     a red hull with a pointed, raked bow (6.0), the mast (6.5), the mainsail (6.75), the jib (7.0), pennant and bow foam (7.25).
+  //     The sails are thin wedge plates, one stud deep and a third of a brick high, so their free edges run in one straight line.
+  const BT = [];
+  const bt = (t, b) => { b.tl = t; b.drop = 9 + BT.length * 0.15; b.yaw0 = (hsh(BT.length * 7.3) - 0.5) * 0.5; BT.push(b); return b; };
+  const BX = 1, BZ = 11, DECK = 3;                                   // hull origin (stern, port side) and deck height in plates
+  // a cut along the world line x = X0 + k*(y - Y0): side +1 keeps the material on the +x side of it, -1 on the -x side
+  const cutXY = (x, w, yPl, h, X0, Y0, k, side) => {
+    const cx = x + w / 2, cy = (yPl + h / 2) * PL, e0 = X0 + k * (cy - Y0) - cx, L = Math.hypot(1, k);
+    const n = side > 0 ? [-1 / L, k / L] : [1 / L, -k / L];
+    return [Math.atan2(n[1], n[0]), side > 0 ? -e0 / L : e0 / L];
+  };
+  bt(6.0, add(BX, 0, BZ, 4, 3, 3, COL.red, { rough: 0.2 }));                                   // hull
+  bt(6.0, add(BX + 4, 0, BZ, 2, 3, 3, COL.red, { type: 6, flags: 4, rough: 0.18 }));            // bow
+  const MX = BX + 3;                                                                            // the mast stands on the last stud of the hull
+  bt(6.5, add(MX, DECK, BZ + 1, 1, 12, 1, COL.lgray, { type: 1, rough: 0.2 }));                 // mast, 12 plates
+  // mainsail, aft of the mast: luff on the mast, foot on the deck, leech from the stern up to the head
+  const Y0 = DECK * PL, ML = [BX + 0.05, MX - 0.12], MROWS = 9, MK = (ML[1] - ML[0]) / (MROWS * PL);
+  for (let r = 0; r < MROWS; r++) {
+    const xs = Math.floor(ML[0] + MK * r * PL + 1e-6), w = MX - xs;
+    bt(6.75, add(xs, DECK + r, BZ + 1, w, 1, 1, COL.white, { type: 5, flags: 4, rough: 0.14, cl: cutXY(xs, w, DECK + r, 1, ML[0], Y0, MK, +1) }));
+  }
+  // jib, ahead of the mast: the forestay runs from the bow down to the stemhead
+  const JT = BX + 5.8, JH = MX + 1.0, JROWS = 6, JK = (JH - JT) / (JROWS * PL);
+  for (let r = 0; r < JROWS; r++) {
+    const xe = Math.ceil(JT + JK * r * PL - 1e-6), w = xe - (MX + 1);
+    bt(7.0, add(MX + 1, DECK + r, BZ + 1, w, 1, 1, COL.white, { type: 5, flags: 4, rough: 0.14, cl: cutXY(MX + 1, w, DECK + r, 1, JT, Y0, JK, -1) }));
+  }
+  // pennant streaming aft from the masthead: a flat triangle
+  { const s = 0.37 / 2, L = Math.hypot(1, s); bt(7.25, add(MX - 2, DECK + 10, BZ + 1, 2, 2, 1, COL.red, { type: 7, flags: 4, rough: 0.18, cl: [Math.atan2(1 / L, -s / L), (0.03 + s) / L] })); }
+  for (const [x, z] of [[BX + 6, BZ + 1], [BX + 6, BZ], [BX + 6, BZ + 2], [BX + 7, BZ + 1], [BX - 1, BZ + 1]]) if (free(x, 0, z, 1, 1, 1)) bt(7.25, add(x, 0, z, 1, 1, 1, COL.white, { type: 1, rough: 0.16 }));   // foam at the bow, a little wake astern
+  // --- waves: bands of azure / white plates, bob in stop-motion
+  const bands = [{ z: 22, c: [COL.azure, COL.lazure, COL.white], x0: 11 }, { z: 24, c: [COL.azure, COL.white, COL.lazure], x0: 9 }, { z: 19, c: [COL.lazure, COL.white, COL.azure], x0: 22, x1: 31 },
+    { z: 16, c: [COL.azure, COL.lazure, COL.white], x0: 23, x1: 31 }, { z: 2, c: [COL.lazure, COL.white, COL.azure], x0: 6, x1: 26 }];
+  bands.forEach((bd, bi) => {
+    let x = (bd.x0 ?? 1) + ((bi * 3) % 4);
+    while (x < (bd.x1 ?? GX - 2)) {
+      const w = 2 + ((hsh(x * 1.7 + bi) * 3) | 0);
+      if (x + w > GX) break;
+      const zz = bd.z + (hsh(x * 0.9 + bi * 4) < 0.35 ? 1 : 0);
+      if (free(x, 0, zz, w, 1, 1)) {
+        add(x, 0, zz, w, 1, 1, bd.c[0], { wave: { band: bi, x }, rough: 0.18 });
+        if (w >= 3 && free(x + 1, 1, zz, w - 2, 1, 1)) add(x + 1, 1, zz, w - 2, 1, 1, bd.c[1], { wave: { band: bi, x }, rough: 0.18 });
+        if (w >= 4 && hsh(x + bi) < 0.5 && free(x + 2, 2, zz, 1, 1, 1)) add(x + 2, 2, zz, 1, 1, 1, bd.c[2], { wave: { band: bi, x }, rough: 0.18, type: 3 });
+      }
+      x += w + 1 + ((hsh(x * 2.3 + bi) * 2) | 0);
+    }
+  });
+  // --- beach: tan plates with a wavy shoreline
+  const shore = (i) => 26 + Math.round(1.2 * Math.sin(i * 0.45 + 0.8) + 0.7 * Math.sin(i * 1.3));
+  for (let k = 24; k < GZ; k++) for (let i = 0; i < GX; i++) {
+    if (k < shore(i) || !free(i, 0, k, 1, 1, 1)) continue;
+    for (const [w, d] of [[4, 2], [2, 4], [3, 2], [2, 2], [2, 1], [1, 2], [1, 1]]) {
+      let ok = true; for (let a2 = 0; a2 < w && ok; a2++) for (let c = 0; c < d && ok; c++) if (k + c < shore(i + a2) || !free(i + a2, 0, k + c, 1, 1, 1)) ok = false;
+      if (ok) { add(i, 0, k, w, 1, d, hsh(i * 5.7 + k * 1.3) < 0.82 ? COL.tan : COL.dtan, { rough: 0.3 }); break; }
+    }
+  }
+  [[5, 29, COL.white], [26, 28, COL.orange], [9, 30, COL.lgray], [28, 30, COL.white], [2, 27, COL.yellow]].forEach(([i, k, c]) => { if (free(i, 1, k, 1, 1, 1)) add(i, 1, k, 1, 1, 1, c, { type: 1, rough: 0.2 }); });
+  // --- the time-lapse: everything not in the tower/title rains in between 1.9 and 4.1 s, island first
+  const rest = BR.filter((b) => b.tl === -1);
+  rest.forEach((b) => { b.ord = (b.y * 0.6 + (b.wave ? 6 : 0) + (b.z > 23 ? 9 : 0) + (b.col === COL.brown || b.col === COL.rbrown ? 4 : 0) + hsh(b.id * 1.31) * 3); });
+  rest.sort((a, b) => a.ord - b.ord);
+  // a few of the rocks are already standing at the start (the scene is being built from a foundation)
+  rest.forEach((b, i) => { const u = i / rest.length; b.tl = u < 0.18 ? -1 : 1.9 + 2.2 * Math.pow((u - 0.18) / 0.82, 0.8); b.drop = 1.4 + hsh(b.id) * 1.6; b.yaw0 = (hsh(b.id * 2.7) - 0.5) * 0.7; });
+  BKH = Math.ceil(BR.length / 256);
+}
+const PRECT = [];
+function makePrint() {
+  // no printed bricks any more (the title is gone); keep an empty atlas so the shader's sampler stays valid
+  const c = document.createElement('canvas'); c.width = 64; c.height = 64;
+  for (let i = 0; i < 6; i++) PRECT.push([0, 0, 1, 1]);
+  tPrint = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tPrint);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+}
+// sRGB colour of printed ink is read straight from the canvas; convert in shader? keep simple: ink colours are dark/strong.
+
+/* ------------------------------------------------------------------ per-frame state */
+const gridData = new Uint16Array(GX * GY * GZ), occData = new Uint8Array(GX * GY * GZ);
+let bkData = null;
+const waveLift = (b, t) => {
+  if (!b.wave) return 0;
+  const tq = Math.floor(t * 12) / 12;                                  // stop-motion: 12 drawings a second
+  const ph = tq * Math.PI * 1.0 - b.wave.x * 0.42 + b.wave.band * 1.3;
+  const on = t > 5.0 && t < 8.5 ? 1 : 0;
+  return on * (Math.sin(ph) > 0.35 ? 1 : 0);
+};
+function state(t) {
+  gridData.fill(0); occData.fill(0);
+  if (!bkData) bkData = new Float32Array(BKW * BKH * 4);
+  const dyn = [];
+  for (const b of BR) {
+    let y = b.y * PL, yaw = 0, vis = true, inGrid = true;
+    if (b.tl > -1) {
+      const fall = Math.sqrt(2 * b.drop / 100);                  // g = 100 units/s^2: speeding up all the way to the click
+      if (t < b.tl - fall) vis = false;
+      else if (t < b.tl) {
+        const u = (t - (b.tl - fall)) / fall;
+        y = b.y * PL + b.drop * (1 - u * u);
+        yaw = b.yaw0 * (1 - E.outCubic(u));
+        inGrid = false;
+      } else if (t < b.tl + 0.08) { y = b.y * PL + 0.06 * Math.sin(Math.PI * (t - b.tl) / 0.08); inGrid = false; }
+    }
+    const lift = waveLift(b, t);
+    const yy = y + lift * PL;
+    const o = b.id * 16;
+    const cj = 0.96 + 0.08 * hsh(b.id * 5.31); bkData.set([b.x, yy, b.z, b.type, b.w, b.h * PL, b.d, b.flags, b.col[0] * cj, b.col[1] * cj, b.col[2] * cj, b.rough, b.print, yaw, b.cl[0], b.cl[1]], o);
+    if (!vis) { bkData[o + 1] = -100; continue; }
+    if (!inGrid) { dyn.push(b.id); continue; }
+    const j0 = b.y + lift;
+    for (let i = b.x; i < b.x + b.w; i++) for (let j = j0; j < j0 + b.h; j++) for (let k = b.z; k < b.z + b.d; k++) {
+      if (j < 0 || j >= GY) continue;
+      const idx = i + GX * (j + GY * k); gridData[idx] = b.id + 1; occData[idx] = (b.flags & 1) ? 60 : 255;
+    }
+  }
+  gl.bindTexture(gl.TEXTURE_3D, tGrid); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, GX, GY, GZ, gl.RED_INTEGER, gl.UNSIGNED_SHORT, gridData);
+  gl.bindTexture(gl.TEXTURE_3D, tOcc); gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, GX, GY, GZ, gl.RED, gl.UNSIGNED_BYTE, occData);
+  gl.bindTexture(gl.TEXTURE_2D, tBk);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, BKW, BKH, 0, gl.RGBA, gl.FLOAT, bkData);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  return dyn.slice(0, 24);
+}
+
+/* ------------------------------------------------------------------ camera */
+const v3 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], norm: (a) => { const l = Math.hypot(...a) || 1; return a.map((x) => x / l); }, cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]], lerp: (a, b, t) => a.map((x, i) => lerp(x, b[i], t)) };
+const cr1 = (p0, p1, p2, p3, u) => { const u2 = u * u, u3 = u2 * u; return 0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3); };
+// keys: t, eye, target, aperture(px), fov. One Hermite track: the camera keeps its momentum through every key.
+const KEYS = [
+  { t: 0.0, e: [10.2, 4.2, 18.6], a: [16, 3.2, 9], ap: 16, fov: 30 },
+  { t: 1.7, e: [9.4, 5.4, 21.0], a: [16, 4.8, 9], ap: 14, fov: 30 },
+  { t: 3.5, e: [8.0, 8.0, 26.5], a: [16, 6.4, 9.5], ap: 11, fov: 30 },
+  { t: 4.15, e: [9.0, 3.4, 34.0], a: [15.5, 4.0, 12], ap: 14, fov: 30 },
+  { t: 4.85, e: [12.0, 1.05, 32.2], a: [16, 3.2, 12], ap: 15, fov: 31 },
+  { t: 5.6, e: [14.0, 1.35, 29.0], a: [16, 5.6, 10], ap: 14, fov: 33.5 },
+  { t: 6.05, e: [9.6, 3.4, 26.0], a: [4.2, 1.6, 12.5], ap: 10, fov: 32 },          // swung onto the open water as the hull lands
+  { t: 6.6, e: [8.4, 4.9, 26.6], a: [4.0, 3.3, 12.5], ap: 9, fov: 32 },
+  { t: 7.5, e: [10.5, 5.2, 29.5], a: [5.4, 3.5, 12.5], ap: 9, fov: 31 },
+  { t: 8.0, e: [16.0, 6.0, 42.0], a: [10.0, 4.8, 12.0], ap: 8, fov: 28, stop: true },          // pulled back to the wide as the beam hits the lens
+  { t: 10.0, e: [15.6, 6.0, 41.0], a: [10.0, 4.85, 12.0], ap: 5, fov: 28 },
+];
+const CAMK = Track(KEYS.map((k) => ({ t: k.t, v: [...k.e, ...k.a, k.ap, k.fov], stop: k.stop })), { easeIn: true, easeOut: false });
+const P_STUD = [12.3, 0.62, 30.4], P_LAMP = [16, 9.2, 9], P_BOAT = [4.0, 2.2, 12.5], P_HOLD = [9.5, 3.0, 11.0];
+function focusAt(t, eye) {
+  // a rack is a quick move between two subjects, landing on the beat
+  const R = (a, b, t0, t1) => v3.lerp(a, b, E.inOutCubic(clamp((t - t0) / (t1 - t0))));
+  if (t < 3.5) return [16, lerp(3.2, 7.0, clamp(t / 3.5)), 9];
+  if (t < 4.15) return R([16, 7.0, 9], P_STUD, 3.5, 4.15);
+  if (t < 5.0) return R(P_STUD, P_LAMP, 4.85, 5.0);              // near studs sharp, snap to the lighthouse with the lamp on 5.0
+  if (t < 6.0) return P_LAMP;
+  if (t < 7.9) return R(P_LAMP, P_BOAT, 5.75, 6.0);              // the boat being built
+  return R(P_BOAT, P_HOLD, 7.9, 8.3);                             // the beam crosses the lens on 8.0: focus settles between boat and lighthouse, both sharp
+}
+function camAt(t) {
+  const k = CAMK(t);
+  const e = k.slice(0, 3);
+  // the low pass over the beach: a soft floor keeps the lens above the stud tops (plates 0.4 + studs), never through them
+  const FL = 0.98, SK = 0.06; e[1] = FL + SK * Math.log(1 + Math.exp((e[1] - FL) / SK));
+  return { e, a: k.slice(3, 6), f: focusAt(t, e), ap: k[6], fov: k[7] };
+}
+// the lighthouse beam points straight at the lens on 8.0
+let BEAM8 = 0;
+
+/* ------------------------------------------------------------------ frame */
+const FOV = 30 * Math.PI / 180;
+function scenePass(t) {
+  const dyn = state(t);
+  const cam = camAt(t);
+  // tiny handheld drift + a nudge on every click
+  let shake = 0; for (const b of BR) if (b.tl > 0 && t >= b.tl && t < b.tl + 0.12) shake = Math.max(shake, (1 - (t - b.tl) / 0.12) * (b.tl < 4 ? 1 : 0.6));
+  const hx = Reel.noise1(t * 0.8 + 2) * 0.05 + shake * 0.025 * Math.sin(t * 90), hy = Reel.noise1(t * 0.7 + 7) * 0.04 + shake * 0.02;
+  const eye = [cam.e[0] + hx, cam.e[1] + hy, cam.e[2]];
+  const fwd = v3.norm(v3.sub(cam.a, eye)), rt = v3.norm(v3.cross(fwd, [0, 1, 0])), up = v3.cross(rt, fwd);
+  const jit = Reel.jit || [0, 0];
+  const jn = [2 * jit[0] / OW, -2 * jit[1] / OH];
+  const sun = v3.norm([-0.72, 0.5, 0.48]);
+  const lamp = E.outCubic(inv(4.97, 5.3, t)) * (0.9 + 0.1 * Math.sin(t * 9));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fMain); gl.viewport(0, 0, OW, OH);
+  gl.useProgram(pScene);
+  U(pScene, 'uCam', eye); U(pScene, 'uCR', rt); U(pScene, 'uCU', up); U(pScene, 'uCF', fwd); U(pScene, 'uTanH', Math.tan(cam.fov * Math.PI / 360)); U(pScene, 'uAsp', 1920 / 1080);
+  U(pScene, 'uRes', [OW, OH]); U(pScene, 'uJn', jn); U(pScene, 'uSun', sun); U(pScene, 'uSunC', [3.6, 2.95, 2.2]); U(pScene, 'uT', t);
+  if (!BEAM8) { const e8 = camAt(8.0).e; BEAM8 = Math.atan2(e8[2] - LAMP[2], e8[0] - LAMP[0]) || 1e-6; }
+  const beamA = BEAM8 + (t - 8.0) * 1.9;
+  U(pScene, 'uLamp', lamp); U(pScene, 'uBeamA', beamA); U(pScene, 'uLampP', LAMP);
+  // lens flare when the beam sweeps across the lens
+  const toCam = Math.atan2(eye[2] - LAMP[2], eye[0] - LAMP[0]); let dA = beamA - toCam; dA = Math.atan2(Math.sin(dA), Math.cos(dA));
+  const flare = lamp * Math.exp(-dA * dA / 0.012);
+  const lc = v3.sub(LAMP, eye), lz = lc[0] * fwd[0] + lc[1] * fwd[1] + lc[2] * fwd[2], th = Math.tan(cam.fov * Math.PI / 360);
+  const flp = lz > 0 ? [0.5 + 0.5 * (lc[0] * rt[0] + lc[1] * rt[1] + lc[2] * rt[2]) / (lz * th * 1920 / 1080), 0.5 + 0.5 * (lc[0] * up[0] + lc[1] * up[1] + lc[2] * up[2]) / (lz * th)] : [0.5, 2];
+  const di = new Int32Array(24); dyn.forEach((d, i) => (di[i] = d)); gl.uniform1iv(pScene.loc('uDyn'), di); gl.uniform1i(pScene.loc('uNDyn'), dyn.length);
+  gl.uniform4fv(pScene.loc('uPR'), new Float32Array(PRECT.flat()));
+  bindTex(pScene, 'uGrid', tGrid, 0, gl.TEXTURE_3D); bindTex(pScene, 'uOcc', tOcc, 1, gl.TEXTURE_3D); bindTex(pScene, 'uBk', tBk, 2); bindTex(pScene, 'uPrint', tPrint, 3);
+  gl.bindVertexArray(vaoFS); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  return { cam, eye, flare, flp };
+}
+// the whip pan onto the falling hull (5.6 -> 6.05) is the fastest move in the film: there each motion-blur sub-frame is itself
+// the average of 3 time steps (48 per frame instead of 16), so the hull's studs smear instead of stepping. Everywhere else 1.
+const SUBW = [5.6, 6.05], SUBN = 3, SUBDT = 0.5 / 30 / 16;
+function frame(t) {
+  const n = t > SUBW[0] && t < SUBW[1] ? SUBN : 1;
+  let mid = null;
+  for (let s = 0; s < n; s++) {
+    const off = (s - (n - 1) / 2) * SUBDT / n;
+    if (s > 0) { gl.enable(gl.BLEND); gl.blendColor(0, 0, 0, 1 / (s + 1)); gl.blendFunc(gl.CONSTANT_ALPHA, gl.ONE_MINUS_CONSTANT_ALPHA); }
+    const r = scenePass(t + off);
+    gl.disable(gl.BLEND);
+    if (Math.abs(off) < 1e-9 || !mid) mid = r;
+  }
+  const { cam, eye, flare, flp } = mid;
+  // DOF
+  const focus = Math.hypot(...v3.sub(cam.f, eye));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fDof); gl.useProgram(pDof); bindTex(pDof, 'uS', tMain, 0);
+  U(pDof, 'uRes', [OW, OH]); U(pDof, 'uFocus', focus); U(pDof, 'uAper', cam.ap * RS); U(pDof, 'uMaxC', 26 * RS); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  // bloom
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fB1); gl.viewport(0, 0, BW, BH); gl.useProgram(pBright); bindTex(pBright, 'uS', tDof, 0); U(pBright, 'uPx', [1 / OW, 1 / OH]); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  for (let k = 0; k < 2; k++) { gl.bindFramebuffer(gl.FRAMEBUFFER, fB2); gl.useProgram(pBlur); bindTex(pBlur, 'uS', tB1, 0); U(pBlur, 'uDir', [(1 + k) / BW, 0]); gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fB1); bindTex(pBlur, 'uS', tB2, 0); U(pBlur, 'uDir', [0, (1 + k) / BH]); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, OW, OH);
+  gl.useProgram(pFinal); bindTex(pFinal, 'uS', tDof, 0); bindTex(pFinal, 'uB', tB1, 1);
+  U(pFinal, 'uExpo', 0.82); U(pFinal, 'uFrame', Math.floor(t * 30)); U(pFinal, 'uBloom', 0.18); U(pFinal, 'uFade', E.outCubic(clamp(t / 0.3 + 0.25)));
+  U(pFinal, 'uFlare', flare); U(pFinal, 'uFlareP', flp);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+}
+
+const CLICKS = [];
+Reel.scene({
+  duration: 10, fps: 30,
+  fonts: [],
+  async setup() { build(); makePrint(); },
+  cues: [
+    { t: 0.5, sfx: 'brick_click', gain: 0.9 }, { t: 1.0, sfx: 'brick_click', gain: 0.85 }, { t: 1.5, sfx: 'brick_click', gain: 0.85 }, { t: 2.0, sfx: 'brick_click', gain: 0.85 },
+    { t: 1.9, sfx: 'brick_rain', gain: 0.55 }, { t: 2.5, sfx: 'brick_click', gain: 0.8 }, { t: 3.0, sfx: 'brick_click', gain: 0.8 }, { t: 3.25, sfx: 'brick_click', gain: 0.75 },
+    { t: 3.5, sfx: 'brick_snap', gain: 0.9 }, { t: 4.0, sfx: 'swoosh_low', gain: 0.7 }, { t: 5.0, sfx: 'lamp_on', gain: 0.8 },
+    { t: 6.0, sfx: 'brick_snap', gain: 0.85 }, { t: 6.5, sfx: 'tile_click', gain: 0.9 }, { t: 6.75, sfx: 'tile_click', gain: 0.85 }, { t: 7.0, sfx: 'tile_click', gain: 0.9 },
+    { t: 7.25, sfx: 'tile_click', gain: 0.85 }, { t: 7.5, sfx: 'swoosh_low', gain: 0.45 }, { t: 8.0, sfx: 'beam_pass', gain: 0.7 },
+  ],
+  render(t) { frame(t); },
+});
+</script></body></html>

@@ -1,0 +1,13 @@
+# 安装脚本的换行符不能被 git 改掉：Windows 的 .bat 要 CRLF，Mac 的 .command 要 LF
+*.bat      text eol=crlf
+*.command  text eol=lf
+*.sh       text eol=lf
+*.js       text eol=lf
+*.py       text eol=lf
+*.md       text eol=lf
+*.json     text eol=lf
+*.html     text eol=lf
+*.otf      binary
+*.ttf      binary
+*.jpg      binary
+*.png      binary

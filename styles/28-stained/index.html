@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>28 彩色玻璃窗 · Stained Glass</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 28 彩色玻璃窗 · Stained Glass =====
+   Real world: a dim stone chapel. A tall lancet window, deep in a splayed stone reveal, leaded like a craftsman's
+   landscape window: a dawn sky cut in curved bands, hills, irises, a tree whose leaves are cut along their midribs;
+   streaky cathedral and opalescent glass, painted grisaille veins and bark, lead came of uneven width with solder
+   joints, two iron saddle bars. Clouds pass outside so the window breathes; the panes catch the sun band by band on
+   the beat; at 4s the sun comes out fully — coloured shafts full of dust reach the floor. The sun keeps moving, the
+   patches slide over the flagstones; the camera sinks into a low three-quarter view: the window above, the dusty shaft,
+   and on the floor the projection of the leaded rosette at the foot of the window, whose petals catch the sun one by
+   one on the beat; its amber heart lights on 8.0. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#050403');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+/* ---------------- the window: a craftsman's leaded landscape (Tiffany-style dawn, tree, irises) ----------------
+   Pieces are cut along the design: curved sky bands split by slanted cuts, hills and meadow split the same way,
+   each leaf cut in two along its midrib, the trunk in slanted pieces. Lead came of varying width with solder
+   blobs at the joints, two iron saddle bars, grisaille veins/bark/matting painted on. */
+const WC = 960, HC = 2540, K = WC / 1.8, APEX = 4.2 + 0.9 * Math.sqrt(3);
+const px = (x) => (x + 0.9) * K, py = (y) => (APEX - y) * K;
+const ux = (cx) => cx / K - 0.9, uy = (cy) => APEX - cy / K;
+function inLancet(x, y, d, y0) {
+  if (y < y0 || Math.abs(x) > 0.9 - d) return false;
+  if (y <= 4.2) return true;
+  const r = 1.8 - d;
+  return Math.hypot(x - 0.9, y - 4.2) < r && Math.hypot(x + 0.9, y - 4.2) < r;
+}
+const BAND = 1.52, PANEL = 1.56, BORDER = 0.07, BARS = [2.63, 3.97];
+const R = Reel.rng(28);
+const lin = (h) => { const n = parseInt(h.slice(1), 16); return [((n >> 16) & 255), ((n >> 8) & 255), (n & 255)]; };
+let winCanvas, auxCanvas, paintCanvas, auxData, colData, LEADM;
+const SQ = 0.8;    // tan of the sun's elevation: the rosette is pre-squashed so it lands round on the floor
+
+function buildWindow() {
+  const sc = Object.assign(document.createElement('canvas'), { width: WC, height: HC });
+  const g = sc.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, WC, HC);
+  const shapes = [];
+  let nid = 10;
+  const idCol = (id) => `rgb(${id & 255},${(id >> 8) & 255},${(id >> 16) & 255})`;
+  const add = (o, draw) => { const id = nid++; shapes[id] = o; g.fillStyle = idCol(id); g.strokeStyle = idCol(id); draw(); return id; };
+  const poly = (pts) => { g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(px(x), py(y)) : g.moveTo(px(x), py(y)))); g.closePath(); g.fill(); };
+  const xs = Array.from({ length: 101 }, (_, i) => -1 + i * 0.02);
+  const mkCuts = (spacing, seed) => { const r = Reel.rng(seed); const c = []; let x = -1.05 + r() * spacing * 0.6; while (x < 1.05) { c.push([x, (r() - 0.5) * 0.7]); x += spacing * (0.65 + 0.7 * r()); } return c; };
+  // hills and meadow (cut into pieces later)
+  const prof = (x, b, a1, f1, p1, a2, f2, p2) => b + a1 * Math.sin(x * f1 + p1) + a2 * Math.sin(x * f2 + p2);
+  const farH = (x) => prof(x, 2.36, 0.12, 2.3, 0.4, 0.05, 6.1, 1.2), nearH = (x) => prof(x, 2.06, 0.1, 3.1, 2.2, 0.04, 7.3, 0.3), meadH = (x) => prof(x, 1.84, 0.05, 4.2, 1.1, 0.02, 9, 2);
+  add({ pal: ['#5b5c9a', '#6a679f', '#55548e', '#6f6fa8', '#61649f'], cuts: mkCuts(0.36, 11), yr: 2.3, opal: 0.6 }, () => poly([[-1, PANEL], ...xs.map((x) => [x, farH(x)]), [1, PANEL]]));
+  add({ pal: ['#6d8c4c', '#7f9c55', '#5f7f45', '#88a25e', '#738f50'], cuts: mkCuts(0.32, 12), yr: 2.0, opal: 0.4 }, () => poly([[-1, PANEL], ...xs.map((x) => [x, nearH(x)]), [1, PANEL]]));
+  add({ pal: ['#3f6a35', '#4c7a3c', '#3a5f33', '#567f3f'], cuts: mkCuts(0.27, 13), yr: 1.7, opal: 0.3 }, () => poly([[-1, PANEL], ...xs.map((x) => [x, meadH(x)]), [1, PANEL]]));
+  // pointed leaf / petal (vesica), optionally split along the midrib into two pieces
+  const vesica = (cx, cy, a, L, w, side) => {
+    const dx = Math.cos(a), dy = Math.sin(a), nx = -dy, ny = dx;
+    const B = [cx - dx * L / 2, cy - dy * L / 2], T = [cx + dx * L / 2, cy + dy * L / 2];
+    g.beginPath(); g.moveTo(px(B[0]), py(B[1]));
+    if (side >= 0) g.quadraticCurveTo(px(cx + nx * w * 1.25), py(cy + ny * w * 1.25), px(T[0]), py(T[1])); else g.lineTo(px(T[0]), py(T[1]));
+    if (side <= 0) g.quadraticCurveTo(px(cx - nx * w * 1.25), py(cy - ny * w * 1.25), px(B[0]), py(B[1])); else g.lineTo(px(B[0]), py(B[1]));
+    g.closePath(); g.fill();
+  };
+  const pick = (a, r = R()) => a[Math.floor(r * a.length)];
+  const PAINT = { leaves: [], petals: [], trunk: [], limbs: [] };
+  // irises in the meadow: broad sword leaves, three petals and a yellow beard each
+  const IRIS = [[-0.56, 1.8], [-0.28, 1.72], [0.42, 1.76], [0.66, 1.69]];
+  IRIS.forEach(([x, y], i) => {
+    add({ col: pick(['#4e8a3c', '#5a9a44']), opal: 0.4 }, () => vesica(x - 0.035, y - 0.07, Math.PI / 2 + 0.25, 0.2, 0.032, 0));
+    add({ col: pick(['#3f7a36', '#4c8a3e']), opal: 0.4 }, () => vesica(x + 0.04, y - 0.08, Math.PI / 2 - 0.3, 0.18, 0.03, 0));
+    const pts = [[Math.PI / 2, 0.1, 0.045, '#7d60b8'], [Math.PI / 2 + 2.1, 0.105, 0.05, '#55409a'], [Math.PI / 2 - 2.1, 0.105, 0.05, '#5c46a2']];
+    pts.forEach(([a, L, w, c]) => { const cx = x + Math.cos(a) * L * 0.55, cy = y + 0.04 + Math.sin(a) * L * 0.55; add({ col: c, opal: 0.55 }, () => vesica(cx, cy, a, L, w, 0)); PAINT.petals.push([cx, cy, a, L, w]); });
+    add({ col: '#e2b33c', opal: 0.2 }, () => vesica(x, y + 0.035, Math.PI / 2, 0.042, 0.017, 0));
+  });
+  // the trunk: slanted pieces, root flare, a slight lean
+  const tw = (y) => lerp(0.11, 0.058, inv(1.75, 3.1, y)) + 0.075 * Math.exp(-(y - 1.72) / 0.08);
+  const tc = (y) => 0.02 * Math.sin(y * 2.4);
+  const tcuts = [[1.66, 0], [2.04, 0.35], [2.42, -0.3], [2.78, 0.28], [3.12, 0]];
+  for (let i = 0; i < 4; i++) {
+    const [ya, sa] = tcuts[i], [yb, sb] = tcuts[i + 1];
+    const pts = [];
+    for (let k = 0; k <= 10; k++) { const y = lerp(ya, yb, k / 10); pts.push([tc(y) - tw(y), y + sa * 0 ]); }
+    const left = Array.from({ length: 11 }, (_, k) => { const y = lerp(ya - sa * 0.1, yb - sb * 0.1, k / 10); return [tc(y) - tw(y), y]; });
+    const right = Array.from({ length: 11 }, (_, k) => { const y = lerp(yb + sb * 0.1, ya + sa * 0.1, k / 10); return [tc(y) + tw(y), y]; });
+    add({ col: pick(['#8b5523', '#a0662b', '#7a4a1f', '#94602a']), opal: 0.5, trunk: 1 }, () => poly(left.concat(right)));
+  }
+  // limbs
+  const LIMBS = [[-0.6, 3.6, -0.36, 3.12], [-0.46, 4.25, -0.32, 3.5], [-0.08, 4.62, -0.14, 3.8], [0.28, 4.5, 0.16, 3.7], [0.5, 4.15, 0.36, 3.45], [0.64, 3.62, 0.4, 3.12]];
+  LIMBS.forEach(([ex, ey, cx, cy]) => {
+    const Pt = (u) => [lerp(lerp(0, cx, u), lerp(cx, ex, u), u), lerp(lerp(3.05, cy, u), lerp(cy, ey, u), u)];
+    for (let seg = 0; seg < 2; seg++) {
+      add({ col: seg ? '#9a5f2a' : '#87501f', opal: 0.4 }, () => { g.lineCap = 'round'; g.lineWidth = (seg ? 0.034 : 0.05) * K; g.beginPath();
+        for (let u = seg * 0.5; u <= seg * 0.5 + 0.5 + 1e-6; u += 0.05) { const [x, y] = Pt(u); u === seg * 0.5 ? g.moveTo(px(x), py(y)) : g.lineTo(px(x), py(y)); } g.stroke(); });
+    }
+    PAINT.limbs.push(Pt);
+  });
+  // canopy: leaves cut in two along the midrib (light half / shaded half), a few warm blossoms
+  const LEAFG = ['#5fa04a', '#7cb85a', '#9cc966', '#4f8f45', '#b5d070', '#6aab55', '#88c25e', '#3f8a4a'], LEAFW = ['#d6a03a', '#c9862f', '#e2b84a'];
+  const leaves = [];
+  for (let tries = 0; tries < 2500 && leaves.length < 128; tries++) {
+    const a = R() * Math.PI * 2, r = Math.sqrt(R());
+    const x = Math.cos(a) * r * 0.82, y = 3.95 + Math.sin(a) * r * 0.7;
+    if (y < 3.15 || !inLancet(x, y, BORDER + 0.06, PANEL)) continue;
+    if (leaves.some((l) => Math.hypot(l[0] - x, l[1] - y) < 0.07)) continue;
+    leaves.push([x, y]);
+  }
+  for (const [x, y] of leaves) {
+    const a = Math.atan2(y - 3.3, x) + (R() - 0.5) * 0.9, L = 0.18 + R() * 0.06, w = 0.06 + R() * 0.02;
+    const warm = R() < 0.12, c1 = warm ? pick(LEAFW) : pick(LEAFG);
+    const c2 = lin(c1).map((v) => Math.round(v * 0.8)); const c2h = '#' + c2.map((v) => v.toString(16).padStart(2, '0')).join('');
+    add({ col: c1, opal: 0.45 }, () => vesica(x, y, a, L, w, 1));
+    add({ col: c2h, opal: 0.3 }, () => vesica(x, y, a, L, w, -1));
+    PAINT.leaves.push([x, y, a, L, w]);
+  }
+  for (let i = 0; i < 9; i++) {
+    const a = R() * Math.PI * 2, r = 0.2 + R() * 0.45, x = Math.cos(a) * r * 0.8, y = 3.95 + Math.sin(a) * r * 0.66;
+    if (!inLancet(x, y, BORDER + 0.07, PANEL)) continue;
+    add({ col: pick(['#c8572f', '#a5262f', '#d98a2e']), opal: 0.2 }, () => { g.beginPath(); g.arc(px(x), py(y), 0.022 * K, 0, 7); g.fill(); });
+  }
+  const sid = g.getImageData(0, 0, WC, HC).data;
+
+  // per-pixel piece ids
+  const LETTER = 100000, ROS = 100000, BANDF = 99000, RUBY = 98000, BORD = 90000, SKY = 70000, CUT = 200000;
+  const ids = new Int32Array(WC * HC).fill(-1);
+  const bandY = (k, x) => 1.9 + k * 0.29 + 0.055 * Math.sin(x * 2.1 + k * 1.3) + 0.025 * Math.sin(x * 4.7 + k * 2.9);
+  const skyCuts = Array.from({ length: 16 }, (_, k) => mkCuts(0.31, 100 + k));
+  const cutIdx = (cuts, x, y, yr) => { let j = 0; for (const [cx, sl] of cuts) { if (x > cx + sl * (y - yr) + 0.035 * Math.sin((y - yr) * 8 + cx * 5)) j++; else break; } return j; };
+  for (let cy = 0; cy < HC; cy++) {
+    const y = uy(cy + 0.5);
+    for (let cx = 0; cx < WC; cx++) {
+      const x = ux(cx + 0.5), o = cy * WC + cx;
+      if (!inLancet(x, y, 0, 1.0)) continue;
+      if (y < BAND) {
+        if (y < 1.033 || y > 1.488) { ids[o] = RUBY + Math.floor((x + 0.95 + 0.03 * Math.sin(y * 40)) / 0.31) + (y > 1.2 ? 10 : 0); continue; }
+        // the rosette, drawn squashed by SQ so its projection on the floor is round
+        const rx = x, ry = (y - 1.26) / SQ, r = Math.hypot(rx, ry), an = (Math.atan2(ry, rx) + Math.PI * 2) % (Math.PI * 2);
+        const lobe = 0.215 + 0.055 * Math.abs(Math.cos(4 * an));
+        if (r < 0.07) { ids[o] = ROS; continue; }
+        if (r < lobe) { ids[o] = ROS + 1 + Math.floor(((an + Math.PI / 8) % (Math.PI * 2)) / (Math.PI / 4)); continue; }
+        if (r < 0.3) { ids[o] = ROS + 10 + Math.floor(an / (Math.PI / 8)); continue; }
+        if (r < 0.315) { ids[o] = -2; continue; }
+        // the deep blue field around it, cut radially into eight pieces
+        ids[o] = BANDF + Math.floor(an / (Math.PI / 4)); continue;
+      }
+      if (y < PANEL) { ids[o] = -2; continue; }
+      if (!inLancet(x, y, BORDER, PANEL + BORDER)) {
+        let s; if (y <= 4.2) s = (x < 0 ? 0 : 1000) + (y - PANEL) / 0.15;
+        else s = (x < 0 ? 0 : 1000) + (4.2 - PANEL) / 0.15 + Math.abs(Math.atan2(y - 4.2, x < 0 ? x - 0.9 : x + 0.9)) * 1.8 / 0.15;
+        ids[o] = BORD + Math.floor(s); continue;
+      }
+      const id = sid[o * 4] | (sid[o * 4 + 1] << 8) | (sid[o * 4 + 2] << 16);
+      if (id >= 10 && shapes[id]) { const sh = shapes[id]; ids[o] = sh.cuts ? CUT + id * 64 + cutIdx(sh.cuts, x, y, sh.yr) : id; continue; }
+      if (id !== 0) { ids[o] = -2; continue; }
+      let k = Math.max(0, Math.floor((y - 1.9) / 0.29)); while (k > 0 && y < bandY(k, x)) k--; while (y >= bandY(k + 1, x)) k++;
+      ids[o] = SKY + k * 64 + cutIdx(skyCuts[Math.min(15, k)], x, y, bandY(k, 0) + 0.15);
+    }
+  }
+  // lead came: distance to the nearest piece boundary vs a width that wanders; solder blobs at the joints
+  const N = WC * HC, edge = new Uint8Array(N), junc = new Uint8Array(N);
+  const painted = (a) => false;
+  for (let cy = 1; cy < HC - 1; cy++) for (let cx = 1; cx < WC - 1; cx++) {
+    const o = cy * WC + cx, a = ids[o]; if (a === -1) continue;
+    const nb = [ids[o + 1], ids[o - 1], ids[o + WC], ids[o - WC]];
+    let e = a === -2;
+    for (const b of nb) if (b !== a && !(painted(a) && b >= BANDF && b < LETTER) && !(painted(b) && a >= BANDF && a < LETTER) && !(painted(a) && painted(b))) e = true;
+    if (e) edge[o] = 1;
+  }
+  for (let cy = 2; cy < HC - 2; cy += 1) for (let cx = 2; cx < WC - 2; cx += 1) {
+    const o = cy * WC + cx; if (!edge[o]) continue;
+    const seen = new Set(); for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) { const b = ids[o + dy * WC + dx]; if (b >= 0) seen.add(b); }
+    if (seen.size >= 3) junc[o] = 1;
+  }
+  const dist = new Float32Array(N).fill(1e6);
+  for (let o = 0; o < N; o++) if (edge[o]) dist[o] = 0;
+  for (let cy = 0; cy < HC; cy++) for (let cx = 0; cx < WC; cx++) { const o = cy * WC + cx; let d = dist[o];
+    if (cx > 0) d = Math.min(d, dist[o - 1] + 1); if (cy > 0) { d = Math.min(d, dist[o - WC] + 1); if (cx > 0) d = Math.min(d, dist[o - WC - 1] + 1.414); if (cx < WC - 1) d = Math.min(d, dist[o - WC + 1] + 1.414); } dist[o] = d; }
+  for (let cy = HC - 1; cy >= 0; cy--) for (let cx = WC - 1; cx >= 0; cx--) { const o = cy * WC + cx; let d = dist[o];
+    if (cx < WC - 1) d = Math.min(d, dist[o + 1] + 1); if (cy < HC - 1) { d = Math.min(d, dist[o + WC] + 1); if (cx < WC - 1) d = Math.min(d, dist[o + WC + 1] + 1.414); if (cx > 0) d = Math.min(d, dist[o + WC - 1] + 1.414); } dist[o] = d; }
+  LEADM = new Uint8Array(N);  // 1 lead, 2 solder, 3 iron bar
+  for (let cy = 0; cy < HC; cy++) for (let cx = 0; cx < WC; cx++) {
+    const o = cy * WC + cx; if (ids[o] === -1) continue;
+    const y = uy(cy + 0.5);
+    const w = 2.0 + 1.7 * (0.5 + 0.5 * Reel.noise2(cx / 34, cy / 34)) + (y < BAND ? -0.3 : 0);
+    if (dist[o] <= w) LEADM[o] = 1;
+    if (BARS.some((b) => Math.abs(y - b) < 0.012) || (y >= BAND && y < PANEL)) LEADM[o] = 3;
+  }
+  for (let cy = 6; cy < HC - 6; cy++) for (let cx = 6; cx < WC - 6; cx++) {
+    if (!junc[cy * WC + cx] || ((cx * 7 + cy * 13) % 3)) continue;
+    const r = 4.5 + 1.5 * Reel.hash(cx * 0.37 + cy * 1.7);
+    for (let dy = -6; dy <= 6; dy++) for (let dx = -6; dx <= 6; dx++) if (dx * dx + dy * dy <= r * r) { const o = (cy + dy) * WC + cx + dx; if (ids[o] !== -1 && LEADM[o] !== 3) LEADM[o] = 2; }
+  }
+  // per-piece colour, ignition (the sun's line runs down the window on the beat), density, opalescence
+  const cyAcc = new Map();
+  for (let o = 0; o < N; o++) { const a = ids[o]; if (a < 0) continue; let e = cyAcc.get(a); if (!e) cyAcc.set(a, e = [0, 0]); e[0] += Math.floor(o / WC); e[1]++; }
+  const skyPal = (h) => h < 2.9 ? ['#f1c27d', '#eaa86b', '#f3d595', '#e59a74', '#f0b878'] : h < 3.5 ? ['#dccf9a', '#bcd2c0', '#a6c9d0', '#cbd3b0'] : h < 4.3 ? ['#86b2cf', '#76a3cb', '#8dbad6', '#6d98c4'] : h < 5.0 ? ['#5683bf', '#4b74b4', '#5a7dbb', '#4467a8'] : ['#3a4f97', '#3a448b', '#323d82', '#463f8c'];
+  const info = new Map();
+  for (const [a, e] of cyAcc) {
+    const yMean = uy(e[0] / e[1]); const hr = Reel.hash(a * 0.731);
+    let col, opal = 0.35;
+    if (a >= ROS) { const k = a - ROS; col = k === 0 ? '#f0a43a' : k < 10 ? (k % 2 ? '#b0182c' : '#e2a640') : (k % 2 ? '#2d6a4a' : '#c98a34'); opal = 0.2; }
+    else if (a >= BANDF && a < ROS) { col = ['#1f3a86', '#22408f', '#1c3680', '#24438f'][a % 4]; opal = 0.25; }
+    else if (a >= RUBY) col = ['#a11d2c', '#8f1826', '#9a1c2a'][a % 3];
+    else if (a >= BORD) { const k = a - BORD; col = ['#b98a3a', '#7d7a3e', '#355a3e', '#a8803a'][k % 4]; }
+    else if (a >= CUT) { const sh = shapes[Math.floor((a - CUT) / 64)]; col = sh ? pick(sh.pal, hr) : '#777'; opal = sh ? sh.opal : 0.3; }
+    else if (a >= SKY) { const k = Math.floor((a - SKY) / 64); col = pick(skyPal(1.9 + (k + 0.5) * 0.29), hr); opal = 0.55; }
+    else { const sh = shapes[a]; col = sh ? sh.col : '#777'; opal = sh ? sh.opal : 0.3; }
+    const rank = clamp(1 - (yMean - 1.0) / (APEX - 1.0));
+    let tIgn = 0.5 + Math.min(6, Math.floor(rank * 7)) * 0.5 + Reel.hash(a * 1.37) * 0.03;
+    if (a >= ROS) { const k = a - ROS;   // petals clockwise in five groups on 7.0 .. 7.5, the heart on 8.0, the ring with the field
+      tIgn = k === 0 ? 8.0 : k < 10 ? 7.0 + Math.min(4, Math.floor(((8 - (k - 1)) % 8) * 5 / 8)) * 0.125 : 3.5 + Reel.hash(a) * 0.05; }
+    else if (a >= RUBY && a < ROS) tIgn = 3.5 + Reel.hash(a * 1.7) * 0.05;
+    // per-piece tint jitter: no two pieces from the same sheet are quite alike
+    const c = lin(col).map((v, i) => clamp(v * (0.9 + 0.2 * Reel.hash(a * 3.1 + i)) / 255) * 255);
+    info.set(a, { col: c, tIgn, dens: Reel.hash(a * 3.91), opal });
+  }
+  winCanvas = Object.assign(document.createElement('canvas'), { width: WC, height: HC });
+  auxCanvas = Object.assign(document.createElement('canvas'), { width: WC, height: HC });
+  paintCanvas = Object.assign(document.createElement('canvas'), { width: WC, height: HC });
+  const wg = winCanvas.getContext('2d', { willReadFrequently: true }), ag = auxCanvas.getContext('2d', { willReadFrequently: true }), pg = paintCanvas.getContext('2d', { willReadFrequently: true });
+  const wi = wg.createImageData(WC, HC), ai = ag.createImageData(WC, HC), pi = pg.createImageData(WC, HC);
+  for (let o = 0; o < N; o++) {
+    const a = ids[o], p = o * 4;
+    if (a === -1) continue;
+    const inf = info.get(a), L = LEADM[o];
+    const c = L === 1 ? [16, 14, 13] : L === 2 ? [34, 32, 30] : L === 3 ? [9, 9, 9] : inf ? inf.col : [16, 14, 13];
+    wi.data[p] = c[0]; wi.data[p + 1] = c[1]; wi.data[p + 2] = c[2]; wi.data[p + 3] = 255;
+    ai.data[p] = inf ? Math.round(clamp(inf.tIgn / 10) * 255) : 255; ai.data[p + 1] = inf ? Math.round(inf.dens * 255) : 0; ai.data[p + 2] = inf ? Math.round(inf.opal * 255) : 0; ai.data[p + 3] = 255;
+    pi.data[p] = L ? 255 : 0; pi.data[p + 3] = 255;
+  }
+  wg.putImageData(wi, 0, 0); ag.putImageData(ai, 0, 0); pg.putImageData(pi, 0, 0);
+  // grisaille (green channel of the paint layer): veins, bark, shading
+  pg.save();
+  pg.beginPath(); pg.moveTo(px(-0.9), py(1.0)); pg.lineTo(px(-0.9), py(4.2));
+  pg.arc(px(0.9), py(4.2), 1.8 * K, Math.PI, Math.PI * 4 / 3, false); pg.arc(px(-0.9), py(4.2), 1.8 * K, Math.PI * 5 / 3, Math.PI * 2, false);
+  pg.lineTo(px(0.9), py(1.0)); pg.closePath(); pg.clip();
+  pg.globalCompositeOperation = 'lighter'; pg.lineCap = 'round';
+  const G = (a) => `rgba(0,255,0,${a})`;
+  for (const [x, y, a, L, w] of PAINT.leaves) {
+    const dx = Math.cos(a), dy = Math.sin(a), nx = -dy, ny = dx;
+    pg.strokeStyle = G(0.38); pg.lineWidth = 1.4;
+    for (const tt of [-0.25, 0, 0.22]) for (const sd of [1, -1]) {
+      const bx = x + dx * L * tt, by = y + dy * L * tt;
+      pg.beginPath(); pg.moveTo(px(bx), py(by)); pg.lineTo(px(bx + (dx * 0.55 + nx * sd * 0.8) * w * 0.85), py(by + (dy * 0.55 + ny * sd * 0.8) * w * 0.85)); pg.stroke();
+    }
+    // matting toward the leaf tip
+    const gr = pg.createLinearGradient(px(x - dx * L / 2), py(y - dy * L / 2), px(x + dx * L / 2), py(y + dy * L / 2));
+    gr.addColorStop(0, G(0.0)); gr.addColorStop(1, G(0.16)); pg.fillStyle = gr;
+    pg.beginPath(); pg.ellipse(px(x), py(y), L / 2 * K, w * K, -a, 0, 7); pg.fill();
+  }
+  for (const [x, y, a, L, w] of PAINT.petals) {
+    const dx = Math.cos(a), dy = Math.sin(a), nx = -dy, ny = dx;
+    pg.strokeStyle = G(0.5); pg.lineWidth = 1.3;
+    for (const sd of [-0.5, 0, 0.5]) { pg.beginPath(); pg.moveTo(px(x - dx * L * 0.4), py(y - dy * L * 0.4)); pg.lineTo(px(x + dx * L * 0.35 + nx * w * sd), py(y + dy * L * 0.35 + ny * w * sd)); pg.stroke(); }
+  }
+  // bark: wavy strokes up the trunk, shading on its right flank
+  for (let i = 0; i < 30; i++) {
+    const x0 = (R() - 0.5) * 0.16, y0 = 1.76 + R() * 1.2, L = 0.12 + R() * 0.2;
+    pg.strokeStyle = G(0.35 + 0.25 * R()); pg.lineWidth = 1.4 + R() * 1.4;
+    pg.beginPath(); pg.moveTo(px(x0 + tc(y0)), py(y0));
+    for (let k = 1; k <= 8; k++) { const y = y0 + L * k / 8; const xx = x0 * (tw(y) / 0.09) + tc(y) + 0.006 * Math.sin(y * 60 + i); pg.lineTo(px(xx), py(y)); }
+    pg.stroke();
+  }
+  for (let k = 0; k < 40; k++) { const y = 1.72 + k * 0.035; pg.strokeStyle = G(0.28); pg.lineWidth = 0.035 * K; pg.beginPath(); pg.moveTo(px(tc(y) + tw(y) * 0.75), py(y)); pg.lineTo(px(tc(y) + tw(y) * 0.75), py(y + 0.036)); pg.stroke(); }
+  for (const Pt of PAINT.limbs) { pg.strokeStyle = G(0.3); pg.lineWidth = 0.012 * K; pg.beginPath(); for (let u = 0; u <= 1.001; u += 0.05) { const [x, y] = Pt(u); u ? pg.lineTo(px(x + 0.01), py(y - 0.012)) : pg.moveTo(px(x + 0.01), py(y - 0.012)); } pg.stroke(); }
+  // hills: a few contour strokes
+  for (let i = 0; i < 7; i++) { const yb = 1.75 + i * 0.1; pg.strokeStyle = G(0.16); pg.lineWidth = 2; pg.beginPath(); xs.forEach((x, k) => { const y = yb + 0.04 * Math.sin(x * 3 + i); k ? pg.lineTo(px(x), py(y)) : pg.moveTo(px(x), py(y)); }); pg.stroke(); }
+  pg.restore();
+  colData = wg.getImageData(0, 0, WC, HC).data;
+  auxData = ai.data;
+}
+
+/* ---------------- renderer ----------------
+   ★ 改光色改这里：下面着色器开头的 SUN_COL（太阳光的颜色）。
+     照进玻璃的光、光柱、地上的彩色光斑、玻璃上的太阳光晕、窗洞侧壁、地面反光、浮尘全都乘它。
+     vec3(1.) = 原样（和成片一模一样）。偏蓝的晨光例如 vec3(.78, .88, 1.15)；更暖例如 vec3(1.08, .95, .8)。
+   天空的冷色散光是另一束光：skyC 的 vec3(.32, .4, .62)（lightAt / skyThrough / revealShade 三处）和 bounce() 里的 vec3(.55, .6, .8)。
+   玻璃本身的颜色在上面 JS 的 skyPal 等调色板里，那是“玻璃配色”，不是光；改它只会换玻璃的颜色。 */
+const NM = 160;
+const rm = Reel.RM(stage, {
+  bloom: 0.62, th: 1.25, expo: 1.5, vig: 0.4, grain: 0.03, ca: 0.6, contrast: 1.04, sat: 1.0, bands: 4,
+  uniforms: `
+uniform sampler2D uWin, uAux, uPaint;
+uniform vec3 uRo; uniform vec3 uFw, uRt, uUp; uniform float uFL;
+uniform vec4 uSun;          // dx, dy, sunGain, dust
+uniform float uT, uSky, uCloud, uGlassX;
+uniform vec4 uMote[${NM}]; uniform vec4 uMoteC[${NM}]; uniform int uNM;`,
+  scene: `
+// SUN_COL = colour of the sun light (see the note above "renderer" in Chinese). vec3(1.) = as delivered.
+const vec3 SUN_COL = vec3(1.);
+const float GZ = -.45;      // glass plane, deep in the wall
+const float RW = 3.6, CEIL = 7.5, SPL = .26, BANDY = ${BAND.toFixed(3)};
+float sdL(vec2 p){ float dS = p.y <= 4.2 ? abs(p.x) - .9 : max(length(p - vec2(.9, 4.2)), length(p - vec2(-.9, 4.2))) - 1.8; return max(dS, 1. - p.y); }
+float sdLs(vec2 p, float s){ vec2 c = vec2(0., 3.3); return sdL((p - c) / s + c) * s; }
+float F3(vec3 X){ return sdLs(X.xy, 1. + SPL * clamp((X.z - GZ) / (-GZ), 0., 1.)); }     // the splayed reveal
+bool inL(vec2 p){ return sdL(p) < 0.; }
+vec2 winUV(vec2 p){ return vec2((p.x + .9) / 1.8, (p.y - 1.) / ${(APEX - 1.0).toFixed(4)}); }
+vec3 s2l(vec3 c){ return pow(c, vec3(2.2)); }
+// clouds drifting past outside: the window breathes
+float cloud(vec2 W){ return 1. - uCloud * .62 * smoothstep(.42, .74, fbm2(W * vec2(.5, .75) + vec2(uT * .33, uT * .05) + 3.)); }
+// transmission of the glass at window point p (+ignition)
+vec4 glassT(vec2 p, float lod){
+  vec2 uv = winUV(p);
+  vec4 a = textureLod(uAux, uv, 0.);
+  vec3 c = s2l(textureLod(uWin, uv, lod).rgb);
+  vec2 pt = textureLod(uPaint, uv, lod).rg;
+  float prox = textureLod(uPaint, uv, lod + 2.6).r;
+  // cathedral glass: streaks along each sheet's own direction, uneven thickness, opalescent wisps, seeds
+  float ang = a.g * 6.28;
+  vec2 q = mat2(cos(ang), -sin(ang), sin(ang), cos(ang)) * p;
+  float st = fbm2(q * vec2(2.2, 20.) + a.g * 40.);
+  float th = st * .65 + fbm2(p * 7. + a.g * 13.) * .35;
+  c = pow(c, vec3(.72 + .95 * th + .35 * a.g));
+  float wisp = smoothstep(.5, .78, fbm2(q * vec2(1.4, 7.) + a.g * 9.)) * a.b;
+  float lum = dot(c, vec3(.3, .55, .15));
+  c = mix(c, c * .5 + vec3(lum) * .9 + .03, wisp * .55);
+  vec2 sc = p * 140.; vec2 cell = floor(sc); float hs = hash12(cell + floor(a.g * 50.));
+  float seedB = step(.94, hs) * smoothstep(.35, .1, length(fract(sc) - .5 - (hash12(cell + 7.) - .5) * .4));
+  c *= 1. + seedB * 1.2;
+  c *= 1. - pt.g * .82;                         // grisaille
+  c *= 1. - .3 * prox * (1. - pt.r);            // matting / shading toward the came
+  float t0 = a.r * 10., ign = smoothstep(t0 - .04, t0 + .1, uT);
+  ign *= 1. + .7 * exp(-max(uT - t0 - .06, 0.) / .14) * step(t0, uT) * step(uT, 6.5);   // the flash as the sun's edge crosses
+  return vec4(c, ign);
+}
+vec3 sunD(){ return normalize(vec3(uSun.x, uSun.y, 1.)); }
+// light arriving at a room point through the window: the sun (projected) + a little diffuse sky
+vec3 lightAt(vec3 X, float lodBase, float skyK){
+  float s = X.z - GZ;
+  vec2 W = X.xy - vec2(uSun.x, uSun.y) * s;
+  if (!inL(W)) return vec3(0.);
+  vec4 g = glassT(W, lodBase + log2(1. + s * 2.6));
+  float cl = cloud(W);
+  vec3 skyC = vec3(.32, .4, .62) * uSky;
+  return g.rgb * (SUN_COL * (g.a * uSun.z * cl) + skyK * skyC * (.55 + .45 * cl));
+}
+vec3 skyThrough(vec2 W, vec3 rd){
+  vec4 g = glassT(W, 0.);
+  vec3 toSun = -sunD();
+  float ang = acos(clamp(dot(rd, toSun), -1., 1.));
+  float lobe = .25 + .75 * exp(-ang * ang / .09) + 1.6 * exp(-ang * ang / .006);
+  float cl = cloud(W);
+  vec3 skyC = vec3(.32, .4, .62) * uSky;
+  vec3 c = g.rgb * (skyC * (.55 + .45 * cl) + SUN_COL * vec3(1., .9, .75) * 9. * lobe * g.a * uSun.z * cl);
+  c *= uGlassX;
+  c = c / (1. + max(max(c.r, c.g), c.b) / 2.6);       // keep the glass jewel-coloured: the glow goes to bloom, not to white
+  float ld = textureLod(uPaint, winUV(W), 0.).r;
+  return c + ld * vec3(.016, .015, .014) * (.5 + uSun.z);   // lead and iron catch a little room light
+}
+// irregular ashlar: courses of varying height, blocks of varying length, chamfered worn arrises, recessed mortar
+float CT(int i){ return i == 0 ? .38 : i == 1 ? .29 : i == 2 ? .42 : i == 3 ? .33 : i == 4 ? .27 : i == 5 ? .4 : i == 6 ? .31 : .36; }
+vec3 ashlar(vec2 p, out vec2 bev){
+  float cyc = 2.76, pp = p.y + 40. * cyc;
+  float base = floor(pp / cyc), yy = pp - base * cyc;
+  float y0 = 0., h = .38, row = 0.;
+  for (int i = 0; i < 8; i++) { h = CT(i); row = float(i); if (yy < y0 + h) break; y0 += h; }
+  float rowId = base * 8. + row, fy = yy - y0;
+  float xx = p.x + hash11(rowId * 1.7) * 3. + 40.;
+  float cell = floor(xx / 3.), lx = xx - cell * 3.;
+  float x0 = 0., bw = .7, bi = 0.;
+  for (int j = 0; j < 8; j++) { bw = .45 + .6 * hash12(vec2(rowId, cell * 9. + float(j))); bi = float(j); if (lx < x0 + bw || j == 7) break; x0 += bw; }
+  bw = min(bw, 3. - x0);
+  float fx = lx - x0;
+  float ex = min(fx, bw - fx), ey = min(fy, h - fy);
+  float wob = (vnoise2(p * 11.) - .5) * .018 + (vnoise2(p * 37.) - .5) * .007;
+  float e = min(ex, ey) + wob;
+  vec2 dir = ex < ey ? vec2(fx < bw - fx ? -1. : 1., 0.) : vec2(0., fy < h - fy ? -1. : 1.);
+  float mortar = smoothstep(.004, .012, e);
+  bev = dir * (1. - smoothstep(.012, .045, e)) * mortar;
+  return vec3(mortar, e, hash12(vec2(rowId, cell * 9. + bi)));
+}
+vec3 stoneAlb(vec2 p, vec3 A){
+  float id = A.z;
+  float n = fbm2(p * 2.1 + id * 7.) * .5 + fbm2(p * 9.) * .3 + vnoise2(p * 48.) * .2;
+  vec3 c = mix(vec3(.47, .41, .33), vec3(.39, .38, .35), hash11(id * 31.)) * (.62 + .55 * id) * (.62 + .6 * n);
+  c *= .85 + .15 * smoothstep(.3, .7, fbm2(p * vec2(4., .5) + id));
+  c *= 1. - .45 * step(.986, hash12(floor(p * 85.)));
+  vec3 m = vec3(.3, .28, .25) * (.75 + .4 * n) * .45;
+  return mix(m, c, A.x);
+}
+float hitT;
+vec3 bounce(vec3 P, vec3 n){
+  // the pool of coloured light on the floor, and the window itself as a big soft source
+  vec3 Lp = vec3(-.4 * uSun.x * 3., .05, 2.6); vec3 d = Lp - P; float r2 = dot(d, d);
+  vec3 floorB = SUN_COL * vec3(.5, .42, .3) * uSun.z * .55 * max(dot(n, normalize(d)), 0.) / (1. + r2 * .25);
+  vec3 Wc = vec3(0., 3.4, -.2); vec3 dw = Wc - P; float w2 = dot(dw, dw);
+  vec3 winC = vec3(.55, .6, .8) * uSky * .22 + SUN_COL * vec3(1., .85, .62) * uSun.z * .22;
+  vec3 winB = winC * max(dot(n, normalize(dw)), 0.) * max(normalize(-dw).z + .15, 0.) / (1. + w2 * .3);
+  return floorB + winB + vec3(.007, .007, .009);
+}
+vec3 wallShade(vec3 P, vec2 p, vec3 N, vec3 T, vec3 B, float ao){
+  vec2 bev; vec3 A = ashlar(p, bev);
+  vec3 alb = stoneAlb(p, A);
+  vec2 bump = vec2(fbm2(p * 6.) - .5, fbm2(p * 6. + 5.) - .5) * .3;
+  vec3 n = normalize(N + T * (bev.x * .9 + bump.x) + B * (bev.y * .9 + bump.y));
+  float wear = 1. - .2 * (1. - smoothstep(.0, .03, A.y)) * A.x;
+  return alb * wear * bounce(P, n) * 1.4 * ao;
+}
+vec3 revealShade(vec3 Q, vec3 rd){
+  vec2 e = vec2(.002, 0.);
+  vec3 gr = vec3(F3(Q + e.xyy) - F3(Q - e.xyy), F3(Q + e.yxy) - F3(Q - e.yxy), F3(Q + e.yyx) - F3(Q - e.yyx));
+  vec3 n = -normalize(gr);
+  vec2 p = vec2(Q.x * .9 + Q.z * 2.3, Q.y + Q.z * 1.7);
+  vec2 bev; vec3 A = ashlar(p, bev);
+  vec3 alb = stoneAlb(p, A);
+  float dz = clamp((Q.z - GZ) / (-GZ), 0., 1.);
+  float s = 1. + SPL * dz; vec2 Wn = vec2(0., 3.3) + (Q.xy - vec2(0., 3.3)) / s * .97;
+  vec3 gl = s2l(textureLod(uWin, winUV(Wn), 7.5).rgb); gl = mix(vec3(dot(gl, vec3(.33))), gl, .45);
+  vec3 glow = gl * (vec3(.32, .4, .62) * uSky + SUN_COL * vec3(1., .88, .7) * 2.2 * uSun.z * cloud(Wn)) * (.2 + .8 * exp(-dz * 3.)) * .45;
+  vec3 sun = lightAt(Q, 1., 0.) * max(dot(n, -sunD()), 0.) * 1.6;
+  float ao = .6 + .4 * smoothstep(0., .12, dz);
+  return alb * (glow + sun + bounce(Q, n) * .8) * ao;
+}
+vec3 shadePoint(vec3 ro, vec3 rd){
+  float tF = rd.y < 0. ? -ro.y / rd.y : 1e9;
+  float tC = rd.y > 0. ? (CEIL - ro.y) / rd.y : 1e9;
+  float tW = rd.z < 0. ? -ro.z / rd.z : 1e9;
+  float tL = rd.x < 0. ? (-RW - ro.x) / rd.x : 1e9, tR = rd.x > 0. ? (RW - ro.x) / rd.x : 1e9;
+  float t = min(min(tF, tC), min(tW, min(tL, tR)));
+  gDepth = t; hitT = t;
+  vec3 P = ro + rd * t;
+  if (t == tW) {
+    if (sdLs(P.xy, 1. + SPL) < 0.) {
+      float tg = (GZ - ro.z) / rd.z; vec3 Gp = ro + rd * tg;
+      if (inL(Gp.xy)) { gDepth = tg; hitT = tg; return skyThrough(Gp.xy, rd); }
+      float a = t, b = tg;
+      for (int i = 0; i < 14; i++) { float m = .5 * (a + b); if (F3(ro + rd * m) < 0.) a = m; else b = m; }
+      gDepth = b; hitT = b;
+      return revealShade(ro + rd * b, rd);
+    }
+    float ao = mix(.5, 1., smoothstep(0., .9, RW - abs(P.x))) * mix(.55, 1., smoothstep(0., .6, P.y)) * mix(.7, 1., smoothstep(0., 1.2, CEIL - P.y));
+    ao *= mix(.75, 1., smoothstep(0., .08, sdLs(P.xy, 1. + SPL)));   // the arris of the splay
+    return wallShade(P, P.xy, vec3(0., 0., 1.), vec3(1., 0., 0.), vec3(0., 1., 0.), ao);
+  }
+  if (t == tF) {
+    vec2 q = P.xz;
+    float rowH = .82; float row = floor(q.y / rowH); float fy = fract(q.y / rowH) * rowH;
+    float rw = .7 + .55 * hash11(row * 3.3); q.x += hash11(row) * 1.7;
+    float col = floor(q.x / rw); float fx = fract(q.x / rw) * rw;
+    float split = step(.62, hash12(vec2(col, row) + 4.));
+    float fy2 = split > .5 ? (fy < rowH * .5 ? fy : fy - rowH * .5) : fy; float hh = split > .5 ? rowH * .5 : rowH;
+    vec2 cell = vec2(col, row * 2. + (split > .5 && fy >= rowH * .5 ? 1. : 0.));
+    float wob = (vnoise2(P.xz * 6.) - .5) * .03 + (vnoise2(P.xz * 23.) - .5) * .01;
+    float jd = min(min(fx, rw - fx), min(fy2, hh - fy2)) + wob;
+    float joint = smoothstep(.0, .028, jd);
+    float id = hash12(cell);
+    float n = fbm2(P.xz * 1.7 + id * 9.) * .5 + fbm2(P.xz * 9.) * .3 + vnoise2(P.xz * 60.) * .2;
+    vec3 alb = mix(vec3(.44, .4, .35), vec3(.37, .36, .34), id) * (.82 + .3 * id) * (.62 + .55 * n);
+    alb *= .8 + .2 * smoothstep(.0, .06, jd);
+    alb = mix(vec3(.2, .18, .15), alb, joint);
+    float ao = mix(.5, 1., smoothstep(0., .8, P.z)) * mix(.55, 1., smoothstep(0., .9, RW - abs(P.x)));
+    vec3 sun = lightAt(P, .0, 0.) * (-sunD().y) * 8.;
+    return alb * (bounce(P, vec3(0., 1., 0.)) * 1.2 * ao + sun);
+  }
+  if (t == tC) return vec3(.006, .005, .005);
+  float ao = mix(.5, 1., smoothstep(0., .9, P.z)) * mix(.55, 1., smoothstep(0., .6, P.y));
+  return wallShade(P, vec2(P.z, P.y), vec3(-sign(P.x), 0., 0.), vec3(0., 0., 1.), vec3(0., 1., 0.), ao);
+}
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 rd = normalize(uFw * uFL + uRt * uv.x + uUp * uv.y);
+  vec3 ro = uRo;
+  vec3 col = shadePoint(ro, rd);
+  float tEnd = min(hitT, 22.);
+  vec3 sd = sunD();
+  float mu = dot(sd, -rd);
+  float ph = .35 + 1.6 * pow(max(mu, 0.), 6.) + .4 * pow(max(mu, 0.), 1.5);
+  vec3 acc = vec3(0.);
+  float jit = hash12(fc + fract(uT * 7.13) * 100.);
+  const int NS = 64;
+  float dt = tEnd / float(NS);
+  for (int i = 0; i < NS; i++) {
+    float tt = (float(i) + jit) * dt;
+    vec3 X = ro + rd * tt;
+    if (X.z < 0.) break;
+    vec3 L = lightAt(X, 2.5, .35);
+    if (dot(L, L) < 1e-7) continue;
+    float dust = .5 + .9 * fbm(X * 1.6 + vec3(0., uT * .05, uT * .03)) + .6 * pow(fbm(X * 6. + vec3(uT * .1, 0., 0.)), 3.);
+    acc += L * dust * dt;
+  }
+  col += acc * ph * .11 * uSun.w;
+  for (int i = 0; i < ${NM}; i++) {
+    if (i >= uNM) break;
+    vec4 m = uMote[i]; float d = length(fc - m.xy);
+    if (d < m.z) col += SUN_COL * uMoteC[i].rgb * m.w * smoothstep(m.z, m.z * .55, d);
+  }
+  return col;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+let texWin, texAux, texPaint;
+function upload(unit, cv, mip) {
+  const t = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  if (mip) gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mip ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0);
+  return t;
+}
+
+/* ---------------- timeline ---------------- */
+// one camera track: position, yaw, pitch, focal length. A slow push on the window (it fills a third of the frame),
+// the crane up as the sun breaks, then one long continuous move down into the low three-quarter view, landing on 8.0.
+const CAMT = Track([
+  { t: 0.0, v: [0.55, 1.45, 7.2, 0.075, 0.26, 3.4] },
+  { t: 2.0, v: [0.35, 1.55, 6.75, 0.045, 0.27, 3.2] },
+  { t: 3.9, v: [0.12, 1.7, 6.2, 0.01, 0.28, 2.9] },
+  { t: 5.0, v: [0.55, 2.5, 6.0, -0.02, 0.1, 2.35] },
+  { t: 6.3, v: [1.15, 2.1, 5.3, -0.2, 0.06, 2.05] },
+  { t: 7.2, v: [1.6, 1.5, 5.15, -0.33, 0.12, 1.6] },
+  { t: 8.0, v: [1.72, 1.35, 5.2, -0.36, 0.17, 1.45], stop: true },
+  { t: 10.0, v: [1.705, 1.35, 5.15, -0.358, 0.17, 1.45] },
+]);
+function cam(t) {
+  const [x, y, z, yaw, pit, fl] = CAMT(t);
+  const fw = [Math.sin(yaw) * Math.cos(pit), Math.sin(pit), -Math.cos(yaw) * Math.cos(pit)];
+  const rt = [Math.cos(yaw), 0, Math.sin(yaw)];
+  const up = [rt[1] * fw[2] - rt[2] * fw[1], rt[2] * fw[0] - rt[0] * fw[2], rt[0] * fw[1] - rt[1] * fw[0]];
+  return { p: [x, y, z], fw, rt, up, fl };
+}
+function sun(t) {
+  // the sun keeps creeping after 8.0, so the patches never quite freeze
+  const dx = lerp(-0.3, 0.0, Track.easeRange(t, 3.6, 8.0)) + 0.006 * Math.max(0, t - 8.0);
+  const gain = lerp(0.42, 1.0, E.outCubic(inv(3.92, 4.35, t)));
+  const dust = lerp(0.4, 1.0, E.outCubic(inv(3.95, 4.6, t)));
+  return [dx, -0.8, gain, dust];
+}
+function auxAt(x, y) {
+  const cx = Math.floor((x + 0.9) * K), cy = Math.floor((APEX - y) * K);
+  if (cx < 0 || cy < 0 || cx >= WC || cy >= HC) return null;
+  const o = cy * WC + cx;
+  return { tIgn: auxData[o * 4] / 255 * 10, lead: LEADM[o] > 0, c: [colData[o * 4], colData[o * 4 + 1], colData[o * 4 + 2]] };
+}
+const MOTES = Array.from({ length: 900 }, (_, i) => { const r = Reel.rng(900 + i); return { x: (r() - 0.5) * 3.4, y: 0.2 + r() * 5.2, z: 0.4 + r() * 8.2, ph: r() * 6.28, sp: 0.3 + r() * 0.6, b: 0.4 + r() * 0.8 }; });
+const mA = new Float32Array(NM * 4), mC = new Float32Array(NM * 4);
+function motes(t, c, s, focus) {
+  mA.fill(0); mC.fill(0);
+  const W = 1920 * Reel.RS, H = 1080 * Reel.RS;
+  let n = 0;
+  if (s[3] < 0.05) return 0;
+  for (const m of MOTES) {
+    if (n >= NM) break;
+    const X = [m.x + 0.06 * Math.sin(t * 0.4 * m.sp + m.ph), m.y + 0.05 * Math.sin(t * 0.3 + m.ph * 2) + t * 0.012, m.z + 0.05 * Math.cos(t * 0.35 * m.sp + m.ph)];
+    const sS = X[2] + 0.45, Wx = X[0] - s[0] * sS, Wy = X[1] - s[1] * sS;
+    if (!inLancet(Wx, Wy, 0, 1.0)) continue;
+    const a = auxAt(Wx, Wy); if (!a || a.lead || t < a.tIgn) continue;
+    const d = [X[0] - c.p[0], X[1] - c.p[1], X[2] - c.p[2]];
+    const z = d[0] * c.fw[0] + d[1] * c.fw[1] + d[2] * c.fw[2]; if (z < 0.3) continue;
+    const sx = (d[0] * c.rt[0] + d[1] * c.rt[1] + d[2] * c.rt[2]) / z * c.fl, sy = (d[0] * c.up[0] + d[1] * c.up[1] + d[2] * c.up[2]) / z * c.fl;
+    const X2 = (sx * H + W) / 2, Y2 = (sy * H + H) / 2;
+    if (X2 < -20 || X2 > W + 20 || Y2 < -20 || Y2 > H + 20) continue;
+    const coc = Math.abs(1 / focus - 1 / z) * 34 * Reel.RS;
+    const rad = Math.max(1.6 * Reel.RS, Math.min(26 * Reel.RS, coc + 1.3 * Reel.RS));
+    const tw = 0.6 + 0.4 * Math.sin(t * 5 * m.sp + m.ph * 3);
+    const I = m.b * tw * s[3] * s[2] * 3.2 * Math.pow(1.6 * Reel.RS / rad, 1.6);
+    mA.set([X2, Y2, rad, I], n * 4);
+    mC.set(a.c.map((v) => Math.pow(v / 255, 2.2) * 0.8 + 0.2), n * 4);
+    n++;
+  }
+  return n;
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+
+  async setup() { buildWindow(); texWin = upload(5, winCanvas, true); texAux = upload(6, auxCanvas, false); texPaint = upload(7, paintCanvas, true); },
+  cues: [
+    { t: 0.5, sfx: 'pane_1', gain: 0.55 }, { t: 1.0, sfx: 'pane_2', gain: 0.55 }, { t: 1.5, sfx: 'pane_3', gain: 0.6 }, { t: 2.0, sfx: 'pane_4', gain: 0.6 },
+    { t: 2.5, sfx: 'pane_5', gain: 0.62 }, { t: 3.0, sfx: 'pane_6', gain: 0.65 }, { t: 3.5, sfx: 'pane_7', gain: 0.68 },
+    { t: 4.0, sfx: 'sun_burst', gain: 0.9 }, { t: 6.0, sfx: 'air_move', gain: 0.55 },
+    { t: 7.0, sfx: 'letter_on', gain: 0.5 }, { t: 7.125, sfx: 'letter_on', gain: 0.5 }, { t: 7.25, sfx: 'letter_on', gain: 0.5 }, { t: 7.375, sfx: 'letter_on', gain: 0.5 }, { t: 7.5, sfx: 'letter_on', gain: 0.55 },
+    { t: 8.0, sfx: 'title_glow', gain: 0.7 },
+  ],
+  render(t) {
+    const c = cam(t), s = sun(t);
+    // focus: the window, then the shaft, then the rosette on the floor
+    const focus = lerp(lerp(7.0, 5.2, Track.easeRange(t, 3.9, 6.3)), Math.hypot(c.p[0], c.p[1], c.p[2] - 1.15), Track.easeRange(t, 6.3, 8.0));
+    const nm = motes(t, c, s, focus);
+    rm.set('uWin', { __ints: 1, v: 5 }).set('uAux', { __ints: 1, v: 6 }).set('uPaint', { __ints: 1, v: 7 })
+      .set('uRo', c.p).set('uFw', c.fw).set('uRt', c.rt).set('uUp', c.up).set('uFL', c.fl)
+      .set('uSun', s).set('uT', t).set('uSky', lerp(0.15, 0.8, inv(0, 4, t))).set('uGlassX', lerp(1.0, 0.5, Track.easeRange(t, 3.85, 4.3))).set('uCloud', lerp(1, 0.18, E.inOutSine(inv(3.8, 4.4, t))))
+      .set('uMote', mA).set('uMoteC', mC).set('uNM', { __ints: 1, v: nm });
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texWin);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, texAux);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, texPaint);
+    gl.activeTexture(gl.TEXTURE0);
+    rm.render(t, { focus, aperture: 30, maxCoc: lerp(18, 12, Track.easeRange(t, 4.0, 5.0)) });
+  },
+});
+
+</script></body></html>

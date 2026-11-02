@@ -1,0 +1,590 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>33 美式漫画 · Comic Book</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 33 美式漫画 · COMIC BOOK =====
+   A real four-colour comic cover lying on a desk. The art is drawn as flat colour + black key-plate line art; the GPU
+   then *prints* it: cyan / magenta / yellow halftone screens at 15° / 75° / 0°, each plate slightly out of register,
+   ink spreading into yellowed newsprint with fibres and foxing, the black plate laid last. The camera reads the inset
+   panels (limited animation at 12 drawings per second), then at 4.45 the original hero punches up through the panel
+   border and peels off the paper as a die-cut cutout with a real shadow, flies over the page and lands as the cover
+   star; the masthead prints plate by plate (Y, M, C, K) on the half-beats. */
+const { E, clamp, lerp, inv } = Reel;
+const stage = Reel.makeStage('#0b0907');
+const C = Reel.cfg({ no: 'No.33', price: '12¢', cap: 'MEANWHILE, ABOVE HARBOR CITY...', say: 'NOT ON MY WATCH!', sfx: 'KRAKOOM!' });
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+Reel.ownJitter = true;
+const SANS = '"Noto Sans CJK SC"', HEROS = '"TeX Gyre Heros Cn"';
+const R = Reel.rng(3333), rr = (a, b) => a + (b - a) * R();
+const PGW = 1000, PGH = 1540, TS = 2.0;                   // page units, texture px per unit
+const TW = Math.round(PGW * TS), TH = Math.round(PGH * TS);
+const mk = (w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; return [c, c.getContext('2d', { willReadFrequently: true })]; };
+const [cCol, gC] = mk(TW, TH), [cInk, gK] = mk(TW, TH);
+const HS = 1100; const [hCol, hgC] = mk(HS, HS), [hInk, hgK] = mk(HS, HS);   // hero cutout art (units = px)
+// panels (page units)
+const PA = [40, 1004, 470, 262], PB = [530, 1004, 430, 262], PC = [40, 1290, 920, 216], ART = [40, 318, 920, 650];
+const T_BREAK = 4.5, T_LAND = 6.0, T_HIT = 4.0;
+// hand lettering: every letter its own size, tilt and baseline (ink plate only unless a fill is given)
+function handText(str, x, y, font, align = 'left', o = {}) {
+  const ch = [...str]; G.k.font = font; G.c.font = font;
+  const ws = ch.map((c) => G.k.measureText(c).width * (o.sp ?? 1));
+  const total = ws.reduce((a, b) => a + b, 0);
+  let cx = align === 'center' ? x - total / 2 : x;
+  const rg = Reel.rng(o.seed || 7);
+  ch.forEach((c, i) => {
+    const r = (rg() - 0.5) * (o.rot ?? 0.07), s = 1 + (rg() - 0.5) * (o.sc ?? 0.1), dy = (rg() - 0.5) * (o.dy ?? 3);
+    both(() => {
+      xf(1, 0, 0, 1, cx + ws[i] / 2, y + dy); G.c.rotate(r); G.k.rotate(r); xf(s, 0, 0, s, 0, 0);
+      for (const g of [G.c, G.k]) { g.textAlign = 'center'; g.textBaseline = 'alphabetic'; }
+      if (o.extrude) for (let d = o.extrude; d > 0; d -= 2) { G.c.fillStyle = o.extCol; G.c.fillText(c, d, d); }
+      if (o.fill) { G.c.fillStyle = o.fill; G.c.fillText(c, 0, 0); }
+      if (o.stroke) { G.k.lineWidth = o.stroke; G.k.strokeStyle = '#000'; G.k.lineJoin = 'round'; G.k.strokeText(c, 0, 0); }
+      if (!o.noInk) { G.k.fillStyle = '#000'; G.k.fillText(c, 0, 0); }
+    });
+    cx += ws[i];
+  });
+}
+
+// ---------- drawing helpers: every shape is filled on the colour plate and stroked on the key (black) plate ----------
+let G = null;   // { c: colour ctx, k: ink ctx }
+function shape(path, fill, lw = 4, opt = {}) {
+  if (fill) { G.c.fillStyle = fill; G.c.fill(path); if (!opt.keepInk) { G.k.save(); G.k.globalCompositeOperation = 'destination-out'; G.k.fillStyle = '#000'; G.k.fill(path); G.k.restore(); } }
+  if (opt.inkFill) { G.k.fillStyle = '#000'; G.k.fill(path); }
+  if (lw > 0) { G.k.lineWidth = lw; G.k.lineJoin = 'round'; G.k.lineCap = 'round'; G.k.strokeStyle = '#000'; G.k.stroke(path); }
+}
+const pth = (pts, close = true) => { const p = new Path2D(); pts.forEach(([x, y], i) => (i ? p.lineTo(x, y) : p.moveTo(x, y))); if (close) p.closePath(); return p; };
+const ell = (x, y, rx, ry, a = 0) => { const p = new Path2D(); p.ellipse(x, y, rx, ry, a, 0, 6.2832); return p; };
+const cap = (x0, y0, x1, y1, r0, r1) => {   // tapered limb
+  const a = Math.atan2(y1 - y0, x1 - x0), n = [-Math.sin(a), Math.cos(a)];
+  const p = new Path2D();
+  p.moveTo(x0 + n[0] * r0, y0 + n[1] * r0); p.lineTo(x1 + n[0] * r1, y1 + n[1] * r1); p.arc(x1, y1, r1, a + Math.PI / 2, a - Math.PI / 2, true);
+  p.lineTo(x0 - n[0] * r0, y0 - n[1] * r0); p.arc(x0, y0, r0, a - Math.PI / 2, a + Math.PI / 2, true); p.closePath(); return p;
+};
+function both(fn) { for (const g of [G.c, G.k]) { g.save(); } fn(); for (const g of [G.c, G.k]) g.restore(); }
+function xf(a, b, c, d, e, f) { G.c.transform(a, b, c, d, e, f); G.k.transform(a, b, c, d, e, f); }
+function clipRect(x, y, w, h) { for (const g of [G.c, G.k]) { g.beginPath(); g.rect(x, y, w, h); g.clip(); } }
+function text(str, x, y, font, fill, stroke = 0, ink = true, align = 'left') {
+  for (const g of [G.c, G.k]) { g.font = font; g.textAlign = align; g.textBaseline = 'alphabetic'; }
+  if (fill) { G.c.fillStyle = fill; G.c.fillText(str, x, y); }
+  if (stroke) { G.k.lineWidth = stroke; G.k.strokeStyle = '#000'; G.k.lineJoin = 'round'; G.k.strokeText(str, x, y); }
+  if (ink) { G.k.fillStyle = '#000'; G.k.fillText(str, x, y); }
+}
+function speedLines(cx, cy, r0, r1, n, seed, lw = 2) {
+  const rg = Reel.rng(seed); G.k.strokeStyle = '#000';
+  for (let i = 0; i < n; i++) { const a = rg() * 6.283, w = (0.4 + rg()) * lw; G.k.lineWidth = w; G.k.beginPath(); G.k.moveTo(cx + Math.cos(a) * (r0 + rg() * 30), cy + Math.sin(a) * (r0 + rg() * 30)); G.k.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1); G.k.stroke(); }
+}
+function burst(cx, cy, r0, r1, n, fill, seed, rot = 0) {
+  const rg = Reel.rng(seed), pts = [];
+  for (let i = 0; i < n * 2; i++) { const a = rot + i / (n * 2) * 6.283, r = i % 2 ? r0 * (0.85 + rg() * 0.2) : r1 * (0.8 + rg() * 0.35); pts.push([cx + Math.cos(a) * r, cy + Math.sin(a) * r]); }
+  shape(pth(pts), fill, 5);
+}
+
+// ---------- the hero (original: a rocket-pack courier in a bubble helmet and red scarf) ----------
+// flying punch, facing right, drawn around (0,0) ~ 420 units tall; f = 12fps tick for the flame / scarf flutter
+function heroFly(f) {
+  const fl = Math.sin(f * 2.1), fl2 = Math.sin(f * 1.3 + 1);
+  // jet flames
+  shape(pth([[-120, 40], [-250 - fl * 30, 70 + fl2 * 10], [-180, 52], [-300 - fl * 40, 30], [-175, 30], [-240 - fl2 * 30, -8], [-118, 14]]), '#ffd23f', 4);
+  shape(pth([[-122, 34], [-200 - fl * 20, 48], [-150, 34], [-210 - fl2 * 20, 20], [-120, 20]]), '#ff6a2a', 0);
+  // scarf
+  shape(pth([[36, -168], [-60, -190 + fl * 12], [-150, -170 + fl2 * 18], [-230, -200 + fl * 22], [-200, -160], [-140, -140 + fl2 * 12], [-60, -150], [30, -140]]), '#e2302f', 4.5);
+  // back leg, back arm
+  shape(cap(-40, 40, -150, 120, 30, 22), '#2a55b0', 5);
+  shape(cap(-170, 128, -200, 150, 24, 24), '#ffcc22', 5);
+  shape(cap(-10, -90, -110, -60, 24, 20), '#2a55b0', 5);
+  shape(ell(-120, -56, 26, 24), '#ffcc22', 5);
+  // jetpack
+  shape(pth([[-60, -120], [-10, -130], [10, 40], [-40, 60], [-120, 40], [-130, -60]]), '#9aa4ad', 5);
+  shape(pth([[-120, 0], [-100, -4], [-100, 30], [-122, 34]]), '#5d6670', 3);
+  G.k.lineWidth = 3; G.k.beginPath(); G.k.moveTo(-105, -90); G.k.lineTo(-30, -100); G.k.stroke();
+  // torso
+  shape(pth([[-30, -140], [70, -150], [110, -60], [80, 40], [-20, 60], [-50, -40]]), '#2e63c7', 5.5);
+  shape(pth([[10, -100], [70, -110], [90, -60], [40, -40]]), '#ffcc22', 4);        // chest emblem (a lightning bolt)
+  shape(pth([[48, -104], [30, -74], [52, -76], [38, -46], [70, -84], [50, -82], [62, -104]]), '#e2302f', 2.5);
+  shape(pth([[-30, 30], [90, 24], [86, 50], [-26, 62]]), '#ffcc22', 4);              // belt
+  // front leg
+  shape(cap(40, 40, -30, 180, 34, 26), '#2e63c7', 5.5);
+  shape(cap(-38, 186, -70, 216, 27, 27), '#ffcc22', 5.5);
+  // front arm, punching
+  shape(cap(60, -120, 220, -150, 28, 24), '#2e63c7', 5.5);
+  shape(ell(250, -152, 38, 34, -0.15), '#ffcc22', 5.5);
+  G.k.lineWidth = 3; G.k.beginPath(); G.k.moveTo(244, -178); G.k.lineTo(250, -130); G.k.moveTo(262, -176); G.k.lineTo(268, -132); G.k.stroke();
+  // helmet + visor
+  shape(ell(60, -200, 66, 62), '#f2f2f2', 5.5);
+  const vis = new Path2D(); vis.moveTo(40, -232); vis.quadraticCurveTo(110, -238, 124, -206); vis.quadraticCurveTo(122, -170, 60, -170); vis.quadraticCurveTo(30, -190, 40, -232); vis.closePath();
+  shape(vis, '#1b1b2e', 3, { inkFill: true });
+  G.c.fillStyle = '#5fd0ff'; G.c.beginPath(); G.c.ellipse(92, -218, 22, 6, -0.25, 0, 6.3); G.c.fill();
+  G.k.globalCompositeOperation = 'destination-out'; G.k.beginPath(); G.k.ellipse(92, -218, 20, 4.5, -0.25, 0, 6.3); G.k.fill(); G.k.globalCompositeOperation = 'source-over';
+  shape(ell(20, -190, 13, 18, 0.2), '#e2302f', 3.5);       // ear piece
+  G.k.lineWidth = 3; G.k.beginPath(); G.k.arc(60, -200, 52, 3.4, 4.3); G.k.stroke();
+  // muscle / fold lines, motion streaks
+  G.k.lineWidth = 2.5; G.k.beginPath(); G.k.moveTo(0, -20); G.k.quadraticCurveTo(30, 0, 60, -10); G.k.moveTo(10, 90); G.k.quadraticCurveTo(0, 120, -10, 150); G.k.stroke();
+}
+function heroStand(f) {   // rooftop silhouette, side view, scarf in the wind
+  const fl = Math.sin(f * 1.7), fl2 = Math.sin(f * 2.3 + 1);
+  shape(pth([[-6, -236], [-90, -254 + fl * 10], [-170, -232 + fl2 * 14], [-226, -262 + fl * 18], [-180, -214], [-112, -206 + fl2 * 8], [-40, -214], [-4, -220]]), '#e2302f', 3);
+  const parts = [
+    cap(14, -96, 34, -6, 20, 14), cap(-14, -96, -26, -6, 20, 14),                       // legs
+    pth([[24, -10], [62, -6], [62, 4], [20, 4]]), pth([[-30, -10], [8, -6], [8, 4], [-34, 4]]),   // boots
+    pth([[-40, -226], [36, -230], [46, -170], [34, -96], [-30, -94], [-44, -160]]),        // torso, broad shoulders
+    pth([[-74, -222], [-38, -228], [-30, -120], [-70, -124]]),                           // jetpack
+    cap(34, -214, 62, -150, 15, 12), cap(62, -150, 56, -112, 12, 13),                   // arm on the hip
+    cap(-30, -210, -14, -140, 14, 12),
+    ell(4, -262, 34, 33),                                                                // helmet
+  ];
+  for (const pp of parts) shape(pp, null, 0, { inkFill: true });
+  G.c.fillStyle = '#ff9a3c'; G.c.beginPath(); G.c.ellipse(20, -266, 16, 8, -0.2, 0, 6.3); G.c.fill();   // visor catching the sunset
+  G.k.globalCompositeOperation = 'destination-out'; G.k.beginPath(); G.k.ellipse(20, -266, 14, 6, -0.2, 0, 6.3); G.k.fill(); G.k.globalCompositeOperation = 'source-over';
+}
+function robot(x, y, s, f, hit = 0) {
+  both(() => {
+    xf(s, 0, 0, s, x, y); G.c.rotate(hit * 0.25); G.k.rotate(hit * 0.25);
+    shape(pth([[-120, -260], [120, -260], [140, 40], [-140, 40]]), '#7a5aa8', 6);
+    shape(pth([[-90, -240], [90, -240], [100, -150], [-100, -150]]), '#5b4185', 4);
+    shape(ell(0, -196, 40, 26), '#ff2a2a', 5);
+    shape(ell(0, -196, 16, 10), '#ffd23f', 0);
+    shape(cap(-140, -180, -230, -40 + Math.sin(f) * 10, 30, 26), '#7a5aa8', 6);
+    shape(cap(140, -180, 230, -60, 30, 26), '#7a5aa8', 6);
+    shape(pth([[-260, -40], [-200, -60], [-190, 0], [-250, 10]]), '#9aa4ad', 5);
+    shape(pth([[260, -70], [200, -80], [190, -20], [250, -10]]), '#9aa4ad', 5);
+    shape(pth([[-6, -260], [6, -260], [8, -330], [-8, -330]]), '#9aa4ad', 4); shape(ell(0, -338, 14, 14), '#ff2a2a', 4);
+    G.k.lineWidth = 3; for (let i = 0; i < 4; i++) { G.k.beginPath(); G.k.moveTo(-110, -120 + i * 34); G.k.lineTo(110, -120 + i * 34); G.k.stroke(); }
+    for (const [rx, ry] of [[-100, -110], [100, -110], [-100, 10], [100, 10]]) { shape(ell(rx, ry, 7, 7), '#cfd6dd', 2); }
+  });
+}
+function skyline(x0, y0, w, h, seed, col, win) {
+  const rg = Reel.rng(seed); let x = x0;
+  while (x < x0 + w) {
+    const bw = 40 + rg() * 90, bh = h * (0.35 + rg() * 0.65);
+    shape(pth([[x, y0], [x, y0 - bh], [x + bw, y0 - bh], [x + bw, y0]]), col, 3);
+    for (let yy = y0 - bh + 14; yy < y0 - 10; yy += 22) for (let xx = x + 10; xx < x + bw - 10; xx += 18) if (rg() < 0.45) { G.c.fillStyle = win; G.c.fillRect(xx, yy, 8, 10); }
+    x += bw + rg() * 6;
+  }
+}
+function caption(x, y, w, h, str, font) { shape(pth([[x, y], [x + w, y], [x + w, y + h], [x, y + h]]), '#ffe46b', 3.5); handText(str, x + 10, y + h - 12, font, 'left', { seed: 3, rot: 0.06, sc: 0.08, dy: 2.2 }); }
+function balloon(cx, cy, rx, ry, tx, ty, str, font) {
+  const p = new Path2D(); p.ellipse(cx, cy, rx, ry, 0, 0, 6.2832);
+  const tail = pth([[cx - rx * 0.2, cy + ry * 0.7], [tx, ty], [cx + rx * 0.15, cy + ry * 0.8]]);
+  shape(tail, '#ffffff', 4); shape(p, '#ffffff', 4);
+  G.c.fillStyle = '#fff'; G.c.beginPath(); G.c.ellipse(cx, cy, rx - 3, ry - 3, 0, 0, 6.3); G.c.fill();
+  G.k.globalCompositeOperation = 'destination-out'; G.k.beginPath(); G.k.ellipse(cx, cy, rx - 2.5, ry - 2.5, 0, 0, 6.3); G.k.fill(); G.k.globalCompositeOperation = 'source-over';
+  handText(str, cx, cy + 12, font, 'center', { seed: 5, rot: 0.07, sc: 0.09, dy: 2.5 });
+}
+function panelFrame(x, y, w, h, broken = 0) {
+  G.k.lineWidth = 6; G.k.strokeStyle = '#000';
+  if (!broken) { G.k.strokeRect(x, y, w, h); return; }
+  // the top border shattered where the hero punched through
+  const bx = x + w * 0.5, gap = 140 * broken;
+  G.k.beginPath(); G.k.moveTo(bx - gap, y); G.k.lineTo(x, y); G.k.lineTo(x, y + h); G.k.lineTo(x + w, y + h); G.k.lineTo(x + w, y); G.k.lineTo(bx + gap * 0.8, y); G.k.stroke();
+  const rg = Reel.rng(77);
+  for (let i = 0; i < 9; i++) {
+    const a = -Math.PI / 2 + (rg() - 0.5) * 2.2, d = 40 + 220 * broken * (0.5 + rg()), cx = bx + (rg() - 0.5) * gap * 1.6 + Math.cos(a) * d, cy = y + Math.sin(a) * d * 0.8;
+    const s = 10 + rg() * 22, r = rg() * 6;
+    shape(pth([[cx - s, cy], [cx + s * 0.7, cy - s * 0.25], [cx + s * 0.4, cy + 6], [cx - s * 0.6, cy + 8]].map(([px, py]) => [cx + (px - cx) * Math.cos(r) - (py - cy) * Math.sin(r), cy + (px - cx) * Math.sin(r) + (py - cy) * Math.cos(r)])), '#ffffff', 3);
+  }
+}
+
+// ---------- the whole page for 12fps tick f ----------
+function drawPage(f) {
+  const t = f / 15; f = f * 12 / 15;           // drawings on twos (15 per second); wiggles keep their old speed
+  G = { c: gC, k: gK };
+  for (const g of [gC, gK]) { g.setTransform(TS, 0, 0, TS, 0, 0); }
+  gC.fillStyle = '#ffffff'; gC.fillRect(0, 0, PGW, PGH); gK.clearRect(0, 0, PGW, PGH);
+  // --- masthead: the hero's bolt emblem (diamond, red block shadow), a Ben-Day stripe band, issue box, price box
+  //     (printed plate by plate at the end: the shader gates this strip by region)
+  both(() => {
+    const ex = 470, ey = 152;
+    // behind the emblem: inked action lines bursting out of it across the masthead
+    G.k.save(); G.k.beginPath(); G.k.rect(130, 30, 700, 228); G.k.clip();
+    const rg = Reel.rng(41);
+    for (let i = 0; i < 46; i++) { const a = rg() * 6.283, r0 = 165 + rg() * 30, r1 = 420; G.k.lineWidth = 1.5 + rg() * 3.5; G.k.beginPath(); G.k.moveTo(ex + Math.cos(a) * r0 * 1.15, ey + Math.sin(a) * r0 * 0.85); G.k.lineTo(ex + Math.cos(a) * r1, ey + Math.sin(a) * r1 * 0.6); G.k.stroke(); }
+    G.k.restore();
+    const dia = (o, s) => pth([[ex + o, ey - 118 * s + o], [ex + 150 * s + o, ey + o], [ex + o, ey + 118 * s + o], [ex - 150 * s + o, ey + o]]);
+    for (let d = 16; d > 0; d -= 2) shape(dia(d, 1), '#c41f26', 0);
+    shape(dia(0, 1), '#ffd23f', 7);
+    shape(dia(0, 0.8), null, 3);
+    const bolt = pth([[ex + 34, ey - 92], [ex - 52, ey + 10], [ex - 6, ey + 10], [ex - 40, ey + 96], [ex + 58, ey - 16], [ex + 10, ey - 16], [ex + 44, ey - 92]]);
+    for (let d = 10; d > 0; d -= 2) shape(pth([[ex + 34 + d, ey - 92 + d], [ex - 52 + d, ey + 10 + d], [ex - 6 + d, ey + 10 + d], [ex - 40 + d, ey + 96 + d], [ex + 58 + d, ey - 16 + d], [ex + 10 + d, ey - 16 + d], [ex + 44 + d, ey - 92 + d]]), '#7a1218', 0);
+    shape(bolt, '#e2302f', 5);
+    // Ben-Day band under the emblem: diagonal stripes, red dots between
+    both(() => {
+      const band = pth([[110, 262], [850, 262], [832, 300], [128, 300]]);
+      G.c.save(); G.c.clip(band); G.k.save(); G.k.clip(band);
+      G.c.fillStyle = '#ffd23f'; G.c.fillRect(100, 255, 760, 50);
+      for (let x = 60; x < 900; x += 34) { G.c.fillStyle = '#2e63c7'; G.c.beginPath(); G.c.moveTo(x, 300); G.c.lineTo(x + 16, 300); G.c.lineTo(x + 40, 262); G.c.lineTo(x + 24, 262); G.c.fill(); }
+      G.c.restore(); G.k.restore();
+      shape(band, null, 4);
+    });
+    shape(pth([[840, 40], [960, 40], [960, 150], [840, 150]]), '#ffffff', 4);
+    handText(C.no, 900, 100, `italic 700 40px ${HEROS}`, 'center', { seed: 11, rot: 0.05, sc: 0.06, dy: 2 });
+    handText('OCT', 900, 138, `700 28px ${HEROS}`, 'center', { seed: 12, fill: '#d9282f', noInk: true, rot: 0.05 });
+    burst(70, 80, 36, 60, 10, '#ffd23f', 5); text('★', 70, 94, `700 40px ${SANS}`, '#d9282f', 0, false, 'center');
+    shape(pth([[44, 150], [118, 150], [118, 214], [44, 214]]), '#ffffff', 4);
+    handText(C.price, 81, 198, `700 40px ${HEROS}`, 'center', { seed: 13, rot: 0.06, sc: 0.06, dy: 2 });
+  });
+  // --- main cover art: night city, the giant robot, search lights
+  both(() => {
+    clipRect(ART[0], ART[1], ART[2], ART[3]);
+    const sky = gC.createLinearGradient(0, ART[1], 0, ART[1] + ART[3]); sky.addColorStop(0, '#16205a'); sky.addColorStop(0.65, '#5a2f8a'); sky.addColorStop(1, '#e05a8a');
+    gC.fillStyle = sky; gC.fillRect(ART[0], ART[1], ART[2], ART[3]);
+    for (const [x, a] of [[220, -0.25], [760, 0.3]]) { gC.save(); gC.translate(x, ART[1] + ART[3]); gC.rotate(a); const sg = gC.createLinearGradient(0, 0, 0, -700); sg.addColorStop(0, 'rgba(255,240,170,.75)'); sg.addColorStop(1, 'rgba(255,240,170,0)'); gC.fillStyle = sg; gC.beginPath(); gC.moveTo(-20, 0); gC.lineTo(-110, -700); gC.lineTo(110, -700); gC.lineTo(20, 0); gC.fill(); gC.restore(); }
+    robot(560, ART[1] + 520, 1.25, f * 0.7, 0);
+    skyline(ART[0] - 10, ART[1] + ART[3] + 4, ART[2] + 30, 260, 9, '#23285a', '#ffd23f');
+    if (t >= T_LAND) { both(() => { xf(1.18, 0, 0, 1.18, 430, ART[1] + 300); G.c.rotate(-0.42); G.k.rotate(-0.42); heroFly(f); }); speedLines(560, ART[1] + 260, 300, 900, 40, 3, 3); }
+  });
+  G.k.lineWidth = 7; G.k.strokeRect(ART[0], ART[1], ART[2], ART[3]);
+
+  // --- panel A: rooftop at dusk, silhouette
+  both(() => {
+    clipRect(PA[0], PA[1], PA[2], PA[3]);
+    const sky = gC.createLinearGradient(0, PA[1], 0, PA[1] + PA[3]); sky.addColorStop(0, '#5a2f8a'); sky.addColorStop(0.55, '#e0508a'); sky.addColorStop(1, '#ffb347');
+    gC.fillStyle = sky; gC.fillRect(PA[0], PA[1], PA[2], PA[3]);
+    gC.fillStyle = '#ffe17a'; gC.beginPath(); gC.arc(PA[0] + 360, PA[1] + 190, 56, 0, 6.3); gC.fill();
+    skyline(PA[0] - 10, PA[1] + PA[3] + 2, PA[2] + 20, 110, 4, '#3b2a6e', '#ffcf5a');
+    shape(pth([[PA[0] + 120, PA[1] + PA[3] + 4], [PA[0] + 140, PA[1] + 214], [PA[0] + 320, PA[1] + 214], [PA[0] + 330, PA[1] + PA[3] + 4]]), null, 0, { inkFill: true });
+    both(() => { xf(0.62, 0, 0, 0.62, PA[0] + 230 + Math.sin(f * 0.2) * 2, PA[1] + 216); heroStand(f); });
+  });
+  panelFrame(PA[0], PA[1], PA[2], PA[3]);
+  caption(PA[0] + 10, PA[1] + 10, 300, 40, C.cap, `italic 700 19px ${HEROS}`);
+  // --- panel B: the helmet close-up, the robot's red eye in the visor
+  both(() => {
+    clipRect(PB[0], PB[1], PB[2], PB[3]);
+    gC.fillStyle = '#ffd23f'; gC.fillRect(PB[0], PB[1], PB[2], PB[3]);
+    speedLines(PB[0] + 250, PB[1] + 150, 120, 520, 70, 11 + (f % 3), 3);
+    const zoom = 1 + 0.06 * clamp((t - 1.2) / 1.4);
+    xf(zoom, 0, 0, zoom, PB[0] + 250, PB[1] + 170);
+    shape(pth([[-150, 90], [-90, 160], [60, 168], [170, 90], [180, 170], [-170, 170]]), '#e2302f', 6);
+    shape(ell(0, 0, 158, 148), '#f2f2f2', 7);
+    shape(ell(-120, 30, 26, 44, 0.1), '#e2302f', 5);
+    const vb = new Path2D(); vb.moveTo(-118, -40); vb.quadraticCurveTo(0, -80, 140, -46); vb.quadraticCurveTo(160, 20, 120, 64); vb.quadraticCurveTo(0, 96, -104, 60); vb.quadraticCurveTo(-136, 10, -118, -40); vb.closePath();
+    shape(vb, '#16193a', 5, { inkFill: true });
+    // reflection: the robot and the city, bent by the visor
+    G.c.save(); G.c.clip(vb);
+    const rob = new Path2D(); rob.moveTo(-6, 70); rob.quadraticCurveTo(-14, -10, 10, -34); rob.quadraticCurveTo(44, -44, 82, -32); rob.quadraticCurveTo(104, -6, 98, 70); rob.closePath();
+    G.c.fillStyle = '#4a3a80'; G.c.fill(rob); G.c.fillStyle = '#ff2a2a'; G.c.beginPath(); G.c.ellipse(44, 6, 20 + Math.sin(f * 1.5) * 3, 12, 0, 0, 6.3); G.c.fill();
+    G.c.fillStyle = '#ffd23f'; for (let i = 0; i < 14; i++) G.c.fillRect(-110 + i * 17, 40 + (i % 3) * 6, 6, 8);
+    G.c.restore();
+    G.k.save(); G.k.clip(vb); G.k.globalCompositeOperation = 'destination-out';
+    G.k.fill(rob); for (let i = 0; i < 14; i++) G.k.fillRect(-110 + i * 17, 40 + (i % 3) * 6, 6, 8);
+    G.k.beginPath(); G.k.ellipse(-30, -38, 70, 9, -0.12, 0, 6.3); G.k.fill(); G.k.restore();
+    G.k.save(); G.k.clip(vb); G.k.lineWidth = 3.5; G.k.stroke(rob); G.k.restore();
+    G.c.save(); G.c.clip(vb); G.c.fillStyle = '#bfefff'; G.c.beginPath(); G.c.ellipse(-30, -38, 70, 9, -0.12, 0, 6.3); G.c.fill(); G.c.restore();
+  });
+  panelFrame(PB[0], PB[1], PB[2], PB[3]);
+  balloon(PB[0] + 300, PB[1] + 58, 118, 40, PB[0] + 300, PB[1] + 110, C.say, `italic 700 22px ${HEROS}`);
+  // --- panel C: the punch
+  const broken = clamp((t - T_BREAK) / 0.35);
+  both(() => {
+    clipRect(PC[0], PC[1], PC[2], PC[3]);
+    gC.fillStyle = '#5fd0ff'; gC.fillRect(PC[0], PC[1], PC[2], PC[3]);
+    const sky = gC.createLinearGradient(PC[0], 0, PC[0] + PC[2], 0); sky.addColorStop(0, '#2e63c7'); sky.addColorStop(1, '#7a2f8a'); gC.fillStyle = sky; gC.fillRect(PC[0], PC[1], PC[2], PC[3]);
+    skyline(PC[0], PC[1] + PC[3] + 2, PC[2], 90, 21, '#1d2450', '#ffd23f');
+    const hit = clamp((t - T_HIT) / 0.25);
+    robot(PC[0] + 700 + hit * 30, PC[1] + 240, 0.62, f, hit);
+    if (t < T_BREAK) {
+      const k = clamp((t - 2.6) / (T_HIT - 2.6)), x = lerp(PC[0] - 160, PC[0] + 470, E.outCubic(k)), y = lerp(PC[1] + 160, PC[1] + 120, k) - E.inQuad(clamp((t - 4.1) / 0.4)) * 180;
+      for (let i = 0; i < 9; i++) { G.k.lineWidth = 2.5; G.k.beginPath(); G.k.moveTo(x - 200 - i * 30, y - 80 + i * 18); G.k.lineTo(x - 520 - i * 20, y - 80 + i * 18); G.k.stroke(); }
+      both(() => { xf(0.42, 0, 0, 0.42, x, y); const a = -0.15 - E.inQuad(clamp((t - 4.1) / 0.4)) * 0.9; G.c.rotate(a); G.k.rotate(a); heroFly(f); });
+    }
+    if (hit > 0 && t < 4.6) {
+      const k = E.outBack(clamp((t - T_HIT) / 0.2)), sc = 0.5 + 0.5 * k;
+      both(() => { xf(sc, 0, 0, sc, PC[0] + 640, PC[1] + 100); burst(0, 0, 70, 150, 13, '#ffd23f', 31, t * 0.4); burst(0, 0, 40, 90, 11, '#ff6a2a', 32, -t * 0.3); });
+    }
+  });
+  panelFrame(PC[0], PC[1], PC[2], PC[3], broken);
+  if (t >= T_HIT) {   // hand-drawn SFX lettering breaks the panel border, as comics do
+    const k = E.outBack(clamp((t - T_HIT) / 0.2), 2.2);
+    both(() => {
+      xf(k, 0, 0, k, PC[0] + 640, PC[1] + 112); G.c.rotate(-0.12); G.k.rotate(-0.12);
+      handText(C.sfx, 0, 0, `italic 700 92px ${HEROS}`, 'center', { seed: 21, rot: 0.17, sc: 0.16, dy: 16, extrude: 12, extCol: '#d9282f', fill: '#ffd23f', stroke: 8, noInk: true, sp: 1.02 });
+    });
+  }
+  G = null;
+}
+function drawHero(f) {
+  G = { c: hgC, k: hgK };
+  for (const g of [hgC, hgK]) { g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, HS, HS); }
+  // die-cut paper border first (white, on the colour plate only): a fat stroke of the silhouette
+  both(() => { xf(1.6, 0, 0, 1.6, HS * 0.52, HS * 0.6); heroFly(f * 12 / 15); });
+  // silhouette of everything drawn → paper margin
+  const tmp = document.createElement('canvas'); tmp.width = HS; tmp.height = HS; const tg = tmp.getContext('2d');
+  tg.drawImage(hCol, 0, 0); tg.drawImage(hInk, 0, 0);
+  const m = document.createElement('canvas'); m.width = HS; m.height = HS; const mg = m.getContext('2d');
+  mg.filter = 'blur(7px)'; mg.drawImage(tmp, 0, 0); mg.filter = 'none';
+  // a torn edge, not a die-cut: the margin wanders, frays into fibres and shows the paper's grey core
+  const md = mg.getImageData(0, 0, HS, HS);
+  for (let i = 3; i < md.data.length; i += 4) {
+    const px = ((i - 3) / 4) % HS, py = Math.floor((i - 3) / 4 / HS);
+    const nz = Reel.noise2(px * 0.045, py * 0.045) * 0.6 + Reel.noise2(px * 0.17 + 9, py * 0.17) * 0.3 + Reel.noise2(px * 0.6, py * 0.6 + 3) * 0.15;
+    const thr = Math.max(10, 26 + nz * 40);                                  // never below the blur floor (no specks)
+    const a = md.data[i] > thr ? 255 : 0;
+    const g = md.data[i] < thr + 30 ? 238 + nz * 8 : 248;                  // the torn rim shows the paper's grey core
+    md.data[i - 3] = g; md.data[i - 2] = g - 3; md.data[i - 1] = g - 10; md.data[i] = a;
+  }
+  mg.putImageData(md, 0, 0);
+  hgC.globalCompositeOperation = 'destination-over'; hgC.drawImage(m, 0, 0); hgC.globalCompositeOperation = 'source-over';
+  G = null;
+}
+
+// ================= GL: print simulation + page / cutout / desk =================
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float');
+const HD = '#version 300 es\nprecision highp float;\n';
+const pShade = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o;
+uniform sampler2D COL, INK, HCOL, HINK;
+uniform vec2 res, jit; uniform vec3 ro, cf, cr, cu; uniform float tanF, T;
+uniform vec4 plates;                 // masthead plate visibility (Y, M, C, K)
+uniform vec4 hero;                   // cutout centre x, y (page units), lift z, visible
+uniform vec2 heroS;                  // squash / stretch (x, y)
+uniform vec4 bump;                   // landing ripple: x, y, radius, amplitude
+uniform float curlK;
+uniform vec4 heroR;                  // rotation (rad), scale (units per hero px), tilt, flex
+uniform vec2 PG;
+${SG.GLSL_NOISE}
+vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
+// page in world: X = x, Y = -y, Z = curl(x, y)
+float curl(vec2 p){ float u = clamp((p.x - PG.x*.86)/(PG.x*.14), 0., 1.); return u*u*14.*curlK; }
+float ripple(vec2 p){ float d = length(p - bump.xy); return bump.w*sin((d - bump.z)*.05)*exp(-pow((d - bump.z)/110., 2.)); }
+// ---- halftone print of an art texture at page coords p (units), with plate gate g and dot size scale
+float dotAt(sampler2D S, vec2 p, float ang, float cell, int ch, vec2 mis, vec2 tsz, float fw, out float flt){
+  float c = cos(ang), s = sin(ang);
+  vec2 q = mat2(c, -s, s, c)*p/cell;
+  vec2 ce = floor(q) + .5;
+  vec2 pc = transpose(mat2(c, -s, s, c))*ce*cell;
+  vec2 q1 = (pc + mis)/tsz, q2 = (p + mis)/tsz;
+  vec3 a = texture(S, vec2(q1.x, 1. - q1.y)).rgb; vec3 af = texture(S, vec2(q2.x, 1. - q2.y)).rgb;
+  float v = 1. - (ch == 0 ? a.r : ch == 1 ? a.g : a.b);
+  flt = 1. - (ch == 0 ? af.r : ch == 1 ? af.g : af.b);
+  // hand-cut separations: every plate only has 0 / 25 / 50 / 75 / 100 % tints, and blank paper gets no ink at all
+  v = v < .09 ? 0. : v > .88 ? 1. : floor(v*4. + .5)/4.;
+  flt = flt < .09 ? 0. : flt > .88 ? 1. : floor(flt*4. + .5)/4.;
+  if (v <= 0.) return 0.;
+  if (v >= 1.) return 1.;
+  float r = sqrt(clamp(v, 0., 1.)/3.14159)*1.12;
+  float d = length(q - ce) + (vn(p*.9) - .5)*.08;
+  float aa = fw/cell*1.2 + .04;
+  return 1. - smoothstep(r - aa, r + aa, d);
+}
+vec3 printAt(sampler2D S, sampler2D K, vec2 p, vec2 tsz, float fw, vec4 gate, vec3 paper){
+  float cell = 4.6;
+  vec2 mC = vec2(.9, -.5), mM = vec2(-.7, .8), mY = vec2(.3, 1.1);
+  float fC, fM, fY;
+  float dC = dotAt(S, p, .2618, cell, 0, mC, tsz, fw, fC);
+  float dM = dotAt(S, p, 1.309, cell, 1, mM, tsz, fw, fM);
+  float dY = dotAt(S, p, 0., cell, 2, mY, tsz, fw, fY);
+  // when the screen is finer than the pixels, print the average tint instead (no moire)
+  float mixF = smoothstep(cell*.16, cell*.42, fw);
+  dC = mix(dC, fC, mixF); dM = mix(dM, fM, mixF); dY = mix(dY, fY, mixF);
+  dC *= gate.z; dM *= gate.y; dY *= gate.x;
+  vec3 inkC = vec3(.0, .63, .9), inkM = vec3(.92, .12, .52), inkY = vec3(1., .9, .05);
+  vec3 col = paper;
+  col *= mix(vec3(1.), inkC, dC*.95);
+  col *= mix(vec3(1.), inkM, dM*.95);
+  col *= mix(vec3(1.), inkY, dY*.92);
+  // key plate: slightly bled, rough edges
+  vec2 qk = (p + vec2(-.3, .2))/tsz;
+  float k = texture(K, vec2(qk.x, 1. - qk.y)).a;
+  float kn = vn(p*1.7)*.18 + vn(p*.4)*.12;
+  float kk = smoothstep(.38 - kn*.4, .62 - kn*.2, k)*gate.w;
+  col *= mix(vec3(1.), vec3(.08, .07, .09), kk);
+  return col;
+}
+vec3 paperAt(vec2 p){
+  float fib = vn(p*vec2(.35, 1.4))*.5 + vn(p*vec2(1.2, 4.))*.3 + vn(p*.08)*.2;
+  vec3 c = vec3(.9, .84, .7)*(.95 + .07*fib);                  // sixty-year-old newsprint: grey-yellow, fibrous
+  float fox = smoothstep(.72, .9, fbm3(p*.012 + 4.));
+  c = mix(c, vec3(.82, .7, .5), fox*.35);
+  vec2 e = min(p, PG - p); float edge = min(e.x, e.y);
+  c *= mix(.8, 1., smoothstep(0., 40., edge));
+  c = mix(c, vec3(.86, .74, .55), (1. - smoothstep(0., 14., edge))*.5);
+  return c;
+}
+float lightAt(vec3 n){ vec3 L = normalize(vec3(-.45, .5, .75)); return .62 + .5*max(dot(n, L), 0.); }
+void main(){
+  vec2 fc = gl_FragCoord.xy + jit;
+  vec2 sp = (fc - res*.5)/(res.y*.5);
+  vec3 rd = normalize(cf + cr*sp.x*tanF + cu*sp.y*tanF);
+  vec3 col = vec3(0.); float depth = 1e5;
+  // the hero cutout (a flat card above the page)
+  float tH = 1e9; vec2 hp = vec2(0.); float hA = 0.; vec3 hpos;
+  if (hero.w > .5) {
+    float zc = hero.z;
+    // plane z = zc tilted around x by heroR.z
+    vec3 nP = normalize(vec3(0., sin(heroR.z), cos(heroR.z)));
+    vec3 c0 = vec3(hero.x, -hero.y, zc);
+    float dn = dot(rd, nP);
+    if (abs(dn) > 1e-5) {
+      float t = dot(c0 - ro, nP)/dn;
+      if (t > 0.) {
+        vec3 q = ro + rd*t - c0;
+        vec3 ex = vec3(1., 0., 0.), ey = normalize(cross(nP, ex));
+        vec2 l = vec2(dot(q, ex), dot(q, ey));
+        float ca = cos(heroR.x), sa = sin(heroR.x);
+        l = mat2(ca, sa, -sa, ca)*l;
+        vec2 hu = vec2(l.x/(heroR.y*heroS.x) + ${HS / 2}., ${HS / 2}. - l.y/(heroR.y*heroS.y));
+        if (hu.x > 0. && hu.y > 0. && hu.x < ${HS}. && hu.y < ${HS}.) {
+          hA = texture(HCOL, vec2(hu.x/${HS}., 1. - hu.y/${HS}.)).a;
+          if (hA > .5) { tH = t; hp = hu; hpos = ro + rd*t; }
+        }
+      }
+    }
+  }
+  // page (with a slight curl at the right edge) — iterate the plane intersection twice for the curl
+  float tP = (0. - ro.z)/rd.z;
+  vec3 pp = ro + rd*tP; vec2 pg = vec2(pp.x, -pp.y);
+  for (int i = 0; i < 2; i++) { float z = curl(pg); tP = (z - ro.z)/rd.z; pp = ro + rd*tP; pg = vec2(pp.x, -pp.y); }
+  bool onPage = pg.x > 0. && pg.y > 0. && pg.x < PG.x && pg.y < PG.y && tP > 0.;
+  float fw = length(fwidth(pg)) + 1e-3;
+  if (tH < 1e8 && (!onPage || tH < tP)) {
+    float fwh = fw*heroR.y/1.;
+    vec3 c = printAt(HCOL, HINK, hp, vec2(${HS}.), fwh/heroR.y*1., vec4(1.), vec3(.95, .91, .8));
+    vec3 n = normalize(vec3(sin(heroR.w*(hp.x/${HS}. - .5))*.4, sin(heroR.z), cos(heroR.z)));
+    col = lin(c)*lightAt(n)*1.05;
+    depth = tH;
+  } else if (onPage) {
+    vec2 tsz = vec2(${PGW}., ${PGH}.);
+    vec4 gate = pg.y < 305. ? plates : vec4(1.);
+    vec3 paper = paperAt(pg);
+    vec3 c = printAt(COL, INK, pg, tsz, fw, gate, paper);
+    // page normal from the curl + fibre bumps
+    float h0 = curl(pg) + ripple(pg), hx = curl(pg + vec2(2., 0.)) + ripple(pg + vec2(2., 0.)), hy = ripple(pg + vec2(0., 2.));
+    vec3 n = normalize(vec3(-(hx - h0)/2. + (vn(pg*.6) - .5)*.05, (hy - ripple(pg))/2. + (vn(pg*.6 + 9.) - .5)*.05, 1.));
+    float li = lightAt(n);
+    // shadow of the cutout on the page
+    if (hero.w > .5 && hero.z > .5) {
+      vec2 so = vec2(hero.z*.55, hero.z*.45);
+      vec2 d = (pg - vec2(hero.x, hero.y) - so);
+      float ca = cos(heroR.x), sa = sin(heroR.x);
+      vec2 l = mat2(ca, -sa, sa, ca)*vec2(d.x, -d.y);
+      vec2 hu = vec2(l.x/heroR.y + ${HS / 2}., ${HS / 2}. - l.y/heroR.y);
+      float sh = textureLod(HCOL, vec2(hu.x/${HS}., 1. - hu.y/${HS}.), 2. + hero.z*.02).a;
+      sh *= step(0., hu.x)*step(hu.x, ${HS}.)*step(0., hu.y)*step(hu.y, ${HS}.);
+      li *= 1. - .42*sh*clamp(1. - hero.z/900., .2, 1.);
+    }
+    col = lin(c)*li;
+    depth = tP;
+  } else {
+    // desk: dark oiled oak, the page's soft shadow
+    float t = (-1. - ro.z)/rd.z; vec3 p = ro + rd*t; vec2 q = vec2(p.x, -p.y);
+    float g = fbm(vec2(q.x*.004, q.y*.05)); float ring = .5 + .5*sin(q.y*.08 + g*9.);
+    vec3 wd = lin(mix(vec3(.16, .1, .06), vec3(.3, .19, .11), ring*.6 + .4*vn(q*vec2(.02, .3))));
+    vec2 e = max(max(-q, q - PG), 0.); float dd = length(e);
+    wd *= mix(.35, 1., smoothstep(0., 60., dd + (q.x - PG.x*.5)*0.));
+    float pool = exp(-pow(length((q - vec2(PG.x*.45, PG.y*.45))/vec2(1500., 1300.)), 2.));
+    col = wd*(.25 + .9*pool);
+    depth = t;
+  }
+  o = vec4(col, depth);
+}`);
+const pDof = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float focus, aper, maxC;
+float coc(float z){ return clamp(abs(1. - focus/max(z, .01))*aper, 0., maxC); }
+void main(){ vec4 c0 = texture(S, uv); float cc = coc(c0.a); vec3 acc = c0.rgb; float ws = 1.;
+  for (int i = 0; i < 48; i++){ float fi = float(i) + .5; float r = sqrt(fi/48.)*maxC; float a = fi*2.39996;
+    vec4 sm = texture(S, uv + vec2(cos(a), sin(a))*r/res); float sc = coc(sm.a); if (sm.a > c0.a) sc = min(sc, cc*1.5 + .5);
+    float wg = clamp(sc - r + 1., 0., 1.); acc += sm.rgb*wg; ws += wg; }
+  o = vec4(acc/ws, c0.a); }`);
+const pComp = SG.prog(gl, SG.VS_QUAD, HD + `in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float seed, expo;
+${SG.GLSL_NOISE}
+void main(){ vec2 d = uv - .5; vec3 c = vec3(texture(S, uv - d*.0012).r, texture(S, uv).g, texture(S, uv + d*.0012).b);
+  c *= expo; c = c/(1. + c*.12); c = pow(c, vec3(1./2.2));
+  c = mix(vec3(dot(c, vec3(.3, .59, .11))), c, 1.06);
+  c *= 1. - .38*smoothstep(.3, 1.05, length(d*vec2(1.3, 1.)));
+  c += (hash12(uv*res + seed*71.) - .5)*.028; o = vec4(clamp(c, 0., 1.), 1.); }`);
+const tCOL = SG.tex(gl, TW, TH, { mips: true, aniso: 8 }), tINK = SG.tex(gl, TW, TH, { mips: true, aniso: 8 });
+const tHC = SG.tex(gl, HS, HS, { mips: true }), tHK = SG.tex(gl, HS, HS, { mips: true });
+const tSH = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fSH = SG.fbo(gl, [tSH]);
+const tDF = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fDF = SG.fbo(gl, [tDF]);
+const QUAD = SG.quad(gl);
+const upFlip = (t, c) => { gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); SG.upload(gl, t, c); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); };
+let lastTick = -999, heroTick = -999;
+
+// ================= camera (page units; X right, Y = -page y, Z up) =================
+const V3 = { add: (a, b) => a.map((x, i) => x + b[i]), sub: (a, b) => a.map((x, i) => x - b[i]), mul: (a, k) => a.map((x) => x * k), lerp: (a, b, k) => a.map((x, i) => lerp(x, b[i], k)),
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]], norm: (a) => { const l = Math.hypot(...a) || 1; return a.map((x) => x / l); } };
+const look = (cx, cy, h, tx = 0.12, ty = -0.2) => ({ ta: [cx, -cy, 0], ro: [cx + h * tx, -cy + h * ty, h] });
+// one continuous camera curve (monotone Hermite per channel: velocity carries through every key, never overshoots)
+// channels: page x, page y, height, x tilt, y tilt
+const KEYS = [
+  [0.0, [250, 1140, 520, 0.1, -0.22]], [1.2, [270, 1131, 470, 0.05, -0.2]],
+  [1.5, [745, 1134, 480, -0.05, -0.2]], [2.45, [728, 1150, 446, -0.08, -0.18]],
+  [2.75, [500, 1400, 820, 0.0, -0.2]], [4.1, [515, 1386, 760, 0.02, -0.18]], [4.7, [520, 1330, 880, 0.03, -0.18]],
+  [5.9, [500, 790, 2300, 0.06, -0.24]], [8.0, [480, 430, 1350, 0.04, -0.2]], [8.6, [480, 424, 1320, 0.04, -0.2]],
+];
+const TAN = KEYS.map(([t, v], i) => v.map((x, d) => {
+  if (i === 0 || i === KEYS.length - 1) return 0;
+  const [t0, v0] = KEYS[i - 1], [t1, v1] = KEYS[i + 1];
+  const a = (x - v0[d]) / (t - t0), b = (v1[d] - x) / (t1 - t);
+  if (a * b <= 0) return 0;
+  const m = (a * (t1 - t) + b * (t - t0)) / (t1 - t0);
+  return Math.sign(m) * Math.min(Math.abs(m), 3 * Math.min(Math.abs(a), Math.abs(b)));
+}));
+function camAt(t) {
+  let i = 0; while (i < KEYS.length - 2 && t > KEYS[i + 1][0]) i++;
+  const [ta_, va] = KEYS[i], [tb_, vb] = KEYS[i + 1], h = tb_ - ta_, u = clamp((t - ta_) / h);
+  const u2 = u * u, u3 = u2 * u, h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+  const [cx, cy, hh, tx, ty] = va.map((x, d) => h00 * x + h10 * h * TAN[i][d] + h01 * vb[d] + h11 * h * TAN[i + 1][d]);
+  return look(cx, cy, hh, tx, ty);
+}
+// hero cutout flight: from panel C up over the page, lands in the cover art
+function heroAt(t) {
+  const k = inv(T_BREAK, T_LAND - 0.07, t);
+  // start / end poses match the printed hero in panel C and on the cover (centre of the cut-out canvas)
+  const x = lerp(482, 382, E.inOutSine(k)) + Math.sin(E.inOutSine(k) * Math.PI) * 150;
+  const y = lerp(PC[1] - 69, ART[1] + 232.6, E.inOutSine(k));
+  const kz = k;                                                         // flight done two frames early: lands, squashes, then prints
+  const z = Math.pow(Math.sin(Math.PI * kz), 0.85) * 900 * (1 - 0.25 * kz);
+  const rot = lerp(-1.05, -0.42, E.inOutCubic(k)) + Math.sin(k * 9) * 0.05;
+  const sc = lerp(0.42 / 1.6, 1.18 / 1.6, E.inOutCubic(k));
+  const tilt = -Math.sin(Math.PI * kz) * 0.35;
+  // anticipation squash as it tears free, stretch on the way up, squash on the landing
+  // (keyed to the frame, not to the motion-blur sub-samples, so a pose never blends with the next one)
+  const tf = Math.round(t * 30) / 30;
+  let sx = 1, sy = 1;
+  if (tf < T_BREAK + 0.067) { sx = 1.08; sy = 0.88; } else if (tf < T_BREAK + 0.167) { sx = 0.9; sy = 1.16; }
+  else if (tf >= T_LAND - 0.07) { sx = 1.12; sy = 0.84; }
+  return { x, y, z: Math.max(0.8, z), rot, sc, tilt, flex: Math.sin(k * 14) * 0.6, sx, sy };   // never below the paper's own thickness (no z-fighting on landing)
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  fonts: [`700 40px ${HEROS}`, `italic 700 40px ${HEROS}`, `700 22px ${SANS}`, `700 40px ${SANS}`],
+  async setup() {},
+  cues: [
+    { t: 0.0, sfx: 'city', gain: 0.5 }, { t: 1.2, sfx: 'whoosh', gain: 0.3 }, { t: 1.5, sfx: 'zap', gain: 0.5 },
+    { t: 2.45, sfx: 'whoosh', gain: 0.25 }, { t: 2.6, sfx: 'jet', gain: 0.7 }, { t: T_HIT, sfx: 'krakoom', gain: 1.0 },
+    { t: 4.5, sfx: 'tear', gain: 0.85 }, { t: 4.55, sfx: 'jet', gain: 0.6 }, { t: T_LAND - 0.07, sfx: 'land', gain: 0.7 },
+    { t: 6.5, sfx: 'press', gain: 0.6 }, { t: 7.0, sfx: 'press', gain: 0.6 }, { t: 7.5, sfx: 'press', gain: 0.65 }, { t: 8.0, sfx: 'press', gain: 0.8 }, { t: 8.0, sfx: 'stinger', gain: 0.6 },
+  ],
+  render(t) {
+    const frame = Math.round(t * 30), tick = Math.floor((frame + 1) / 2), tp = tick / 15;   // 15 drawings per second, locked to the frame (not the blur sub-samples)
+    if (tick !== lastTick) { drawPage(tick); upFlip(tCOL, cCol); upFlip(tINK, cInk); lastTick = tick; }
+    const hs = tp >= T_BREAK && tp < T_LAND ? heroAt(t) : null;
+    if (hs && heroTick !== tick) { drawHero(tick); upFlip(tHC, hCol); upFlip(tHK, hInk); heroTick = tick; }
+    const jit = Reel.jit || [0, 0];
+    const cam = camAt(t);
+    const fwd = V3.norm(V3.sub(cam.ta, cam.ro)), right = V3.norm(V3.cross(fwd, [0, 1, 0])), up = V3.cross(right, fwd);
+    const plates = [t >= 6.5 ? 1 : 0, t >= 7.0 ? 1 : 0, t >= 7.5 ? 1 : 0, t >= 8.0 ? 1 : 0];
+    const settle = t >= 8.0 ? Math.sin(Math.PI * clamp((t - 8.0) / 0.3)) * Math.exp(-(t - 8.0) * 4) : 0;   // the corner drops flat as the black plate lands
+    const rp = t >= T_LAND - 0.07 ? t - (T_LAND - 0.07) : -1;
+    SG.bind(gl, fSH);
+    const P = pShade.use().t('COL', tCOL).t('INK', tINK).t('HCOL', tHC).t('HINK', tHK).f('res', W, H).f('jit', jit[0], -jit[1])
+      .v('ro', cam.ro).v('cf', fwd).v('cr', right).v('cu', up).f('tanF', 0.36).f('T', t).v('plates', plates).f('PG', PGW, PGH);
+    if (hs) P.f('hero', hs.x, hs.y, hs.z, 1).f('heroR', hs.rot, hs.sc, hs.tilt, hs.flex).f('heroS', hs.sx, hs.sy); else P.f('hero', 0, 0, 0, 0).f('heroR', 0, 1, 0, 0).f('heroS', 1, 1);
+    P.f('curlK', 1 - 0.55 * settle).f('bump', 430, ART[1] + 300, rp >= 0 ? rp * 1300 : -999, rp >= 0 && rp < 0.6 ? 2.2 * Math.exp(-rp * 6) : 0);
+    QUAD.draw();
+    let src = tSH;
+    const dist = Math.hypot(...V3.sub(cam.ta, cam.ro));
+    const ap = hs ? 1.4 : 0.5;
+    SG.bind(gl, fDF); pDof.use().t('S', tSH).f('res', W, H).f('focus', hs ? Math.max(200, dist - hs.z * 0.8) : dist).f('aper', ap * 6 * RS).f('maxC', ap * 6 * RS + 0.01); QUAD.draw(); src = tDF;
+    SG.bind(gl, null); gl.viewport(0, 0, W, H);
+    pComp.use().t('S', src).f('res', W, H).f('seed', Math.floor(t * 30) % 97).f('expo', 1.25); QUAD.draw();
+    gl.finish();
+  },
+});
+</script></body></html>

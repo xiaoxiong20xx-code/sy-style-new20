@@ -1,0 +1,19 @@
+{
+  "name": "sy-style-new20",
+  "version": "1.0.0",
+  "description": "新风格 20 种：10 秒纯画面短片，每一帧都由代码算出来（Canvas / WebGL / 光线步进 + 逐帧渲染 + 程序合成音效）",
+  "author": "肖雄 XIAOXIONG",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "check": "node make.js check",
+    "list": "node make.js list",
+    "setup": "node node_modules/playwright/cli.js install chromium"
+  },
+  "dependencies": {
+    "playwright": "1.64.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

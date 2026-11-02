@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>21 油画厚涂 · Oil Impasto</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 21 油画厚涂 · OIL IMPASTO =====
+   A stretched linen canvas on an easel under one warm raking softbox. Every brush / palette-knife stroke is a
+   GPU strip that writes colour + paint height + gloss into 4096x2560 maps (bristle grooves, edge ridges, dry-brush
+   skips that show the linen weave, knife plateaus with a lip of paint). The maps are then lit by a perspective
+   height-field ray marcher: soft raking shadows, cavity AO, glossy GGX highlights of wet oil, a steel palette
+   knife with its own reflections and shadow, depth of field and a filmic grade.
+   0.25s the knife lays the first ribbon · strokes stack on the beat into a vase of flowers (timelapse) ·
+   4.5s the camera drops to grazing height and the paint rises like a mountain range · pull back, signature,
+   the title is painted in thick cream paint and holds. */
+const { E, clamp, lerp, inv } = Reel;
+const stage = Reel.makeStage('#0b0a09');
+const C = Reel.cfg({});
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+Reel.ownJitter = true;
+const PW = 4096, PH = 2560;              // painting maps (texels); 1 texel ≈ 0.16 mm of a 65 cm canvas
+const HMAX = 64;                         // max paint+weave height in texels (hs = 1)
+const R = Reel.rng(2126);
+const rr = (a, b) => a + (b - a) * R();
+const hex = (h) => [parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255];
+const mixc = (a, b, k) => { const A = hex(a), B = hex(b); return '#' + A.map((x, i) => Math.round(lerp(x, B[i], k) * 255).toString(16).padStart(2, '0')).join(''); };
+const SANS = '"Noto Sans CJK SC"', SERIF = '"Noto Serif CJK SC"';
+
+// ================= the painting, stroke by stroke =================
+// spec: { pts, w, A, B, th (paint level), k (0 brush 1 knife 2 dab), dry, gl, mx, g (group), cap }
+const SPEC = [];
+const add = (g, pts, w, A, B, th, o = {}) => SPEC.push(Object.assign({ g, pts, w, A, B: B || A, th, k: 0, dry: 0.35, gl: 0.6, mx: 0.5 }, o));
+/// --- the opening palette-knife ribbon (deep teal marbled with titanium white)
+const KNIFE_PTS = [[330, 470], [1000, 560], [1650, 650], [2250, 800]];
+add('k1', KNIFE_PTS, 420, '#1b3f4c', '#e9e5da', 7, { k: 1, dry: 0.3, gl: 0.95, mx: 0.55, cap: 0.2 });
+const jit = (c, a = 0.06) => { const A = hex(c); return '#' + A.map((x) => Math.round(clamp(x + rr(-a, a) * (0.6 + x)) * 255).toString(16).padStart(2, '0')).join(''); };
+const pick = (arr) => arr[Math.floor(R() * arr.length)];
+const BG_D = ['#172a30', '#1e3438', '#22322d', '#2a2b26', '#1b2c34'], BG_M = ['#34504c', '#3f5a58', '#4a5e52', '#3a4e5e', '#465a50'],
+  BG_L = ['#7f8c7c', '#959682', '#a8a28a', '#8c9c94', '#9e9c86'], BG_A = ['#6b7a5a', '#7d6a48', '#4c6a80', '#5d6f6a'];
+const halo = (x, y) => Math.exp(-(((x - 2780) / 1050) ** 2 + ((y - 760) / 760) ** 2));
+const bgCol = (x, y) => { const h = halo(x, y), l = clamp(1 - x / 2600); const d = pick(BG_D), m = pick(BG_M), li = pick(BG_L);
+  return h > 0.42 ? mixc(m, li, clamp((h - 0.42) / 0.5)) : mixc(m, d, clamp(l * 0.9 + 0.1 + rr(-0.2, 0.2))); };
+const KDIST = (x, y) => { let d = 1e9; for (let i = 0; i < KNIFE_PTS.length - 1; i++) { const [ax, ay] = KNIFE_PTS[i], [bx, by] = KNIFE_PTS[i + 1]; const t = clamp(((x - ax) * (bx - ax) + (y - ay) * (by - ay)) / ((bx - ax) ** 2 + (by - ay) ** 2)); d = Math.min(d, Math.hypot(x - ax - t * (bx - ax), y - ay - t * (by - ay))); } return d; };
+(function bg() {
+  // 0: thin toned ground over the whole background (leaves the knife ribbon alone)
+  for (let row = 0; row < 6; row++) for (let k = 0; k < 2; k++) {
+    const y = -60 + row * 360 + rr(-30, 30), x0 = k ? 1900 : -300, x1 = x0 + 2600;
+    if (KDIST((x0 + x1) / 2, y) < 150 && row < 2 && k === 0) continue;
+    add('bg0', [[x0, y + rr(-60, 60)], [(x0 + x1) / 2, y + rr(-40, 40)], [x1, y + rr(-60, 60)]], 470, jit(bgCol((x0 + x1) / 2, y), 0.03), jit(bgCol(x1, y), 0.03), 1.2, { dry: 0.12, gl: 0.45, mx: 0.5 });
+  }
+  // 1: crosshatched body strokes
+  const cells = [];
+  for (let gy = 0; gy < 7; gy++) for (let gx = 0; gx < 11; gx++) cells.push([gx * 400 + rr(-110, 110) + (gy % 2) * 180 - 100, gy * 290 + rr(-60, 60) + 40, gy]);
+  cells.sort((a, b) => (a[0] * 0.5 + a[1]) - (b[0] * 0.5 + b[1]) + rr(-300, 300));
+  for (const [x, y, gy] of cells) {
+    if (y > 1900) continue;
+    if (KDIST(x, y) < 230 && R() < 0.85) continue;
+    const ang = (gy % 2 ? 0.45 : -0.35) + rr(-0.3, 0.3), len = rr(600, 980), knife = R() < 0.14;
+    const dx = Math.cos(ang) * len / 2, dy = Math.sin(ang) * len / 2, bend = rr(-70, 70);
+    const A = jit(bgCol(x, y), 0.04);
+    const B = R() < 0.5 ? mixc(A, pick(BG_A), 0.5) : mixc(A, halo(x, y) > 0.45 ? pick(BG_L) : pick(BG_D), 0.55);
+    const sw = rr(0.55, 0.85), bulge = rr(0.1, 0.4);
+    const dryB = R() < 0.28 ? rr(0.82, 0.95) : rr(0.35, 0.7);          // a quarter of the strokes run dry and break up
+    add('bg1', [[x - dx, y - dy], [x + bend * Math.sin(ang), y - bend * Math.cos(ang)], [x + dx, y + dy]], knife ? rr(230, 320) : 190 * rr(0.5, 1.8), A, B,
+      rr(3.6, 4.6), knife ? { k: 1, dry: 0.45, gl: 0.85, mx: 0.5, cap: 0.6 } : { dry: dryB, gl: 0.6, mx: 0.55, wf: (u) => (sw + (1 - sw) * clamp(u / bulge)) * (1 - 0.35 * clamp((u - 0.7) / 0.3)) });
+  }
+  // 2: accents: light scumbles in the halo, dark corners, a few warm / cool notes
+  for (let i = 0; i < 16; i++) {
+    const x = 2780 + rr(-1000, 1000), y = 760 + rr(-560, 700), a = rr(-0.7, 0.7), l = rr(260, 480);
+    if (halo(x, y) < 0.3) continue;
+    add('bg2', [[x - Math.cos(a) * l / 2, y - Math.sin(a) * l / 2], [x + Math.cos(a) * l / 2, y + Math.sin(a) * l / 2]], rr(110, 180), jit(pick(BG_L), 0.04), jit('#cfc6a8', 0.03), 4.8, { k: R() < 0.25 ? 1 : 0, dry: 0.7, gl: 0.8, mx: 0.5, cap: 0.7 });
+  }
+  for (let i = 0; i < 12; i++) {
+    const x = rr(-100, 4200), y = rr(-50, 1850), a = rr(-0.6, 0.6), l = rr(220, 420);
+    if (halo(x, y) > 0.35 || KDIST(x, y) < 250) continue;
+    add('bg2', [[x - Math.cos(a) * l / 2, y - Math.sin(a) * l / 2], [x + Math.cos(a) * l / 2, y + Math.sin(a) * l / 2]], rr(100, 170), jit(pick(BG_A), 0.04), jit(pick(BG_D), 0.03), 4.5, { dry: 0.6, gl: 0.7, mx: 0.6 });
+  }
+})();
+// --- table: horizontal strokes, lit from the left, dark front edge
+(function table() {   // a painter's table: a few broad warm ochre sweeps, a dark front edge, the vase's reflection
+  for (let i = 0; i < 2; i++) add('tb0', [[-300, 1960 + i * 330], [2000, 1975 + i * 330], [4400, 1955 + i * 330]], 420, i < 1 ? '#7a5028' : '#3a2416', i < 1 ? '#8e6232' : '#2a1a10', 1.2, { dry: 0.1, gl: 0.45 });
+  const ty = [1895, 1990, 2085, 2180, 2255];
+  ty.forEach((y, i) => {
+    const x0 = -350 + (i % 2) * 300 + rr(-100, 100), x1 = 4450;
+    add('tb1', [[x0, y + rr(-10, 10)], [1600, y + rr(-18, 18)], [3000, y + rr(-18, 18)], [x1, y + rr(-12, 12)]], rr(150, 210), jit(mixc('#b07a3c', '#7a4d26', i / 5), 0.03), jit(mixc('#d4a05a', '#9a6835', i / 5), 0.03), rr(4.4, 5.4), { dry: rr(0.45, 0.75), gl: 0.62, mx: 0.6 });
+  });
+  for (let i = 0; i < 3; i++) add('tb1', [[-350 + i * 200, 2400 + i * 70], [2000, 2405 + i * 70], [4450, 2395 + i * 70]], rr(150, 190), jit(mixc('#3a2416', '#55361f', R()), 0.03), '#24170e', rr(4, 4.8), { dry: 0.5, gl: 0.55, mx: 0.45 });
+  add('tb1', [[-80, 2318], [1400, 2306], [2900, 2316], [4180, 2304]], 34, '#c89a5a', '#e8c88c', 6, { dry: 0.65, gl: 0.85, mx: 0.5 });
+})();
+// --- vase: a cobalt jug, strokes following the form, highlight on the lit (left) side
+const VX = 2700;
+const vr = (y) => y < 1395 ? 150 : y < 1570 ? lerp(118, 106, (y - 1395) / 175) : y < 1780 ? lerp(106, 292, E.outSine((y - 1570) / 210)) : y < 1990 ? lerp(292, 270, (y - 1780) / 210) : lerp(270, 196, E.inQuad((y - 1990) / 100));
+(function vase() {
+  add('vs', [[VX + 150, 2080], [VX + 700, 2112], [VX + 1180, 2125]], 130, '#3b2415', '#4f321c', 4.5, { dry: 0.65, gl: 0.5 }); // cast shadow
+  for (let k = -2; k <= 2; k++) { const pts = []; for (let y = 1370; y <= 2030; y += 110) pts.push([VX + vr(y) * k * 0.36, y]); add('vs', pts, 230, '#18264f', '#1f3268', 6, { dry: 0.15, gl: 0.8, mx: 0.4, cap: 0.25 }); }
+  for (let k = -5; k <= 5; k++) {
+    const f = k / 5.35, pts = [];
+    for (let y = 1365; y <= 2010; y += 60) pts.push([VX + vr(y) * f * (1 + 0.03 * Math.sin(y * 0.012 + k * 1.7)), y + (k % 2) * 12]);
+    pts.push([VX + vr(2035) * f * 0.97, 2035]);
+    const lit = clamp(0.48 - f * 0.6 + rr(-0.08, 0.08));
+    add('vs', pts, rr(66, 86), jit(mixc('#111b40', '#4466a8', lit), 0.03), jit(mixc('#1b2a5c', '#7d97c8', lit), 0.03), 6.5 + rr(0, 1.2), { dry: 0.4, gl: 0.9, mx: 0.6, cap: 0.3, wf: (u) => 1 - 0.25 * clamp((u - 0.85) / 0.15) });
+  }
+  // the foot: a dark rim curving around the base, the shadow right under it
+  add('vs', Array.from({ length: 13 }, (_, i) => { const a = Math.PI * (1 - i / 12); return [VX + Math.cos(a) * 214, 2052 + Math.sin(a) * 16]; }), 46, '#0e1838', '#1c2a58', 7.2, { dry: 0.3, gl: 0.85, mx: 0.4, cap: 0.4 });
+  add('vs', Array.from({ length: 11 }, (_, i) => { const a = Math.PI * (1 - i / 10); return [VX + 20 + Math.cos(a) * 205, 2074 + Math.sin(a) * 9]; }), 20, '#2a1a10', '#3a2416', 5.2, { dry: 0.45, gl: 0.5, mx: 0.5, cap: 0.6 });
+  for (let j = 0; j < 3; j++) {
+    const y = 1720 + j * 110, pts = [];
+    for (let a = -1.05; a <= 1.05; a += 0.15) pts.push([VX + Math.sin(a) * vr(y) * 0.93, y + Math.cos(a) * 26]);
+    if (j === 1) add('vs', pts.slice(0, 7), 46, '#26437e', '#5a78b0', 6, { dry: 0.9, gl: 0.9, mx: 0.5 });
+  }
+  add('vs', [[VX - 150, 1352], [VX, 1333], [VX + 150, 1352]], 44, '#7d9ee0', '#dfe8fa', 8, { gl: 0.95 });
+  add('vs', [[VX - 145, 1364], [VX, 1394], [VX + 145, 1364]], 30, '#0d173e', '#203a80', 8, { gl: 0.8 });
+  add('vs', [[VX - 168, 1640], [VX - 222, 1765], [VX - 202, 1890]], 58, '#a9bde0', '#e9eef6', 9, { dry: 0.6, gl: 1, mx: 0.5 }); // highlight
+  add('vs', [[VX - 90, 1428], [VX - 99, 1480], [VX - 96, 1530]], 26, '#8aa6dc', '#cbd9f2', 8.2, { dry: 0.75, gl: 1, mx: 0.6 });
+  add('vs', [[VX + 252, 1790], [VX + 264, 1860], [VX + 257, 1935]], 22, '#2f4a86', '#4f6b9e', 7, { dry: 0.85, gl: 0.9, mx: 0.6 });  // reflected light
+})();
+// --- bouquet layout
+const FL = [ // [x, y, r, type, depth]
+  [2620, 540, 200, 'peony', 0], [2250, 650, 150, 'poppy', 0], [3060, 560, 165, 'poppy', 0], [3430, 830, 95, 'daisy', 0],
+  [2000, 830, 72, 'yellow', 0], [2860, 330, 72, 'corn', 0], [3330, 400, 62, 'yellow', 0],
+  [3190, 1060, 175, 'peony', 1], [2660, 960, 150, 'poppy', 1], [2180, 1080, 102, 'daisy', 1], [3520, 1180, 66, 'corn', 1], [2420, 1250, 60, 'yellow', 1],
+  [2950, 1270, 128, 'poppy', 2],
+];
+(function stems() {
+  for (const [x, y, r] of FL) {
+    const x0 = VX + clamp((x - VX) * 0.12, -70, 70), y0 = 1370;
+    add('st', [[x0, y0], [lerp(x0, x, 0.45) + rr(-40, 40), lerp(y0, y, 0.5)], [lerp(x0, x, 0.9), lerp(y0, y, 0.9)]], rr(16, 24), jit(mixc('#24401e', '#3f5f27', R()), 0.03), '#5a7a32', 6, { dry: 0.3, gl: 0.6, mx: 0.4 });
+  }
+  const LV = [[2380, 1180, 2.5, 300], [2530, 1330, 2.9, 260], [2880, 1380, 0.4, 280], [3080, 1300, 0.2, 330], [3340, 1300, 0.55, 300], [2120, 900, 3.4, 260],
+    [3450, 980, 0.0, 280], [2430, 830, 2.2, 240], [2860, 780, 1.1, 230], [3280, 700, 0.3, 250], [2050, 1240, 2.7, 280], [2780, 1180, 1.3, 220], [3600, 1330, 0.5, 220], [2240, 430, 3.9, 230]];
+  for (const [x, y, a, l] of LV) {
+    const c = Math.cos(a), s = Math.sin(a), ben = rr(-0.3, 0.3);
+    const tip = [x + c * l, y + s * l + l * 0.18];
+    const mid = [x + c * l * 0.5 - s * l * 0.12 * ben, y + s * l * 0.5 + c * l * 0.12 * ben];
+    const lit = clamp(0.5 - c * 0.3 - s * 0.3);
+    add('lv', [[x, y], mid, tip], rr(76, 100), jit(mixc('#25401f', '#5d7a36', lit), 0.04), jit(mixc('#3e5e28', '#93a452', lit), 0.04), 7.5 + rr(0, 1.5), { dry: 0.55, gl: 0.8, mx: 0.6, wf: (u) => Math.pow(Math.sin(Math.PI * clamp(u * 0.9 + 0.1)), 0.65) });
+  }
+})();
+(function flowers() {
+  const order = FL.map((f, i) => [f, i]).sort((a, b) => a[0][4] - b[0][4] || a[0][1] - b[0][1]);
+  const LA = Math.atan2(-0.62, -0.78); // painted light from the upper left
+  for (const [[x, y, r, ty]] of order) {
+    const lit = (a) => 0.5 + 0.5 * Math.cos(a - LA);
+    const petal = (a, r0, r1, ww, A, B, th, o = {}) => {
+      const p0 = [x + Math.cos(a) * r * r0, y + Math.sin(a) * r * r0], p1 = [x + Math.cos(a + 0.12) * r * (r0 + r1) / 2, y + Math.sin(a + 0.12) * r * (r0 + r1) / 2], p2 = [x + Math.cos(a) * r * r1, y + Math.sin(a) * r * r1];
+      add('fl', [p0, p1, p2], r * ww, A, B, th, Object.assign({ k: 2, dry: 0.4, gl: 0.85, mx: 0.6 }, o));
+    };
+    if (ty === 'poppy') {
+      const a0 = rr(0, 6.28);
+      for (let k = 0; k < 5; k++) { const a = a0 + k * 1.2566 + rr(-0.15, 0.15), L = lit(a); petal(a, 0.1, 0.8, 0.9, jit(mixc('#9a1d16', '#e04a2a', L), 0.03), jit(mixc('#c8341f', '#f4804e', L), 0.03), 9 + rr(0, 2)); }
+      for (let k = 0; k < 4; k++) { const a = a0 + 0.6 + k * 1.57 + rr(-0.2, 0.2), L = lit(a); petal(a, 0.15, 0.6, 0.5, jit(mixc('#c22c1c', '#ff7a46', L), 0.03), jit(mixc('#e85a30', '#ffb080', L), 0.03), 7, { dry: 0.6 }); }
+      add('fl', [[x - r * 0.08, y - r * 0.02], [x + r * 0.08, y + r * 0.03]], r * 0.36, '#231511', '#3a2a1e', 9, { k: 2, dry: 0.2, gl: 0.7, mx: 0.3 });
+      add('fl', [[x - r * 0.03, y], [x + r * 0.03, y + 0.01]], r * 0.17, '#8a9a6a', '#c8d09a', 8, { k: 2, gl: 0.85, mx: 0.5 });
+      add('hi', [[x - r * 0.58, y - r * 0.32], [x - r * 0.36, y - r * 0.52]], r * 0.24, '#ff9e70', '#ffe2c8', 8, { k: 2, dry: 0.55, gl: 1, mx: 0.5 });
+    } else if (ty === 'peony') {
+      for (let ring = 0; ring < 3; ring++) {
+        const n = [9, 7, 5][ring], rin = [0.45, 0.25, 0.06][ring], rout = [1.0, 0.72, 0.4][ring], ww = [0.55, 0.46, 0.34][ring];
+        const a0 = rr(0, 6.28);
+        for (let k = 0; k < n; k++) {
+          const a = a0 + k * 6.283 / n + rr(-0.15, 0.15), L = clamp(lit(a) * 0.75 + 0.12 * ring + rr(-0.05, 0.05));
+          petal(a, rin, rout, ww, jit(mixc('#a88c86', '#f6ead8', L), 0.02), jit(mixc('#e2b8a8', '#fff8ec', L), 0.02), 7.5 + ring * 1.5, { dry: 0.45 });
+        }
+      }
+      add('fl', [[x - r * 0.08, y], [x + r * 0.08, y + r * 0.04]], r * 0.22, '#e9c69c', '#f6e2bf', 10, { k: 2, gl: 0.9 });
+      add('hi', [[x - r * 0.38, y - r * 0.44], [x - r * 0.14, y - r * 0.54]], r * 0.22, '#fff6ea', '#ffffff', 8, { k: 2, gl: 1, mx: 0.3 });
+    } else if (ty === 'daisy') {
+      const a0 = rr(0, 6.28);
+      for (let k = 0; k < 13; k++) { const a = a0 + k * 0.4833 + rr(-0.08, 0.08), L = lit(a); petal(a, 0.25, 0.95, 0.24, jit(mixc('#a9a4a8', '#f8f4ec', L), 0.02), '#ffffff', 6.5, { dry: 0.35, mx: 0.4 }); }
+      add('fl', [[x - r * 0.06, y], [x + r * 0.06, y]], r * 0.44, '#d29218', '#f6d040', 9, { k: 2, gl: 0.85, mx: 0.5 });
+    } else if (ty === 'yellow') {
+      const a0 = rr(0, 6.28);
+      for (let k = 0; k < 5; k++) { const a = a0 + k * 1.2566, L = lit(a); petal(a, 0.15, 0.78, 0.8, jit(mixc('#c88a14', '#ffd640', L), 0.03), '#fff08a', 7, { mx: 0.5 }); }
+      add('fl', [[x - r * 0.05, y], [x + r * 0.05, y]], r * 0.36, '#b8520e', '#e88a20', 8.5, { k: 2, gl: 0.85 });
+    } else if (ty === 'corn') {
+      const a0 = rr(0, 6.28);
+      for (let k = 0; k < 9; k++) { const a = a0 + k * 0.698 + rr(-0.1, 0.1), L = lit(a); petal(a, 0.2, 1.0, 0.38, jit(mixc('#1f3484', '#5a80de', L), 0.03), '#9ab4f4', 6.5, { dry: 0.55, mx: 0.5 }); }
+      add('fl', [[x - r * 0.04, y], [x + r * 0.04, y]], r * 0.3, '#161a40', '#3a3a70', 7, { k: 2 });
+    }
+  }
+  // a fallen poppy and a loose petal on the table
+  const fx = 1980, fy = 2160, fr = 120;
+  add('fl', [[fx + 70, fy + 40], [fx + 260, fy + 80], [fx + 380, fy + 60]], 22, '#3a5a26', '#5a7a32', 5, { gl: 0.6 });
+  for (let k = 0; k < 5; k++) { const a = -0.4 + k * 1.2, L = 0.5 + 0.5 * Math.cos(a + 2.2); add('fl', [[fx + Math.cos(a) * fr * 0.1, fy + Math.sin(a) * fr * 0.06], [fx + Math.cos(a) * fr * 0.7, fy + Math.sin(a) * fr * 0.42]], fr * 0.74, jit(mixc('#9a1d16', '#e04a2a', L), 0.03), jit(mixc('#c8341f', '#f4804e', L), 0.03), 8, { k: 2, gl: 0.85, mx: 0.55 }); }
+  add('fl', [[fx - 10, fy], [fx + 10, fy]], fr * 0.3, '#231511', '#3a2a1e', 8, { k: 2 });
+  add('fl', [[2300, 2235], [2380, 2252]], 84, '#c0301c', '#f07040', 7, { k: 2, gl: 0.85 });
+  add('hi', [[1300, 2300], [1700, 2299]], 16, '#fff0c8', '#ffffff', 5, { gl: 1 });
+})();
+// --- the ending: the palette knife comes back and lays one thick cream highlight down the vase's lit side (7.5–8.0)
+const K2_PTS = [1610, 1665, 1725, 1790, 1855, 1925].map((y) => [VX - vr(y) * 0.64 - 6, y]);
+add('k2', K2_PTS, 100, '#9fb5df', '#f5f1e6', 13.5, { k: 1, dry: 0.72, gl: 1, mx: 0.9, cap: 0.9, wf: (u) => 1.15 - 0.85 * Math.pow(u, 1.1) });
+// --- schedule: groups land on the beat (120 BPM), each a quick burst of strokes (a painting timelapse)
+const WIN = { k1: [0.25, 1.0, 0.75], bg0: [1.0, 1.46, 0.16], bg1a: [1.5, 1.72, 0.12], bg1b: [1.75, 1.97, 0.12], bg2: [2.0, 2.2, 0.1], tb0: [2.25, 2.42, 0.14], tb1: [2.3, 2.47, 0.1],
+  vs: [2.5, 2.98, 0.14], st: [3.0, 3.2, 0.1], lv: [3.12, 3.48, 0.1], fl: [3.5, 4.1, 0.08], hi: [4.02, 4.2, 0.06], k2: [7.5, 8.0, 0.5], pk: [7.99, 8.07, 0.08] };
+{ const b1 = SPEC.filter((s) => s.g === 'bg1'); b1.forEach((s, i) => (s.g = i < b1.length / 2 ? 'bg1a' : 'bg1b')); }
+const ST = new SG.Strokes();
+(function schedule() {
+  const by = {};
+  SPEC.forEach((s) => (by[s.g] = by[s.g] || []).push(s));
+  for (const g of Object.keys(WIN)) {
+    const [a, b, d] = WIN[g], L = by[g] || [];
+    L.forEach((s, i) => {
+      const t0 = L.length === 1 ? a : a + (b - a - d) * (i / (L.length - 1));
+      ST.add(s.pts, { w: s.w, colA: hex(s.A), colB: hex(s.B), thick: s.th, kind: s.k, t0, t1: t0 + d, seed: (ST.list.length * 3.71 + 0.37) % 97, p1: s.dry, p2: s.gl, p3: s.mx, cap: s.cap ?? 1, wf: s.wf, pad: s.k === 1 ? 0.12 : 0.15 });
+    });
+  }
+})();
+const ease = (x) => 1 - Math.pow(1 - clamp(x), 1.6);   // same reveal curve as the stroke shader
+
+// ================= GL setup =================
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('EXT_float_blend');
+const NOISE = SG.GLSL_NOISE;
+const HD = `#version 300 es
+precision highp float;`;
+
+/// --- stroke pass, run twice over the same strips:
+//   PASS 0 -> albedo (rgb, coverage), ordinary "over" blending
+//   PASS 1 -> (height*a, coverage, gloss*a, a*K) blended ONE / ONE_MINUS_SRC_ALPHA: new paint is added on top while
+//             the paint underneath is partly flattened (K) -> mounds build up, nothing is ever dug into.
+const pStroke = SG.prog(gl, SG.VS_STROKE, HD + `
+in vec4 v0; flat in vec4 v1; flat in vec4 v2; flat in vec4 v3; flat in vec4 v4;
+uniform float T, PASS;
+out vec4 o;
+${NOISE}
+void main(){
+  float s = v0.z, v = v0.w, L = v1.x, w = v1.y, t0 = v1.z, t1 = v1.w;
+  if (T < t0) discard;
+  float pr = clamp((T - t0)/max(t1 - t0, 1e-3), 0., 1.); pr = 1. - pow(1. - pr, 1.6);
+  float kind = v3.w, seed = v4.x, dry = v4.y, gls = v4.z, mixA = v4.w;
+  bool knife = kind > .5 && kind < 1.5, dab = kind > 1.5;
+  float hw = w*.5, head = L*pr;
+  float u01 = clamp(s/max(L, 1.), 0., 1.);
+  // bristle streaks: anisotropic noise stretched along the stroke (irregular, never a regular comb)
+  float nb = max(3., w/4.2), acr = v*nb*.5;
+  float sN = vn(vec2(acr*.6 + seed*3., s*.0045))*.5 + vn(vec2(acr*1.5 + seed, s*.012))*.32 + vn(vec2(acr*3.7 + seed*.7, s*.035))*.18;
+  float ds = s < 0. ? -s : (s > head ? s - head : 0.);
+  float ck = knife ? 2.5 : 2.;
+  float en = (.06*(vn(vec2(s*.011, seed)) - .5) + .03*(vn(vec2(s*.045, seed*3.1)) - .5))*(knife ? 1.8 : 1.);
+  float r = pow(pow(ds/hw, ck) + pow(abs(v)/(1. + en), ck), 1./ck);
+  float load = 1. - dry*smoothstep(.2, 1., u01);
+  // the tail splits into bristle tracks
+  float fine = vn(vec2(acr*4.2 + seed*1.9, s*.02))*.6 + vn(vec2(acr*9. + seed, s*.05))*.4;
+  float tail = knife ? 0. : smoothstep(.7, 1., u01)*(1. - (sN*.4 + fine*.6))*1.1;
+  float aa = fwidth(r)*1.2 + .004;
+  float inside = 1. - smoothstep(1. - aa - .015, 1. + aa, r + tail*.45);
+  float cov = smoothstep(-.05, .05, load*1.05 - .1 - (1. - (sN*.5 + fine*.5))*.9*(1. - load*.78));
+  if (knife) {
+    float kn = vn(vec2(v*2.4 + seed, s*.018))*.7 + vn(vec2(v*7. + seed, s*.05))*.3;
+    cov = smoothstep(-.04, .04, load*1.2 - .16 - .8*kn*(1. - load*.55));
+  }
+  float a = inside*cov;
+  if (a < .003) discard;
+  // colour: two paints on the brush, never fully mixed
+  float m = knife ? smoothstep(.52, .8, vn(vec2(v*7.5 + seed, s*.0009)) + .3*(vn(vec2(v*16. + seed, s*.003)) - .5))
+                  : smoothstep(.3, .7, vn(vec2(acr*.22 + seed*5., s*.0028)) + .25*(sN - .5));
+  vec3 alb = mix(v2.rgb, v3.rgb, clamp(m*mixA*1.7 - mixA*.25, 0., 1.));
+  alb *= knife ? (.97 + .06*sN) : (.9 + .2*sN);
+  if (PASS < .5) { o = vec4(clamp(alb, 0., 1.), a); return; }
+  // height profile: rounded mound, bristle-ridged top, paint pushed into ridges at the edges, blob where the brush landed
+  float dome = pow(clamp(1. - r*r, 0., 1.), .6);
+  float prof;
+  if (knife) {
+    prof = smoothstep(1., .9, r)*(1. + .05*(sN - .5)) + .55*exp(-pow((abs(v) - .9)/.06, 2.))*smoothstep(1.02, .9, r)
+         + .6*exp(-pow((s - head)/(.06*w + 3.), 2.))*smoothstep(1., .7, abs(v));
+  } else {
+    prof = dome*(.74 + .5*(sN - .5) + .12*(fine - .5)) + .17*exp(-pow((r - .8)/.13, 2.));
+    prof += (dab ? .2 : .45)*exp(-pow(max(s, 0.)/(.9*hw), 1.5))*dome;
+    if (dab) prof *= 1.15 - .35*u01;
+    prof *= mix(1., .5, smoothstep(.6, 1., u01));
+  }
+  float hgt = v2.w*prof*(.6 + .4*load);
+  float K = knife ? 1. : (dab ? .85 : (v2.w < 2. ? .45 : .9));     // thick paint hides what is under it; only the thin ground lets it show
+  o = vec4(hgt*a, a, gls*a, a*K);
+}`);
+// --- text paint pass (title + signature from glyph masks): mound from the blurred mask, streaks along the strokes
+const pText = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; uniform sampler2D TXT; uniform float T, PASS; uniform vec2 PS;
+out vec4 o;
+${NOISE}
+void main(){
+  vec2 px = vec2(uv.x, 1. - uv.y)*PS;           // painting px (y down)
+  vec4 m = texture(TXT, uv);
+  float mask = m.r, bl = m.g, ramp = m.b;
+  if (mask < .02 && bl < .05) discard;
+  float tr = 6.7 + ramp*2.;
+  float rv = smoothstep(tr - .01, tr + .07, T);
+  if (rv <= 0.) discard;
+  bool sig = px.y > 2280.;
+  vec2 e = 1./vec2(textureSize(TXT, 0));
+  vec2 g = vec2(texture(TXT, uv + vec2(e.x, 0.)).g - texture(TXT, uv - vec2(e.x, 0.)).g, texture(TXT, uv + vec2(0., e.y)).g - texture(TXT, uv - vec2(0., e.y)).g);
+  vec2 gn = length(g) > .004 ? normalize(g) : vec2(0., 1.);
+  float acr = dot(px, gn), alo = dot(px, vec2(-gn.y, gn.x));
+  float sN = vn(vec2(acr*.22, alo*.02))*.55 + vn(vec2(acr*.6, alo*.05))*.3 + vn(vec2(acr*1.4, alo*.12))*.15;
+  float cov = smoothstep(.34, .6, mask + .22*(vn(px*.03) - .5) + .1*(sN - .5));
+  float a = cov*rv;
+  if (a < .003) discard;
+  float st = smoothstep(.3, .7, vn(vec2(acr*.08, alo*.006)));
+  vec3 alb = sig ? mix(vec3(.66, .13, .07), vec3(.84, .28, .13), st) : mix(vec3(.9, .83, .66), vec3(.98, .95, .87), st);
+  if (!sig) alb = mix(alb, vec3(.83, .64, .36), smoothstep(.62, .9, vn(px*.005 + 3.))*.4);
+  alb *= .92 + .14*sN;
+  if (PASS < .5) { o = vec4(alb, a); return; }
+  float dome = smoothstep(.05, .75, bl);
+  float hgt = (sig ? 3.5 : 11.)*(dome*(.7 + .6*(sN - .5)) + .25*smoothstep(.2, .5, mask)*(1. - smoothstep(.4, .8, bl)));
+  o = vec4(hgt*a, a, .95*a, a*.6);
+}`);
+// --- normal pass: total height (paint over linen weave) + gradient, gloss
+const pNorm = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; uniform sampler2D HG; uniform vec2 PS; out vec4 o;
+${NOISE}
+float weave(vec2 p){
+  vec2 q = p/4.4;
+  vec2 c = floor(q);
+  float tx = 1. - pow(abs(fract(q.x) - .5)*2., 2.), ty = 1. - pow(abs(fract(q.y) - .5)*2., 2.);
+  float sx = .85 + .3*vn(vec2(c.x*3.1, q.y*.05)), sy = .85 + .3*vn(vec2(q.x*.05, c.y*2.7));
+  float warp = tx*sx*(.62 + .38*sin(3.14159*q.y + 3.14159*c.x));
+  float weft = ty*sy*(.62 + .38*sin(3.14159*q.x + 3.14159*c.y + 3.14159));
+  return max(warp, weft)*1.1 + .25*fbm3(p*.02);
+}
+float Ht(vec2 p){
+  vec2 q = p/PS, e = 1.1/PS;
+  vec4 h = texture(HG, q)*.25 + (texture(HG, q + vec2(e.x, 0.)) + texture(HG, q - vec2(e.x, 0.)) + texture(HG, q + vec2(0., e.y)) + texture(HG, q - vec2(0., e.y)))*.125
+         + (texture(HG, q + e) + texture(HG, q - e) + texture(HG, q + vec2(e.x, -e.y)) + texture(HG, q - vec2(e.x, -e.y)))*.0625;
+  return h.r + weave(vec2(p.x, PS.y - p.y))*(1. - smoothstep(.25, .85, h.g));
+}
+void main(){
+  vec2 p = uv*PS;
+  float h0 = Ht(p);
+  float gx = (Ht(p + vec2(1,0)) - Ht(p - vec2(1,0)))*.5;
+  float gy = (Ht(p + vec2(0,1)) - Ht(p - vec2(0,1)))*.5;
+  vec4 hg = texture(HG, uv);
+  float gl = mix(.16, hg.b/max(hg.g, 1e-3), clamp(hg.g, 0., 1.));
+  o = vec4(gx, gy, h0, gl);
+}`);
+// --- shading: perspective ray march of the height field + palette knife
+const pShade = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o;
+uniform sampler2D NRM, ALB;
+uniform vec2 PS, res, jit;
+uniform vec3 ro, cf, cr, cu; uniform float tanF;
+uniform float hs, top;
+uniform vec3 Ld, Lc, Ac;
+uniform float kOn; uniform vec3 kC, kA, kB, kN, kH0, kH1, kH2; uniform vec2 kSz; uniform vec3 kPa, kPb;
+${NOISE}
+const float DEP = 150., WZ = -5200.;
+vec2 pUV(vec2 X){ return vec2(X.x/PS.x, 1. + X.y/PS.y); }
+float Hs(vec2 X, float lod){ return textureLod(NRM, pUV(X), lod).z*hs; }
+float bladeW(float a){ float x = clamp(a/kSz.x*.5 + .5, 0., 1.); return kSz.y*pow(x, .45)*pow(1. - x, .75)/.452; }
+float bladeSD(vec2 ab){ return abs(ab.y) - bladeW(ab.x) + max(abs(ab.x) - kSz.x, 0.)*4.; }
+float capT(vec3 ro, vec3 rd, vec3 pa, vec3 pb, float r){
+  vec3 ba = pb - pa, oa = ro - pa;
+  float baba = dot(ba,ba), bard = dot(ba,rd), baoa = dot(ba,oa), rdoa = dot(rd,oa), oaoa = dot(oa,oa);
+  float a = baba - bard*bard, b = baba*rdoa - baoa*bard, c = baba*oaoa - baoa*baoa - r*r*baba;
+  float h = b*b - a*c;
+  if (h >= 0.) { float t = (-b - sqrt(h))/a; float y = baoa + t*bard;
+    if (y > 0. && y < baba) return t;
+    vec3 oc = (y <= 0.) ? oa : ro - pb; b = dot(rd, oc); c = dot(oc, oc) - r*r; h = b*b - c;
+    if (h > 0.) return -b - sqrt(h); }
+  return -1.;
+}
+vec3 capN(vec3 p, vec3 a, vec3 b, float r){ vec3 ba = b - a; float h = clamp(dot(p - a, ba)/dot(ba, ba), 0., 1.); return normalize(p - a - ba*h); }
+// distance between a ray (p + L t, t>0) and a segment, for soft capsule shadows
+float raySegD(vec3 p, vec3 L, vec3 a, vec3 b, out float tt){
+  vec3 u = L, v = b - a, w0 = p - a;
+  float A = dot(u,u), B = dot(u,v), Cc = dot(v,v), D = dot(u,w0), Ee = dot(v,w0);
+  float den = A*Cc - B*B;
+  float sc = den > 1e-6 ? (B*Ee - Cc*D)/den : 0., tc = den > 1e-6 ? (A*Ee - B*D)/den : Ee/Cc;
+  tc = clamp(tc, 0., 1.); sc = max((B*tc - D)/A, 0.);
+  tt = sc;
+  return length(w0 + u*sc - v*tc);
+}
+float knifeSh(vec3 p){
+  if (kOn < .5) return 1.;
+  float sh = 1.;
+  float dn = dot(Ld, kN);
+  if (abs(dn) > 1e-4) {
+    float t = dot(kC - p, kN)/dn;
+    if (t > 0. && t < 600.) { vec3 q = p + Ld*t - kC; float sd = bladeSD(vec2(dot(q, kA), dot(q, kB))); sh = min(sh, smoothstep(-1. - .02*t, 1. + .03*t, sd)); }
+  }
+  float tt;
+  float d1 = raySegD(p, Ld, kH0, kH1, tt); sh = min(sh, smoothstep(7., 9. + .05*tt, d1));
+  float d2 = raySegD(p, Ld, kH1, kH2, tt); sh = min(sh, smoothstep(34., 37. + .05*tt, d2));
+  return sh;
+}
+vec3 env(vec3 R){
+  float sb = smoothstep(.86, .985, dot(R, Ld));
+  float fill = smoothstep(.6, .95, dot(R, normalize(vec3(.7, .2, .7))));
+  return Ac*(.25 + .3*clamp(R.z, 0., 1.)) + Lc*1.7*sb + vec3(.5,.6,.75)*.12*fill;
+}
+float shadowHF(vec3 p){
+  float res = 1., s = 1.2;
+  for (int i = 0; i < 70; i++){
+    vec3 q = p + Ld*s;
+    if (q.z > top) break;
+    if (q.x < 0. || q.y > 0. || q.x > PS.x || q.y < -PS.y) break;
+    float d = q.z - Hs(q.xy, .6);
+    res = min(res, 9.*d/s);
+    if (res < -.05) return 0.;
+    s += clamp(d*.5, .5, 40.);
+  }
+  return smoothstep(0., 1., clamp(res, 0., 1.));
+}
+float aoHF(vec2 X, float h0){
+  float occ = 0.;
+  for (int i = 0; i < 8; i++){
+    float a = float(i)*.785 + .39; vec2 d = vec2(cos(a), sin(a));
+    occ += clamp((Hs(X + d*4., 1.) - h0)/(4.*hs), 0., 1.)*.5;
+    occ += clamp((Hs(X + d*14., 2.) - h0)/(14.*hs), 0., 1.)*.8;
+  }
+  return clamp(1. - occ/8.*1.2, 0., 1.);
+}
+float march(vec3 ro, vec3 rd, float ta, float tb, float pixA){
+  float t = ta, tl = ta, rxy = length(rd.xy);
+  for (int i = 0; i < 700; i++){
+    if (t > tb) return -1.;
+    vec3 p = ro + rd*t;
+    float lod = clamp(log2(max(t*pixA, 1.)), 0., 5.);
+    float d = p.z - Hs(p.xy, lod);
+    if (d < 0.) {
+      float a = tl, b = t;
+      for (int k = 0; k < 8; k++){ float m = (a + b)*.5; vec3 q = ro + rd*m; if (q.z - Hs(q.xy, lod) < 0.) b = m; else a = m; }
+      return b;
+    }
+    tl = t;
+    t += max(d/(abs(rd.z) + 1.4*hs*rxy), max(.3, t*pixA*.5));
+  }
+  return -1.;
+}
+vec3 shadePaint(vec3 p, vec3 rd, float t, float pixA){
+  float lod = clamp(log2(max(t*pixA/max(abs(rd.z), .2), 1.)), 0., 6.);
+  vec2 q = pUV(p.xy);
+  vec4 nr = textureLod(NRM, q, lod);
+  vec3 n = normalize(vec3(-nr.x*hs, -nr.y*hs, 1.));
+  vec4 al = textureLod(ALB, q, lod);
+  vec3 alb = al.rgb + vec3(.86, .84, .79)*(1. - al.a);
+  alb = pow(clamp(alb, 0., 1.), vec3(2.2));
+  float gls = nr.w;
+  float sh = shadowHF(p + vec3(0., 0., .3)) * knifeSh(p);
+  float ao = aoHF(p.xy, p.z);
+  vec3 V = -rd, Hh = normalize(Ld + V);
+  float ndl = max(dot(n, Ld), 0.), ndv = max(dot(n, V), 1e-3), ndh = max(dot(n, Hh), 0.);
+  float rough = mix(.6, .11, gls*gls), a2 = rough*rough*rough*rough;                 // wet oil: the glossy ridges get a tight sharp highlight
+  float D = a2/(3.14159*pow(ndh*ndh*(a2 - 1.) + 1., 2.));
+  float kk = rough*rough*.5, G = ndl/(ndl*(1. - kk) + kk)*ndv/(ndv*(1. - kk) + kk);
+  float F = .04 + .96*pow(1. - max(dot(Hh, V), 0.), 5.);
+  float fall = 1.12 - .28*(p.x/PS.x) + .08*(p.y/PS.y + .5);
+  vec3 dif = alb*(Lc*fall*ndl*sh + Ac*(.42 + .58*n.z)*ao);
+  vec3 spec = Lc*fall*D*G*F/(4.*ndv*max(ndl, 1e-3) + 1e-3)*ndl*sh;
+  vec3 R = reflect(rd, n);
+  float Fe = .04 + .96*pow(1. - ndv, 5.);
+  vec3 envs = env(R)*Fe*mix(.2, 1., gls)*ao;
+  return dif + spec*mix(.3, 1.9, gls*gls) + envs*.75;
+}
+vec3 wallCol(vec3 p){
+  // dark studio wall behind the easel, with the canvas shadow on it
+  vec3 c = vec3(.085, .072, .06);
+  float g = .6 + .4*fbm3(p.xy*.0015);
+  vec3 q = p + Ld*((-p.z)/Ld.z);   // project to canvas plane along the light
+  float sh = 1. - (1. - smoothstep(0., 140., min(min(q.x, PS.x - q.x), min(-q.y, PS.y + q.y))))*step(0., q.x)*step(q.x, PS.x)*step(q.y, 0.)*step(-PS.y, q.y)*.85;
+  float fall = exp(-pow(length((p.xy - vec2(PS.x*.1, -PS.y*.3))/vec2(7000., 5000.)), 2.));
+  return c*g*(.3 + 1.1*fall*sh) + Lc*.006*fall*sh;
+}
+vec3 sideCol(vec3 p, vec3 n){
+  vec2 w = abs(n.x) > .5 ? vec2(p.y, p.z) : vec2(p.x, p.z);
+  float wv = .5 + .5*sin(w.x*1.4)*sin(w.y*1.4);
+  vec3 alb = pow(vec3(.66, .58, .45)*(.85 + .15*wv), vec3(2.2));
+  float ndl = max(dot(n, Ld), 0.);
+  return alb*(Lc*ndl*.9 + Ac*.5);
+}
+vec3 shadeKnife(vec3 p, vec3 rd, vec3 n, float part){
+  vec3 R = reflect(rd, n);
+  float ndv = max(dot(n, -rd), 0.);
+  if (part < 1.5) {   // steel (blade, neck, ferrule)
+    vec3 F0 = vec3(.62, .63, .65);
+    vec3 F = F0 + (1. - F0)*pow(1. - ndv, 5.);
+    vec3 c = (Ac*(.2 + .35*clamp(R.z, 0., 1.)) + Lc*.55*smoothstep(.8, .98, dot(R, Ld)) + vec3(.05, .045, .04)*smoothstep(.2, -.5, R.z))*F;
+    float aniso = .9 + .2*vn(vec2(dot(p - kC, kA)*.4, dot(p - kC, kB)*.02));
+    c *= aniso;
+    float ndl = max(dot(n, Ld), 0.);
+    c += vec3(.02)*ndl;
+    return c;
+  }
+  // varnished walnut handle
+  vec3 hd = normalize(kH2 - kH1);
+  float along = dot(p - kH1, hd);
+  float grain = .5 + .5*sin(along*.022 + 6.*fbm3(vec2(along*.003, atan(n.y, n.x)*2.)));
+  vec3 alb = pow(mix(vec3(.24, .12, .05), vec3(.42, .22, .1), grain), vec3(2.2));
+  if (along < 110.) alb = vec3(.5);   // ferrule
+  float ndl = max(dot(n, Ld), 0.);
+  vec3 c = alb*(Lc*ndl + Ac*.5);
+  float F = .04 + .96*pow(1. - ndv, 5.);
+  c += env(R)*F*.9;
+  return c;
+}
+void main(){
+  vec2 fc = gl_FragCoord.xy + jit;
+  vec2 sp = (fc - res*.5)/(res.y*.5);
+  vec3 rd = normalize(cf + cr*sp.x*tanF + cu*sp.y*tanF);
+  float pixA = 2.*tanF/res.y;
+  float tBest = 1e9; vec3 col = vec3(0.); float hitK = 0.;
+  // palette knife
+  vec3 kn = vec3(0.); float kpart = 0.;
+  if (kOn > .5) {
+    float dn = dot(rd, kN);
+    if (abs(dn) > 1e-5) {
+      float t = dot(kC - ro, kN)/dn;
+      if (t > 0.) { vec3 q = ro + rd*t - kC; vec2 ab = vec2(dot(q, kA), dot(q, kB)); float sd = bladeSD(ab);
+        if (sd < 0.) { tBest = t; kn = kN*sign(-dn); kpart = 1.; } }
+    }
+    float t1 = capT(ro, rd, kH0, kH1, 7.); if (t1 > 0. && t1 < tBest) { tBest = t1; kn = capN(ro + rd*t1, kH0, kH1, 7.); kpart = 1.; }
+    float t2 = capT(ro, rd, kH1, kH2, 36.); if (t2 > 0. && t2 < tBest) { tBest = t2; kn = capN(ro + rd*t2, kH1, kH2, 36.); kpart = 2.; }
+  }
+  // canvas block
+  vec3 bmin = vec3(0., -PS.y, -DEP), bmax = vec3(PS.x, 0., top);
+  vec3 iv = 1./rd, ta = (bmin - ro)*iv, tb = (bmax - ro)*iv;
+  vec3 tmn = min(ta, tb), tmx = max(ta, tb);
+  float tn = max(max(tmn.x, tmn.y), tmn.z), tf = min(min(tmx.x, tmx.y), tmx.z);
+  float tC = 1e9; vec3 cc = vec3(0.);
+  if (tn < tf && tf > 0.) {
+    float t0 = max(tn, 0.);
+    vec3 pe = ro + rd*t0;
+    if (pe.z > -.5) {
+      float th = march(ro, rd, t0, tf, pixA);
+      if (th > 0.) { tC = th; }
+    } else {
+      tC = t0;
+    }
+  }
+  float depth;
+  if (tBest < tC && kpart > 0.) {
+    vec3 p = ro + rd*tBest;
+    col = shadeKnife(p, rd, kn, kpart);
+    // paint smeared on the lower face of the blade
+    if (kpart < 1.5 && abs(dot(p - kC, kN)) < 2.) {
+      vec3 q = p - kC; vec2 ab = vec2(dot(q, kA), dot(q, kB));
+      float pm = (1. - smoothstep(-.75, -.35, ab.y/kSz.y + .3*(vn(ab*.03) - .5))) * step(bladeSD(ab), -1.5);
+      vec3 pc = mix(kPa, kPb, smoothstep(.62, .8, vn(vec2(ab.x*.03, ab.y*.08)))*.8);
+      vec3 pal = pow(pc, vec3(2.2));
+      float ndl = max(dot(kn, Ld), 0.);
+      col = mix(col, pal*(Lc*ndl + Ac*.5) + env(reflect(rd, kn))*.05, pm*.85);
+      float edge = smoothstep(-3., -.5, bladeSD(ab));
+      col += Lc*.35*edge*(1. - pm);
+    }
+    depth = tBest;
+  } else if (tC < 1e8) {
+    vec3 p = ro + rd*tC;
+    if (p.z > -.5) col = shadePaint(p, rd, tC, pixA);
+    else {
+      vec3 n = vec3(0.);
+      if (abs(p.x) < 2.) n = vec3(-1, 0, 0); else if (abs(p.x - PS.x) < 2.) n = vec3(1, 0, 0); else if (abs(p.y) < 2.) n = vec3(0, 1, 0); else n = vec3(0, -1, 0);
+      col = sideCol(p, n);
+    }
+    depth = tC;
+  } else {
+    float t = (WZ - ro.z)/rd.z;
+    vec3 p = ro + rd*max(t, 0.);
+    col = t > 0. ? wallCol(p) : vec3(.02);
+    depth = t > 0. ? t : 1e5;
+  }
+  col = clamp(col, 0., 40.);                       // grazing glints can overflow half floats -> Inf -> NaN blooms
+  if (!(col.r == col.r && col.g == col.g && col.b == col.b)) col = vec3(.2);
+  o = vec4(col, depth);
+}`);
+// --- depth of field (gather)
+const pDof = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float aper, maxC;
+float focus;
+float coc(float z){ return clamp(abs(1. - focus/max(z, 1.))*aper, 0., maxC); }
+void main(){
+  focus = 0.; for (int i = 0; i < 9; i++){ vec2 q = vec2(.5, .5) + vec2(float(i % 3) - 1., float(i/3) - 1.)*vec2(.06, .05); focus += min(texture(S, q).a, 1e4); } focus /= 9.;
+  vec4 c0 = texture(S, uv); float cc = coc(c0.a);
+  vec3 acc = c0.rgb; float wsum = 1.;
+  for (int i = 0; i < 56; i++){
+    float fi = float(i) + .5; float r = sqrt(fi/56.)*maxC; float a = fi*2.39996;
+    vec4 sm = texture(S, uv + vec2(cos(a), sin(a))*r/res);
+    float sc = coc(sm.a); if (sm.a > c0.a) sc = min(sc, cc*1.5 + .5);
+    float wg = clamp(sc - r + 1., 0., 1.);
+    acc += sm.rgb*wg; wsum += wg;
+  }
+  o = vec4(acc/wsum, c0.a);
+}`);
+const pBright = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 px; uniform float th;
+void main(){ vec3 c = vec3(0.); for (int i=-1;i<=1;i++) for (int j=-1;j<=1;j++) c += clamp(texture(S, uv + vec2(i,j)*px).rgb, 0., 40.); c /= 9.;
+  float l = max(c.r, max(c.g, c.b)); o = vec4(c*smoothstep(th, th*2.5, l), 1.); }`);
+const pBlur = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 dir;
+void main(){ vec3 c = texture(S, uv).rgb*.227;
+  c += texture(S, uv + dir*1.385).rgb*.316; c += texture(S, uv - dir*1.385).rgb*.316;
+  c += texture(S, uv + dir*3.231).rgb*.07; c += texture(S, uv - dir*3.231).rgb*.07; o = vec4(c, 1.); }`);
+const pComp = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S, B1, B2; uniform vec2 res; uniform float expo, bloom, vig, grain, seed, ca;
+${NOISE}
+vec3 aces(vec3 x){ return clamp((x*(2.51*x + .03))/(x*(2.43*x + .59) + .14), 0., 1.); }
+void main(){
+  vec2 d = uv - .5;
+  vec3 c = vec3(texture(S, uv - d*ca).r, texture(S, uv).g, texture(S, uv + d*ca).b);
+  c += (texture(B1, uv).rgb*.5 + texture(B2, uv).rgb*.8)*bloom;
+  c *= expo;
+  c = aces(c);
+  c = pow(c, vec3(1./2.2));
+  float l = dot(c, vec3(.299, .587, .114));
+  c += vec3(.018, .006, -.016)*smoothstep(.4, .95, l) + vec3(-.01, .0, .012)*(1. - smoothstep(.0, .35, l));
+  c = mix(vec3(l), c, 1.05);
+  c *= 1. - vig*smoothstep(.25, 1.1, length(d*vec2(1.35, 1.)));
+  c += (hash12(uv*res + seed*91.7) - .5)*grain + (hash12(floor(uv*res*.5) + seed*13.1) - .5)*grain*.5;
+  o = vec4(clamp(c, 0., 1.), 1.);
+}`);
+
+// targets
+const tALB = SG.tex(gl, PW, PH, { ifmt: gl.RGBA8, mips: true, aniso: 8 });
+const tHG = SG.tex(gl, PW, PH, { ifmt: gl.RGBA16F, fmt: gl.RGBA, type: gl.HALF_FLOAT });
+const tNRM = SG.tex(gl, PW, PH, { ifmt: gl.RGBA16F, fmt: gl.RGBA, type: gl.HALF_FLOAT, mips: true, aniso: 8 });
+const fAlb = SG.fbo(gl, [tALB]), fHgt = SG.fbo(gl, [tHG]);
+const fNorm = SG.fbo(gl, [tNRM]);
+const tSH = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, fmt: gl.RGBA, type: gl.HALF_FLOAT }), fSH = SG.fbo(gl, [tSH]);
+const tDF = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, fmt: gl.RGBA, type: gl.HALF_FLOAT }), fDF = SG.fbo(gl, [tDF]);
+const bw = W >> 2, bh = H >> 2;
+const tB1 = SG.tex(gl, bw, bh, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fB1 = SG.fbo(gl, [tB1]);
+const tB2 = SG.tex(gl, bw, bh, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fB2 = SG.fbo(gl, [tB2]);
+const tB3 = SG.tex(gl, bw >> 1, bh >> 1, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fB3 = SG.fbo(gl, [tB3]);
+const tB4 = SG.tex(gl, bw >> 1, bh >> 1, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fB4 = SG.fbo(gl, [tB4]);
+const tTXT = SG.tex(gl, PW >> 1, PH >> 1, {});
+const QUAD = SG.quad(gl);
+ST.upload(gl);
+
+// ================= title / signature glyph masks =================
+function buildText() {
+  const w = PW >> 1, h = PH >> 1, s = 0.5;
+  const mk = () => { const c = document.createElement('canvas'); c.width = w; c.height = h; const g = c.getContext('2d', { willReadFrequently: true }); g.fillStyle = '#000'; g.fillRect(0, 0, w, h); g.scale(s, s); return [c, g]; };
+  const [cm, gm] = mk(), [cr, gr] = mk();
+  const items = [];  // [text, font, x, baseline, t0, t1, spacing]
+  const T0 = 6.7, SPAN = 2.0;
+  // title (Chinese): one character per beat-half
+  const tt = [...C.title];
+  tt.forEach((ch, i) => items.push([ch, `900 300px ${SERIF}`, 360 + i * 335, 1330, 7.2 + i * 0.23, 7.2 + i * 0.23 + 0.34]));
+  // english line
+  items.push([C.en, `700 118px ${SERIF}`, 372, 1545, 8.02, 8.38, 22]);
+  // signature (low-key, on the dark front edge of the table)
+  items.push([C.sign + ' ' + C.signEn, `700 58px ${SERIF}`, 3330, 2468, 6.78, 7.12, 6]);
+  for (const [txt, font, x, y, a, b, sp] of items) {
+    gm.font = font; gr.font = font;
+    gm.fillStyle = '#fff';
+    const chars = sp ? [...txt] : [txt];
+    let cx = x;
+    const widths = chars.map((c) => gm.measureText(c).width + (sp || 0));
+    const total = widths.reduce((p, q) => p + q, 0) - (sp || 0);
+    const asc = parseFloat(font.split(' ')[1]);
+    const grad = gr.createLinearGradient(x, y - asc, x + total, y + asc * 0.15 + (sp ? total * 0.05 : asc * 0.8));
+    const va = (a - T0) / SPAN, vb = (b - T0) / SPAN;
+    grad.addColorStop(0, `rgb(0,0,${Math.round(va * 255)})`); grad.addColorStop(1, `rgb(0,0,${Math.round(vb * 255)})`);
+    gr.fillStyle = grad; gr.strokeStyle = grad; gr.lineWidth = 10;
+    chars.forEach((c, i) => { gm.fillText(c, cx, y); gr.fillText(c, cx, y); gr.strokeText(c, cx, y); cx += widths[i]; });
+  }
+  // blurred copy (G) for the groove direction / lip
+  const cb = document.createElement('canvas'); cb.width = w; cb.height = h; const gb = cb.getContext('2d', { willReadFrequently: true });
+  gb.fillStyle = '#000'; gb.fillRect(0, 0, w, h); gb.filter = 'blur(5px)'; gb.drawImage(cm, 0, 0);
+  const M = gm.getImageData(0, 0, w, h).data, B = gb.getImageData(0, 0, w, h).data, RR = gr.getImageData(0, 0, w, h).data;
+  const out = new ImageData(w, h); const O = out.data;
+  for (let i = 0; i < O.length; i += 4) { O[i] = M[i]; O[i + 1] = B[i]; O[i + 2] = RR[i + 2]; O[i + 3] = 255; }
+  const co = document.createElement('canvas'); co.width = w; co.height = h; co.getContext('2d').putImageData(out, 0, 0);
+  gl.bindTexture(gl.TEXTURE_2D, tTXT.tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, co);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+}
+
+// ================= camera =================
+const V3 = { add: (a, b) => a.map((x, i) => x + b[i]), sub: (a, b) => a.map((x, i) => x - b[i]), mul: (a, k) => a.map((x) => x * k), dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2],
+  cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]], norm: (a) => { const l = Math.hypot(...a) || 1; return a.map((x) => x / l); }, lerp: (a, b, k) => a.map((x, i) => lerp(x, b[i], k)) };
+const orb = (ta, d, dir) => V3.add(ta, V3.mul(V3.norm(dir), d));
+// keys: [t, ro, ta, tanF, focusOffset, aperture]
+const CX = PW / 2, CY = -PH / 2;
+// camera: [t, ro, ta, tanF, aperture]; segment eases chosen so velocity is continuous where it matters
+// one continuous camera curve: Hermite through the keys with velocity carried through every key
+// (x, y: Catmull–Rom tangents · height z and lens: monotone tangents, so the camera never dips into the paint)
+const KEYS = [
+  [0.0, orb([1750, -1080, 0], 5100, [0.17, -0.21, 1]), [1750, -1080, 0], 0.3, 0],
+  [3.8, orb([2560, -1010, 0], 3780, [0.05, -0.11, 1]), [2560, -1010, 0], 0.3, 0],
+  [4.0, orb([2575, -1005, 0], 3880, [0.045, -0.105, 1]), [2575, -1005, 0], 0.3, 0],        // a breath back before the dive
+  [4.72, [2080, -1650, 240], [2370, -1130, 0], 0.3, 2.0],
+  [6.15, [2880, -1620, 225], [3130, -1110, 0], 0.3, 2.0],
+  [7.15, orb([2560, -1220, 0], 4100, [0.0, -0.0001, 1]), [2560, -1220, 0], 0.3, 0],
+  [8.0, orb([4096 - 40 - 3920 / 2, -1250, 0], 3920 / 1.06667, [0.0, -0.0001, 1]), [4096 - 40 - 3920 / 2, -1250, 0], 0.3, 0],
+  [8.6, orb([4096 - 40 - 3720 / 2, -1250, 0], 3720 / 1.06667, [0.0, -0.0001, 1]), [4096 - 40 - 3720 / 2, -1250, 0], 0.3, 0],
+];
+const CAMV = KEYS.map((k) => [k[0], [...k[1], ...k[2], k[3], k[4]]]);
+const MODE = ['cr', 'cr', 'mono', 'cr', 'cr', 'mono', 'mono', 'mono'];
+const TAN = CAMV.map(([t, v], i) => v.map((x, d) => {
+  if (i === 0 || i === CAMV.length - 1) return 0;
+  const [t0, v0] = CAMV[i - 1], [t1, v1] = CAMV[i + 1];
+  const a = (x - v0[d]) / (t - t0), b = (v1[d] - x) / (t1 - t);
+  if (MODE[d] === 'cr') return (v1[d] - v0[d]) / (t1 - t0);
+  if (a * b <= 0) return 0;
+  const m = (a * (t1 - t) + b * (t - t0)) / (t1 - t0);
+  return Math.sign(m) * Math.min(Math.abs(m), 3 * Math.min(Math.abs(a), Math.abs(b)));
+}));
+function camAt(t) {
+  let i = 0; while (i < CAMV.length - 2 && t > CAMV[i + 1][0]) i++;
+  const [ta_, va] = CAMV[i], [tb_, vb] = CAMV[i + 1], h = tb_ - ta_, u = clamp((t - ta_) / h);
+  const u2 = u * u, u3 = u2 * u, h00 = 2 * u3 - 3 * u2 + 1, h10 = u3 - 2 * u2 + u, h01 = -2 * u3 + 3 * u2, h11 = u3 - u2;
+  const v = va.map((x, d) => h00 * x + h10 * h * TAN[i][d] + h01 * vb[d] + h11 * h * TAN[i + 1][d]);
+  return { ro: v.slice(0, 3), ta: v.slice(3, 6), tanF: v[6], ap: v[7] };
+}
+const hsAt = (t) => 1 + 1.9 * E.inOutCubic(inv(4.35, 5.0, t)) - 1.75 * E.inOutCubic(inv(6.2, 7.05, t));
+
+// ================= palette knife pose =================
+const KS = SG.crSample(KNIFE_PTS, 4); const KCL = [0]; for (let i = 1; i < KS.length; i++) KCL.push(KCL[i - 1] + Math.hypot(KS[i][0] - KS[i - 1][0], KS[i][1] - KS[i - 1][1]));
+const KL = KCL[KCL.length - 1];
+function pathAt(s) { let i = 1; while (i < KCL.length - 1 && KCL[i] < s) i++; const k = clamp((s - KCL[i - 1]) / (KCL[i] - KCL[i - 1] || 1)); const p = [lerp(KS[i - 1][0], KS[i][0], k), lerp(KS[i - 1][1], KS[i][1], k)]; const d = V3.norm([KS[i][0] - KS[i - 1][0], -(KS[i][1] - KS[i - 1][1]), 0]); return { p, d }; }
+// two passes of the same knife: the opening ribbon, and the final highlight (comes in from the right, handle to the right)
+const mkPath = (P) => { const S = SG.crSample(P, 4), L = [0]; for (let i = 1; i < S.length; i++) L.push(L[i - 1] + Math.hypot(S[i][0] - S[i - 1][0], S[i][1] - S[i - 1][1])); return { S, L, len: L[L.length - 1] }; };
+const KPASS = [
+  { path: mkPath(KNIFE_PTS), t0: 0.25, t1: 1.0, tin: 0.0, tout: 1.38, hl: 205, hw: 74, side: 1, come: [0, 0], go: [1000, -1600], z0: 10.5, pa: '#1d4351', pb: '#ebe7dc' },
+  { path: mkPath(K2_PTS), t0: 7.5, t1: 8.0, tin: 7.2, tout: 8.32, hl: 50, hw: 20, side: -1, come: [1500, 500], go: [1400, 700], z0: 13.5, pa: '#f1e7cf', pb: '#ffffff' },
+];
+function passPathAt(P, s) { const KS = P.S, KCL = P.L; let i = 1; while (i < KCL.length - 1 && KCL[i] < s) i++; const k = clamp((s - KCL[i - 1]) / (KCL[i] - KCL[i - 1] || 1)); const p = [lerp(KS[i - 1][0], KS[i][0], k), lerp(KS[i - 1][1], KS[i][1], k)]; const d = V3.norm([KS[i][0] - KS[i - 1][0], -(KS[i][1] - KS[i - 1][1]), 0]); return { p, d }; }
+function knifeAt(t) {
+  const K = KPASS.find((k) => t >= k.tin && t <= k.tout);
+  if (!K) return null;
+  const pr = ease(inv(K.t0, K.t1, t));
+  const { p, d } = passPathAt(K.path, K.path.len * pr);
+  const hl = K.hl, hw = K.hw;
+  const lift = 1 - E.outCubic(inv(K.tin, K.t0, t)) + E.inCubic(inv(K.t1, K.tout, t)) * 9;
+  const tilt = 0.17 + 0.25 * (1 - inv(K.tin, K.tin + 0.3, t));
+  const A = V3.mul(V3.norm([-d[1], d[0], 0]), K.side);    // long axis (blade tip), handle on the other side
+  const B = V3.norm(V3.add(V3.mul(d, Math.cos(tilt)), [0, 0, Math.sin(tilt)]));
+  const N = V3.norm(V3.cross(B, A));
+  const away = E.inCubic(inv(K.t1, K.tout, t)) * 2, come = 1 - E.outCubic(inv(K.tin, K.t0, t));
+  const head = [p[0] - d[0] * 20 + K.go[0] * away * 0.5 + K.come[0] * come, -p[1] - d[1] * 20 + K.go[1] * away * 0.5 + K.come[1] * come, K.z0 + lift * 160];
+  const Cc = V3.add(head, V3.mul(B, hw));
+  const H0 = V3.sub(Cc, V3.mul(A, hl * 0.98));
+  const H1 = V3.add(V3.add(H0, V3.mul(A, -150)), [0, 0, 150]);
+  const H2 = V3.add(H1, V3.mul(V3.norm(V3.add(V3.add(V3.mul(A, -0.55), [0, 0, 0.75]), V3.mul(d, -0.25))), 820));
+  return { C: Cc, A, B, N, H0, H1, H2, sz: [hl, hw], pa: K.pa, pb: K.pb };
+}
+
+// ================= render =================
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {},
+  cues: [
+    { t: 0.25, sfx: 'knife', gain: 0.9 },
+    { t: 1.0, sfx: 'brush', gain: 0.55 }, { t: 1.25, sfx: 'brush', gain: 0.35 }, { t: 1.5, sfx: 'brush', gain: 0.45 }, { t: 1.75, sfx: 'brush', gain: 0.35 },
+    { t: 2.0, sfx: 'brush', gain: 0.45 }, { t: 2.25, sfx: 'brush', gain: 0.45 }, { t: 2.5, sfx: 'brush', gain: 0.5 }, { t: 3.0, sfx: 'brush', gain: 0.45 },
+    { t: 3.5, sfx: 'dabs', gain: 0.6 },
+    { t: 4.0, sfx: 'whoosh', gain: 0.35 }, { t: 4.4, sfx: 'rise', gain: 0.55 },
+    { t: 6.15, sfx: 'whoosh', gain: 0.25 },
+    { t: 7.5, sfx: 'knife', gain: 0.75 }, { t: 8.0, sfx: 'chime', gain: 0.4 },
+  ],
+  render(t) {
+    const jit = Reel.jit || (Reel.Q.get('jit') ? Reel.Q.get('jit').split(',').map(Number) : [0, 0]);
+    gl.disable(gl.DEPTH_TEST);
+    // 1. paint strokes into colour / height maps
+    gl.enable(gl.BLEND);
+    for (const pass of [0, 1]) {
+      SG.bind(gl, pass ? fHgt : fAlb);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      if (pass) gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ZERO, gl.ONE);
+      else gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      pStroke.use().f('T', t).f('PASS', pass).f('PS', PW, PH).f('VIEW', 0, 0, 1);
+      ST.draw();
+    }
+    gl.disable(gl.BLEND);
+    // 2. height + gradient (and mips for distant views)
+    SG.bind(gl, fNorm);
+    pNorm.use().t('HG', tHG).f('PS', PW, PH); QUAD.draw();
+    gl.bindTexture(gl.TEXTURE_2D, tNRM.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    gl.bindTexture(gl.TEXTURE_2D, tALB.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    // 3. shade
+    const cam = camAt(t);
+    const fwd = V3.norm(V3.sub(cam.ta, cam.ro));
+    const low = clamp((fwd[2] + 0.8) / 0.55);
+    const upH = V3.norm(V3.add(V3.mul([0, 1, 0], 1 - low), V3.mul([0, 0, 1], low)));
+    const right = V3.norm(V3.cross(fwd, upH)), up = V3.cross(right, fwd);
+    const hs = hsAt(t);
+    const kn = knifeAt(t);
+    SG.bind(gl, fSH);
+    const Ld = V3.norm([-0.84, 0.32, 0.43]);
+    const Pp = pShade.use().t('NRM', tNRM).t('ALB', tALB).f('PS', PW, PH).f('res', W, H).f('jit', jit[0], -jit[1])
+      .v('ro', cam.ro).v('cf', fwd).v('cr', right).v('cu', up).f('tanF', cam.tanF).f('hs', hs).f('top', HMAX * hs)
+      .v('Ld', Ld).f('Lc', 2.75, 2.3, 1.74).f('Ac', 0.15, 0.18, 0.23).f('kOn', kn ? 1 : 0);
+    if (kn) Pp.v('kC', kn.C).v('kA', kn.A).v('kB', kn.B).v('kN', kn.N).v('kH0', kn.H0).v('kH1', kn.H1).v('kH2', kn.H2).f('kSz', kn.sz[0], kn.sz[1]).v('kPa', hex(kn.pa)).v('kPb', hex(kn.pb));
+    QUAD.draw();
+    // 4. depth of field
+    let src = tSH;
+    if (cam.ap > 0.05) {
+      const focus = Math.hypot(...V3.sub(cam.ta, cam.ro)) * 0.62;
+      SG.bind(gl, fDF);
+      pDof.use().t('S', tSH).f('res', W, H).f('aper', cam.ap * 5 * RS).f('maxC', cam.ap * 5 * RS + 0.01);
+      QUAD.draw(); src = tDF;
+    }
+    // 5. bloom + grade
+    SG.bind(gl, fB1); pBright.use().t('S', src).f('px', 1 / W, 1 / H).f('th', 1.1); QUAD.draw();
+    SG.bind(gl, fB2); pBlur.use().t('S', tB1).f('dir', 1 / bw, 0); QUAD.draw();
+    SG.bind(gl, fB1); pBlur.use().t('S', tB2).f('dir', 0, 1 / bh); QUAD.draw();
+    SG.bind(gl, fB3); pBlur.use().t('S', tB1).f('dir', 2 / (bw >> 1), 0); QUAD.draw();
+    SG.bind(gl, fB4); pBlur.use().t('S', tB3).f('dir', 0, 2 / (bh >> 1)); QUAD.draw();
+    SG.bind(gl, null); gl.viewport(0, 0, W, H);
+    const beat = Math.floor(t * 2);
+    const flick = t > 1 && t < 4.2 ? 1 + (Reel.hash(beat * 3.7) - 0.5) * 0.035 : 1;
+    pComp.use().t('S', src).t('B1', tB1).t('B2', tB4).f('res', W, H).f('expo', 0.92 * flick).f('bloom', 0.22).f('vig', 0.38).f('grain', 0.028)
+      .f('seed', Math.floor(t * 30) % 97).f('ca', 0.0012);
+    QUAD.draw();
+    gl.finish();
+  },
+});
+</script></body></html>

@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>34 孔版套印 · Risograph</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 34 孔版套印 · RISOGRAPH, TWO PASSES =====
+   The exit of a stencil duplicator: through the slot we see the inked drum turning, rubber exit rollers, the ribbed
+   output tray. An A3 sheet slides out; ink appears exactly where the sheet has passed the drum's nip line.
+   Pass 1 = fluorescent pink, pass 2 (new drum) = blue over it. Inks are transparent and multiply (pink+blue = violet),
+   flat areas carry riso grain and white specks, tints are AM screens at their own angles, the blue is misregistered,
+   there is roller banding, faint roller tracks and the sheen of wet ink. When the blue lands, the tiger "appears".
+   Everything is ray-traced analytically; the artwork is drawn into two density maps at setup. */
+const { E, clamp, lerp, inv } = Reel;
+// ★ 改光色改这里：着色器里的 LIGHT_COL（搜 LIGHT_COL）。它乘在室内主光（所有受光面的漫反射和反光高光）上。
+//   vec3(1.) = 原样（和成片一模一样）；偏冷例如 vec3(.85, .95, 1.15)；6.75 秒后窗帘拉开的窗光是另一束光（搜 uWinI）。只想换物体/纸/颜料的颜色是“配色”，不是光，见 SKILL 的对照表。
+const stage = Reel.makeStage('#1a1816');
+Reel.ownJitter = true;
+const C = Reel.cfg({ ed: '№ 01/50', ed2: '№ 02/50' });
+const RS = Reel.RS, OW = Math.round(1920 * RS), OH = Math.round(1080 * RS);
+const PW = 297, PH = 420, MPX = 4;      // paper (mm), map px per mm
+const hsh = Reel.hash;
+
+/* ------------------------------------------------------------------ GL */
+const cv = document.createElement('canvas'); cv.width = OW; cv.height = OH;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true, alpha: false });
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear');
+function shd(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { const e = gl.getShaderInfoLog(s); console.error(e + '\n' + src.split('\n').map((l, i) => (i + 1) + ': ' + l).join('\n')); throw new Error(e); } return s; }
+function prog(vs, fs) { const p = gl.createProgram(); gl.attachShader(p, shd(gl.VERTEX_SHADER, vs)); gl.attachShader(p, shd(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); const L = {}; p.loc = (n) => (n in L ? L[n] : (L[n] = gl.getUniformLocation(p, n))); return p; }
+function U(p, n, v) { const l = p.loc(n); if (l === null) return; if (typeof v === 'number') gl.uniform1f(l, v); else if (v.length === 2) gl.uniform2fv(l, v); else if (v.length === 3) gl.uniform3fv(l, v); else if (v.length === 4) gl.uniform4fv(l, v); }
+function target(w, h) { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0); return { t, f }; }
+const bindTex = (p, n, t, unit) => { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t); const l = p.loc(n); if (l !== null) gl.uniform1i(l, unit); };
+const T_MAIN = target(OW, OH), T_DOF = target(OW, OH);
+let tInk = null;
+const vaoFS = gl.createVertexArray(); gl.bindVertexArray(vaoFS);
+{ const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0); }
+const VSFS = `#version 300 es
+layout(location=0) in vec2 p; out vec2 vUV; void main(){ vUV = p*.5+.5; gl_Position = vec4(p,0.,1.); }`;
+
+const pScene = prog(VSFS, `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o;
+uniform vec3 uCam, uCR, uCU, uCF; uniform float uTanH, uAsp; uniform vec2 uRes, uJn;
+uniform sampler2D uInk;                 // r = pink density, g = blue density (poster space)
+uniform float uZL;                      // leading edge of the sheet (mm, along +z)
+uniform float uP1, uP2;                 // printed length (mm from leading edge) for pink / blue
+uniform float uDrumCol, uDrumA, uT, uWet, uRoll;
+uniform vec3 uL;
+uniform float uCurl;                    // hero: trailing-edge curl (mm)
+uniform float uZL2, uP2b, uWet2, uCurl2; // second print: leading edge, printed blue length, wetness, trailing curl
+uniform vec3 uS2;                       // second print: x offset (mm), rotation (rad), on/off
+uniform float uWinX, uWinI;             // window light: curtain edge position (mm), intensity
+const vec3 LIGHT_COL = vec3(1.);   // light colour, vec3(1.) = as delivered (see the Chinese note at the top of the script)
+const vec3 LW = vec3(-.1176, .7843, .6087);   // direction to the window (normalised (-.15, 1., .776))
+#define PI 3.14159265
+const vec2 PSZ = vec2(${PW}., ${PH}.);
+const float NIP = -112., DR = 92., DCY = 94.;      // drum: radius, centre height, nip z
+float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f); return mix(mix(hash12(i),hash12(i+vec2(1,0)),f.x), mix(hash12(i+vec2(0,1)),hash12(i+vec2(1,1)),f.x), f.y); }
+float fbm(vec2 p){ float a=.5,s=0.; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.03+vec2(1.7,9.2); a*=.5; } return s; }
+vec2 boxT(vec3 ro, vec3 rd, vec3 mn, vec3 mx, out vec3 n){ vec3 iv = 1./rd, t0 = (mn - ro)*iv, t1 = (mx - ro)*iv; vec3 a = min(t0,t1), b = max(t0,t1);
+  float tn = max(max(a.x,a.y),a.z), tf = min(min(b.x,b.y),b.z); n = -sign(rd)*step(a.yzx, a.xyz)*step(a.zxy, a.xyz); return vec2(tn, tf); }
+float cylX(vec3 ro, vec3 rd, vec2 c, float r, vec2 xr, out vec3 n){   // cylinder along x, centre (y,z)=c
+  vec2 o = ro.yz - c, d = rd.yz; float a = dot(d,d), b = dot(o,d), cc = dot(o,o) - r*r, disc = b*b - a*cc; n = vec3(0.);
+  if (disc < 0. || a < 1e-9) return 1e9; float t = (-b - sqrt(disc))/a; float x = ro.x + rd.x*t;
+  if (t > 0. && x > xr.x && x < xr.y) { vec2 q = o + d*t; n = vec3(0., q)/r; return t; } return 1e9; }
+// riso ink at a poster point (mm, origin centre, y up); returns transmission
+vec3 inkAt(vec2 pp, float printedP, float printedB, vec3 mis, vec2 dens, float sd, float wetA, float sheet2, out float wet){
+  wet = 0.;
+  vec2 uv = pp/PSZ + .5; vec3 T = vec3(1.);
+  if (any(lessThan(uv, vec2(0.))) || any(greaterThan(uv, vec2(1.)))) return T;
+  float v = (PSZ.y*.5 + pp.y);                                 // distance from the leading edge (the sheet runs foot first)
+  vec2 fw = fwidth(pp);
+  float aa = max(max(fw.x, fw.y), .03);
+  // pink
+  if (v < printedP) {
+    vec4 tx = texture(uInk, uv); float d = clamp(tx.r + (sheet2 > .5 ? tx.a : tx.b), 0., 1.);
+    float band = .95 + .05*sin(pp.y*.11 + fbm(vec2(pp.y*.02, 3.))*4.) ;     // roller banding
+    float grain = .9 + .1*vnoise(pp*3.1 + sd*13.) + .05*vnoise(pp*.4 + sd*7.);
+    float speck = step(.965, hash12(floor(pp*4.) + sd*31.));
+    float dd = d;
+    if (d < .96) { // AM screen, 15 deg, coarse 1.7 mm cells: the dots of a riso tint are visible at arm's length
+      vec2 q = mat2(.966,-.259,.259,.966)*pp/1.7; vec2 f = fract(q) - .5;
+      float th = (cos(f.x*2.*PI) + cos(f.y*2.*PI))*.25 + .5;
+      float ab = aa/1.7*1.6;
+      dd = smoothstep(th - ab, th + ab, d)*(.92 + .08*grain);
+      dd = mix(dd, d, smoothstep(.75, 1.4, aa));                 // only when a dot is smaller than a pixel does it average out
+    } else { dd = d*grain*(1. - speck*.7); }
+    dd *= band*dens.x;
+    vec3 pink = vec3(1.0, .07, .42);
+    T *= mix(vec3(1.), pink, clamp(dd, 0., 1.));
+    wet = max(wet, dd*(1. - smoothstep(0., 60., printedP - v))*wetA);
+  }
+  // blue, misregistered by ~1.1 mm and a hair of rotation
+  if (v < printedB) {
+    float mc = sqrt(1. - mis.z*mis.z); vec2 pb = mat2(mc,-mis.z,mis.z,mc)*pp + mis.xy;
+    float d = texture(uInk, pb/PSZ + .5).g;
+    float band = .95 + .05*sin(pb.y*.13 + 1.3 + fbm(vec2(pb.y*.02, 7.))*4.);
+    float grain = .9 + .1*vnoise(pb*2.9 + 11. + sd*5.) + .05*vnoise(pb*.37 + 5. + sd*3.);
+    float speck = step(.97, hash12(floor(pb*4.) + 17. + sd*23.));
+    float dd = d;
+    if (d < .96) { vec2 q = mat2(.259,-.966,.966,.259)*pb/1.7; vec2 f = fract(q) - .5;
+      float th = (cos(f.x*2.*PI) + cos(f.y*2.*PI))*.25 + .5; float ab = aa/1.7*1.6; dd = smoothstep(th - ab, th + ab, d)*(.92 + .08*grain); dd = mix(dd, d, smoothstep(.75, 1.4, aa)); }
+    else dd = d*grain*(1. - speck*.7);
+    dd *= band*dens.y;
+    vec3 blue = vec3(.05, .21, .56);
+    T *= mix(vec3(1.), blue, clamp(dd, 0., 1.));
+    wet = max(wet, dd*(1. - smoothstep(0., 60., printedB - v))*wetA);
+  }
+  return T;
+}
+vec3 env(vec3 r){ vec3 c = mix(vec3(.08,.08,.085), vec3(.5,.5,.52), smoothstep(-.2, .9, r.y));
+  c += LIGHT_COL*vec3(1.,.97,.92)*2.2*smoothstep(.93, .985, dot(r, normalize(uL + vec3(0.,.25,0.)))); return c; }
+vec3 lightDiffuse(vec3 n, float sh){ return LIGHT_COL*vec3(1.,.97,.92)*1.15*max(dot(n, uL), 0.)*sh + mix(vec3(.10,.10,.11), vec3(.28,.28,.30), n.y*.5 + .5); }
+float sheetMask(vec3 p){ return step(abs(p.x), PSZ.x*.5)*step(uZL - PSZ.y, p.z)*step(p.z, uZL); }
+float heroCurl(vec3 p){ float u2 = p.z - (uZL - PSZ.y); float ax = abs(p.x)/(PSZ.x*.5); return uCurl*exp(-max(u2, 0.)/26.)*(1. + .6*ax*ax); }
+float paperH(vec3 p){ float u = uZL - p.z; float lift = 3.2*exp(-u/40.)*step(0., u)*(1. - smoothstep(0., 1., (uRoll))); return 1.2 + lift + heroCurl(p) + .5*fbm(p.xz*.012); }
+// the second print (lands on top of the hero): local frame centred on the sheet, rotated by uS2.y
+vec2 s2Local(vec3 p){ vec2 d = p.xz - vec2(uS2.x, uZL2 - PSZ.y*.5); float c = cos(uS2.y), s = sin(uS2.y); return vec2(c*d.x + s*d.y, -s*d.x + c*d.y); }
+float sheetMask2(vec3 p){ vec2 q = s2Local(p); return step(abs(q.x), PSZ.x*.5)*step(abs(q.y), PSZ.y*.5); }
+uniform float uFloat2;                  // second print: air film under it while it slides (mm)
+float paperH2(vec3 p){ vec2 q = s2Local(p); float u2 = q.y + PSZ.y*.5, ul = PSZ.y*.5 - q.y;
+  return 1.45 + uFloat2*(.4 + .6*exp(-ul/60.)) + uCurl2*exp(-max(u2, 0.)/22.) + .5*fbm(p.xz*.012); }
+// warm window light: the window's panes projected along LW, a curtain being drawn open (lit where x < uWinX)
+vec3 winLight(vec3 P, vec3 n){
+  if (uWinI <= 0.) return vec3(0.);
+  vec2 g = P.xz - LW.xz*(P.y/LW.y);
+  float m = smoothstep(-470., -430., g.x)*smoothstep(330., 290., g.x)*smoothstep(-300., -250., g.y)*smoothstep(780., 730., g.y);
+  vec2 w = mat2(.978, .208, -.208, .978)*(g - vec2(0., 90.));
+  float mull = 1. - .62*(1. - smoothstep(4., 11., abs(w.y)))                        // transom
+             - .62*(1. - smoothstep(4., 11., abs(w.x - 215.)))                       // mullions (beside the sheet)
+             - .62*(1. - smoothstep(4., 11., abs(w.x + 250.)));
+  float edge = uWinX + 16.*sin(g.y*.029 + 1.3) + 7.*sin(g.y*.083 + .4);              // the curtain's folds
+  float cur = smoothstep(edge + 26., edge - 26., g.x);
+  // the paper guides shade a thin strip beside them
+  float gs = 1.;
+  for (int k=0;k<2;k++){ float x0 = (k==0 ? -153. : 159.); float reach = (34. - P.y)*(-LW.x)/LW.y; float dx = P.x - x0;
+    gs *= 1. - (1. - smoothstep(reach - 1.5, reach + 1.5, dx))*step(0., dx)*smoothstep(0., 10., P.z); }
+  return vec3(1., .74, .48)*2.2*uWinI*m*max(mull, 0.)*cur*gs*max(dot(n, LW), 0.);
+}
+void main(){
+  vec2 ndc = gl_FragCoord.xy/uRes*2. - 1. - uJn;
+  vec3 rd = normalize(uCF + uCR*ndc.x*uTanH*uAsp + uCU*ndc.y*uTanH), ro = uCam;
+  float tB = 1e9; int mat = 0; vec3 N = vec3(0.,1.,0.); vec3 n;
+  // table (y = -24), tray top (y = 0) with ribs, machine front (z = 0) with a slot, side guides, drum, rollers, paper
+  float tt = (-24. - ro.y)/rd.y; if (tt > 0.) { tB = tt; mat = 1; }
+  vec2 b = boxT(ro, rd, vec3(-250., -24., 0.), vec3(250., 0., 640.), n); if (b.x < b.y && b.x > 0. && b.x < tB) { tB = b.x; mat = 2; N = n; }
+  // machine body, with the slot cut out
+  b = boxT(ro, rd, vec3(-320., -24., -420.), vec3(320., 240., 0.), n);
+  if (b.x < b.y && b.x > 0. && b.x < tB) { vec3 p = ro + rd*b.x;
+    bool slot = n.z > .5 && abs(p.x) < 190. && p.y > 2. && p.y < 62.;
+    if (!slot) { tB = b.x; mat = 3; N = n; } else { tB = b.x + 190.; mat = 8; } }
+  for (int k=0;k<2;k++){ float sx = k==0 ? -1. : 1.; b = boxT(ro, rd, vec3(sx*156. - 3., 0., 30.), vec3(sx*156. + 3., 34., 560.), n); if (b.x < b.y && b.x > 0. && b.x < tB) { tB = b.x; mat = 4; N = n; } }
+  float tc = cylX(ro, rd, vec2(DCY, NIP), DR, vec2(-170., 170.), n); if (tc < tB) { tB = tc; mat = 5; N = n; }
+  for (int k=0;k<4;k++){ float x0 = -150. + float(k)*80.; tc = cylX(ro, rd, vec2(8., -10.), 7., vec2(x0 - 22., x0 + 22.), n); if (tc < tB) { tB = tc; mat = 6; N = n; } }
+  // the sheet: a thin plane over the tray (and inside the machine, under the drum)
+  float tp = (1.2 - ro.y)/rd.y;
+  if (tp > 0. && tp < tB) { vec3 p = ro + rd*tp; if (sheetMask(p) > .5) { tp = (paperH(p) - ro.y)/rd.y; p = ro + rd*tp; if (sheetMask(p) > .5 && tp < tB) { tB = tp; mat = 7; } } }
+  if (uS2.z > .5) { float t2 = (1.5 - ro.y)/rd.y;
+    if (t2 > 0. && t2 < tB + 2.) { vec3 p = ro + rd*t2; if (sheetMask2(p) > .5) { t2 = (paperH2(p) - ro.y)/rd.y; p = ro + rd*t2; if (sheetMask2(p) > .5 && t2 < tB) { tB = t2; mat = 9; } } } }
+  vec3 P = ro + rd*tB; vec3 V = -rd; vec3 col;
+  // inside the machine (behind the slot) it is dark
+  float inside = smoothstep(0., -60., P.z);
+  if (mat == 0) col = vec3(.02);
+  else if (mat == 8) col = vec3(.012,.011,.01)*(1. + 2.*smoothstep(-200., -40., P.z));
+  else if (mat == 1) { vec2 q = P.xz; float g = fbm(vec2(q.x*.004, q.y*.05)); vec3 alb = mix(vec3(.10,.06,.035), vec3(.20,.13,.07), g); col = alb*(lightDiffuse(vec3(0.,1.,0.), 1.)*.8 + winLight(P, vec3(0.,1.,0.))); }
+  else if (mat == 2) {
+    vec3 alb = vec3(.56,.55,.52);
+    vec3 nn = N; if (N.y > .5) { float rib = sin(P.x*.42); nn = normalize(vec3(-cos(P.x*.42)*.18*step(abs(P.x), 150.), 1., 0.)); alb *= .97 + .03*rib; }
+    float sh = 1.;
+    // contact shadow of the sheet and of the guides
+    if (N.y > .5) { float dx = abs(P.x) - PSZ.x*.5; float inZ = smoothstep(-4., 4., P.z - (uZL - PSZ.y))*smoothstep(4., -4., P.z - uZL);
+      sh *= 1. - .45*inZ*(1. - smoothstep(0., 9., dx))*step(-.5, dx);
+      sh *= 1. - .35*(1. - smoothstep(0., 22., 153. - abs(P.x)))*step(abs(P.x), 153.);
+      sh *= mix(1., .55, smoothstep(40., 0., P.z));
+      // under the curled trailing edge of the hero
+      float zt = uZL - PSZ.y; sh *= 1. - .35*clamp(uCurl/4., 0., 1.)*smoothstep(-14., 0., P.z - zt)*step(abs(P.x), PSZ.x*.5 + 2.)*step(P.z, zt);
+      if (uS2.z > .5) { vec2 q = s2Local(P); vec2 dq = abs(q) - PSZ*.5; float od = length(max(dq, 0.));
+        sh *= 1. - .42*(1. - smoothstep(0., 8., od))*step(-.5, max(dq.x, dq.y)); } }
+    col = alb*(lightDiffuse(nn, sh) + winLight(P, nn)*sh) + env(reflect(rd, nn))*.035;
+  }
+  else if (mat == 3) { vec3 alb = vec3(.22,.215,.205)*(.92 + .08*vnoise(P.xy*.8)); col = alb*lightDiffuse(N, 1.)*.9 + env(reflect(rd, N))*.03;
+    // slot lip, a status LED, a vent grille
+    if (N.z > .5) { float lip = smoothstep(5., 0., abs(P.y - 64.))*step(abs(P.x), 192.); col *= 1. - .4*lip;
+      vec2 led = P.xy - vec2(250., 150.); col += vec3(.2,1.,.3)*1.5*exp(-dot(led,led)/8.) + vec3(.1,.5,.15)*.15*exp(-dot(led,led)/200.);
+      if (P.y > 120. && P.y < 190. && abs(P.x + 170.) < 70.) col *= .75 + .25*step(.5, fract(P.y/6.)); } }
+  else if (mat == 4) { col = vec3(.6,.6,.58)*(lightDiffuse(N, 1.) + winLight(P, N)) + env(reflect(rd, N))*.04; }
+  else if (mat == 5) {
+    // the inked drum: mesh master, wet ink, the design mirrored on it, turning
+    float ang = atan(P.y - DCY, P.z - NIP);
+    float u = ang*DR + uDrumA;                                   // mm along the circumference
+    vec2 dp = vec2(-P.x, mod(u, 640.) - 320.);
+    float d = textureLod(uInk, dp/PSZ + .5, 1.)[int(uDrumCol)];
+    vec3 inkC = uDrumCol < .5 ? vec3(.95,.05,.40) : vec3(.04,.18,.56);
+    vec3 master = vec3(.55,.52,.48);                              // the stencil master film over the drum mesh
+    float mesh = .9 + .1*sin(P.x*4.0)*sin(u*4.0);
+    vec3 alb = mix(master*mix(vec3(1.), inkC, .35), inkC*.75, smoothstep(.2, .6, d))*mesh;
+    vec3 rf = reflect(rd, N); float F = .04 + .96*pow(1. - max(dot(N, V), 0.), 5.);
+    float wetI = smoothstep(.2, .6, d);
+    col = alb*lightDiffuse(N, 1.)*.9 + env(rf)*(F*.6 + .03 + wetI*.10);
+    col *= mix(1., .55, smoothstep(10., 80., P.y));               // deeper inside it is darker
+  }
+  else if (mat == 6) { vec3 rf = reflect(rd, N); col = vec3(.02)*lightDiffuse(N, 1.) + env(rf)*.05; col *= .5; }
+  else if (mat == 7) {
+    // the sheet: paper fibre + ink + slight cockle
+    vec2 pp = vec2(P.x, P.z - (uZL - PSZ.y*.5)); pp.y = -pp.y;   // poster coords: +y toward the leading edge
+    float e = .6; float h0 = paperH(P), hx = paperH(P + vec3(e,0.,0.)), hz = paperH(P + vec3(0.,0.,e));
+    vec3 nn = normalize(vec3(-(hx - h0)/e, 1., -(hz - h0)/e));
+    float wet; vec3 T = inkAt(pp, uP1, uP2, vec3(1.1, -.7, .0028), vec2(1.), 0., uWet, 0., wet);
+    vec3 paper = vec3(.90,.875,.82)*(.97 + .03*vnoise(P.xz*.9) + .02*vnoise(P.xz*6.));
+    paper *= 1. - .05*smoothstep(.6, 1., vnoise(vec2(P.x*1.5, P.z*.08)));            // fibre streaks
+    // faint grey tracks of the exit rollers
+    float tr = 0.; for (int k=0;k<4;k++){ float x0 = -150. + float(k)*80.; tr += smoothstep(14., 4., abs(P.x - x0)); }
+    paper *= 1. - .035*tr;
+    vec3 alb = paper*T;
+    float fl = (1. - T.g)*(T.r > .8 ? 1. : 0.);                       // fluorescent pink glows a little
+    float sh = 1. - .3*smoothstep(20., 0., P.z)*step(P.z, 20.);
+    float wsh = 1.;
+    if (uS2.z > .5) { float hgt = .3 + uFloat2; vec3 Ps = P - vec3(-.35, 0., .45)*hgt;            // where the second sheet shades this point
+      vec2 q = s2Local(Ps); vec2 dq = abs(q) - PSZ*.5; float od = max(dq.x, dq.y);
+      float occ = 1. - smoothstep(-.4 - hgt*.6, .4 + hgt*.6, od);
+      sh *= 1. - .55*occ*(1. - .35*clamp(uFloat2/3., 0., 1.)); wsh = 1. - .9*occ;
+      vec2 q0 = s2Local(P); vec2 d0 = abs(q0) - PSZ*.5; sh *= 1. - .3*exp(-max(max(d0.x, d0.y), 0.)/1.2)*step(0., max(d0.x, d0.y)); }
+    vec3 wl = winLight(P, nn)*wsh;
+    col = alb*(lightDiffuse(nn, sh) + wl) + vec3(.22,.0,.07)*fl*(sh + length(wl)*.5);
+    float F = .04 + .96*pow(1. - max(dot(nn, V), 0.), 5.);
+    col += env(reflect(rd, nn))*(F*.25 + wet*.35) + vec3(1.,.8,.6)*wet*.5*pow(max(dot(reflect(rd, nn), LW), 0.), 40.)*length(wl);
+  }
+  else if (mat == 9) {
+    // the second print: the next sheet of the run, on top of the hero, its blue further off
+    vec2 q = s2Local(P); vec2 pp = vec2(q.x, -q.y);
+    float e = .6; float h0 = paperH2(P), hx = paperH2(P + vec3(e,0.,0.)), hz = paperH2(P + vec3(0.,0.,e));
+    vec3 nn = normalize(vec3(-(hx - h0)/e, 1., -(hz - h0)/e));
+    float wet; vec3 T = inkAt(pp, 9999., uP2b, vec3(-2.4, 2.1, -.0055), vec2(.92, 1.04), 1., uWet2, 1., wet);
+    vec3 paper = vec3(.90,.875,.82)*(.97 + .03*vnoise(P.xz*.9 + 40.) + .02*vnoise(P.xz*6. + 9.));
+    paper *= 1. - .05*smoothstep(.6, 1., vnoise(vec2(P.x*1.5 + 7., P.z*.08)));
+    float tr = 0.; for (int k=0;k<4;k++){ float x0 = -150. + float(k)*80.; tr += smoothstep(14., 4., abs(P.x - x0)); }
+    paper *= 1. - .035*tr;
+    vec3 alb = paper*T;
+    float fl = (1. - T.g)*(T.r > .8 ? 1. : 0.);
+    float sh = 1. - .3*smoothstep(20., 0., P.z)*step(P.z, 20.);
+    vec3 wl = winLight(P, nn);
+    col = alb*(lightDiffuse(nn, sh) + wl) + vec3(.22,.0,.07)*fl*(sh + length(wl)*.5);
+    float F = .04 + .96*pow(1. - max(dot(nn, V), 0.), 5.);
+    col += env(reflect(rd, nn))*(F*.25 + wet*.35);
+  }
+  col *= 1. - inside*.85*step(P.z, 0.)*(mat == 7 ? 1. : 0.);
+  if (mat == 7 && P.z < 0.) col *= mix(1., .3, smoothstep(0., -70., P.z));
+  if (any(isnan(col))) col = vec3(0.);
+  o = vec4(col, tB);
+}`);
+const pDof = prog(VSFS, `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uS; uniform vec2 uRes; uniform float uFocus, uAper, uMaxC;
+float coc(float z){ return clamp(uAper*abs(z - uFocus)/max(z, 1e-3), 0., uMaxC); }
+void main(){ vec4 c0 = texture(uS, vUV); float cc = coc(c0.a); vec3 acc = c0.rgb; float w = 1.;
+  for (int i=0;i<64;i++){ float fi = float(i) + .5; float r = sqrt(fi/64.)*uMaxC; float a = fi*2.39996323;
+    vec4 sm = texture(uS, vUV + vec2(cos(a), sin(a))*r/uRes); float sc = coc(sm.a); if (sm.a > c0.a) sc = min(sc, cc*1.5 + .5);
+    float wg = clamp(sc - r + 1., 0., 1.); acc += sm.rgb*wg; w += wg; }
+  o = vec4(acc/w, c0.a); }`);
+const pFinal = prog(VSFS, `#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uS; uniform float uExpo, uFrame, uFade;
+float hash12(vec2 p){ vec3 p3=fract(vec3(p.xyx)*.1031); p3+=dot(p3,p3.yzx+33.33); return fract((p3.x+p3.y)*p3.z); }
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14), 0., 1.); }
+void main(){ vec2 d = vUV - .5; float ca = .001;
+  vec3 c = vec3(texture(uS, vUV - d*ca).r, texture(uS, vUV).g, texture(uS, vUV + d*ca).b);
+  c *= uExpo; c *= 1. - .32*smoothstep(.3, 1.05, length(d*vec2(1.3, 1.)));
+  c = aces(c); c = pow(c, vec3(1./2.2));
+  c = (c - .5)*1.04 + .5; c += vec3(.008,.004,-.006);
+  c += (hash12(gl_FragCoord.xy + uFrame*17.31) - .5)*.024; o = vec4(clamp(c, 0., 1.)*uFade, 1.); }`);
+
+/* ------------------------------------------------------------------ the artwork: two separations */
+function drawArt() {
+  const W = PW * MPX, H = PH * MPX;
+  const mk = () => { const c = document.createElement('canvas'); c.width = W; c.height = H; const g = c.getContext('2d', { willReadFrequently: true }); g.setTransform(MPX, 0, 0, -MPX, PW / 2 * MPX, PH / 2 * MPX); g.lineJoin = 'round'; g.lineCap = 'round'; return [c, g]; };
+  const [cP, P] = mk(), [cB, B] = mk();
+  const ink = (g, d) => { g.fillStyle = `rgba(0,0,0,${d})`; g.strokeStyle = `rgba(0,0,0,${d})`; };
+  const sm = (pts, close = true) => { const p = new Path2D(), n = pts.length; const Q = (i) => pts[close ? (i + n) % n : clamp(i, 0, n - 1)]; p.moveTo(...pts[0]);
+    for (let i = 0; i < (close ? n : n - 1); i++) { const a = Q(i - 1), b = Q(i), c = Q(i + 1), d = Q(i + 2); p.bezierCurveTo(b[0] + (c[0] - a[0]) / 6, b[1] + (c[1] - a[1]) / 6, c[0] - (d[0] - b[0]) / 6, c[1] - (d[1] - b[1]) / 6, c[0], c[1]); }
+    if (close) p.closePath(); return p; };
+  const mirror = (pts) => pts.concat(pts.slice().reverse().map(([x, y]) => [-x, y]));
+  const knock = (g, path) => { g.save(); g.globalCompositeOperation = 'destination-out'; g.fillStyle = '#000'; g.fill(path); g.restore(); };
+  const R = Reel.rng(3434);
+  // --- sun (pink tint) behind the head
+  ink(P, 0.42); P.beginPath(); P.arc(0, 96, 118, 0, 7); P.fill();
+  // --- banana leaves (pink tint) and monstera / palms (blue) around the frame
+  const banana = (x, y, a, L, w) => { P.save(); P.translate(x, y); P.rotate(a); ink(P, 0.62); const p = sm([[0, 0], [L * 0.3, w], [L * 0.75, w * 0.8], [L, 0], [L * 0.7, -w * 0.7], [L * 0.3, -w * 0.9]]); P.fill(p);
+    P.save(); P.globalCompositeOperation = 'destination-out'; P.lineWidth = 1.4; for (let k = 1; k < 9; k++) { const u = k / 9; P.beginPath(); P.moveTo(L * u, 0); P.lineTo(L * u + 14, (k % 2 ? 1 : -1) * w * 0.95); P.stroke(); } P.lineWidth = 1.0; P.beginPath(); P.moveTo(4, 0); P.lineTo(L * 0.95, 0); P.stroke(); P.restore(); P.restore(); };
+  banana(-150, -20, 0.9, 190, 34); banana(150, 10, 2.3, 190, 36); banana(-140, 175, -0.35, 150, 26); banana(140, 190, 3.6, 150, 26);
+  const monstera = (x, y, a, s) => { B.save(); B.translate(x, y); B.rotate(a); B.scale(s, s); ink(B, 1);
+    const leaf = sm([[0, 0], [-34, 18], [-48, 52], [-36, 90], [0, 104], [36, 90], [48, 52], [34, 18]]); B.fill(leaf);
+    B.save(); B.globalCompositeOperation = 'destination-out'; B.lineWidth = 3.2;
+    for (const sd of [-1, 1]) for (let k = 0; k < 5; k++) { const yy = 22 + k * 15; B.beginPath(); B.moveTo(sd * 52, yy + 6); B.quadraticCurveTo(sd * 30, yy + 2, sd * 16, yy + 4 + k); B.stroke();
+      if (k > 0 && k < 4) { B.beginPath(); B.ellipse(sd * 12, yy - 4, 3.6, 2.2, 0.3 * sd, 0, 7); B.fill(); } }
+    B.lineWidth = 1.6; B.beginPath(); B.moveTo(0, 2); B.lineTo(0, 98); B.stroke(); B.restore();
+    B.lineWidth = 3; B.beginPath(); B.moveTo(0, 0); B.lineTo(0, -30); B.stroke(); B.restore(); };
+  monstera(-118, 18, 0.6, 0.95); monstera(122, 48, -0.75, 1.0); monstera(-104, 150, 0.15, 0.7); monstera(116, 168, -0.25, 0.62);
+  const palm = (x, y, a, L) => { B.save(); B.translate(x, y); B.rotate(a); ink(B, 0.55); B.lineWidth = 1.6; B.beginPath(); B.moveTo(0, 0); B.quadraticCurveTo(L * 0.5, 8, L, 0); B.stroke();
+    for (let k = 2; k < 24; k++) { const u = k / 24, px = L * u, py = 8 * Math.sin(Math.PI * u) * 0.9; for (const sd of [-1, 1]) { const ll = 30 * Math.sin(Math.PI * Math.min(1, u * 1.15)) + 6;
+      B.save(); B.translate(px, py); B.rotate(sd * (1.0 - u * 0.4)); B.fill(sm([[0, 0], [ll * 0.5, 2.4], [ll, 0], [ll * 0.5, -1.2]])); B.restore(); } } B.restore(); };
+  palm(-150, 120, 0.35, 150); palm(150, 128, 2.75, 150); palm(-60, 205, -0.6, 110); palm(70, 210, -2.6, 110);
+  // --- the tiger (front view): pink face, paper-white muzzle / brows / ruffs, blue stripes and drawing
+  const headR = [[0, 168], [30, 166], [54, 160], [78, 142], [93, 120], [105, 102], [98, 93], [113, 82], [104, 73], [117, 60], [103, 53], [109, 39], [91, 31], [84, 15], [62, 3], [36, -5], [0, -9]];
+  const head = sm(mirror(headR).slice(0, -1));
+  const ears = (sd) => sm([[sd * 56, 154], [sd * 60, 182], [sd * 80, 192], [sd * 98, 178], [sd * 94, 150]]);
+  ink(P, 1); P.fill(head); P.fill(ears(1)); P.fill(ears(-1));
+  // white areas (knocked out of the pink)
+  const white = [sm([[0, 46], [24, 46], [42, 36], [40, 20], [22, 12], [0, 18], [-22, 12], [-40, 20], [-42, 36], [-24, 46]]), sm([[0, 16], [18, 8], [16, -6], [0, -8], [-16, -6], [-18, 8]])];
+  for (const sd of [-1, 1]) { white.push(sm([[sd * 26, 116], [sd * 38, 120], [sd * 48, 114], [sd * 40, 108], [sd * 28, 109]]));
+    white.push(sm([[sd * 64, 160], [sd * 68, 178], [sd * 80, 184], [sd * 90, 174], [sd * 87, 156]]));
+    white.push(sm([[sd * 72, 70], [sd * 104, 73], [sd * 117, 60], [sd * 103, 53], [sd * 109, 39], [sd * 91, 31], [sd * 80, 44], [sd * 70, 58]])); }
+  for (const w of white) knock(P, w);
+  // shading tint (blue, light) for form
+  ink(B, 0.24); for (const sd of [-1, 1]) { B.fill(sm([[sd * 6, 106], [sd * 20, 98], [sd * 22, 72], [sd * 10, 62], [sd * 4, 80]])); B.fill(sm([[sd * 60, 128], [sd * 86, 116], [sd * 92, 96], [sd * 70, 96], [sd * 58, 110]])); }
+  // stripes
+  ink(B, 1);
+  const stripe = (pts, w0) => { const p = new Path2D(); const L = [], Rr = []; for (let i = 0; i < pts.length; i++) { const a = pts[Math.max(0, i - 1)], b = pts[Math.min(pts.length - 1, i + 1)]; const d = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1; const nx = -(b[1] - a[1]) / d, ny = (b[0] - a[0]) / d; const w = w0 * Math.sin(Math.PI * (i + 0.5) / pts.length) + 0.4; L.push([pts[i][0] + nx * w, pts[i][1] + ny * w]); Rr.push([pts[i][0] - nx * w, pts[i][1] - ny * w]); } B.fill(sm(L.concat(Rr.reverse()))); };
+  stripe([[0, 164], [2, 150], [-1, 138], [1, 126]], 4.5);
+  for (const sd of [-1, 1]) {
+    stripe([[sd * 6, 152], [sd * 16, 156], [sd * 28, 152]], 3.6); stripe([[sd * 8, 140], [sd * 20, 144], [sd * 34, 138]], 3.6); stripe([[sd * 10, 128], [sd * 22, 130], [sd * 30, 126]], 3.0);
+    stripe([[sd * 44, 150], [sd * 52, 140], [sd * 56, 128]], 4.0); stripe([[sd * 60, 146], [sd * 68, 134], [sd * 70, 122]], 3.6);
+    stripe([[sd * 104, 100], [sd * 90, 102], [sd * 76, 98], [sd * 66, 92]], 4.6); stripe([[sd * 108, 82], [sd * 94, 84], [sd * 80, 80], [sd * 70, 76]], 4.6); stripe([[sd * 98, 64], [sd * 86, 66], [sd * 76, 62]], 3.6);
+    stripe([[sd * 46, 70], [sd * 56, 62], [sd * 60, 50]], 3.0);
+    // eye: outline, pink iris (left as pink), blue pupil, tear line
+    B.lineWidth = 2.6; B.stroke(sm([[sd * 20, 92], [sd * 32, 100], [sd * 48, 98], [sd * 50, 92], [sd * 38, 86], [sd * 26, 86]]));
+    B.beginPath(); B.ellipse(sd * 36, 92.5, 3.4, 5.6, 0, 0, 7); B.fill();
+    B.lineWidth = 2.2; B.beginPath(); B.moveTo(sd * 20, 91); B.quadraticCurveTo(sd * 16, 76, sd * 12, 62); B.stroke();
+    // whisker dots
+    for (let r2 = 0; r2 < 3; r2++) for (let k = 0; k < 4; k++) { B.beginPath(); B.arc(sd * (14 + k * 6 + r2 * 2), 38 - r2 * 6 + k * 0.5, 1.15, 0, 7); B.fill(); }
+  }
+  // nose and mouth
+  P.save(); ink(P, 1); P.fill(sm([[0, 46], [12, 56], [10, 62], [0, 64], [-10, 62], [-12, 56]])); P.restore();
+  B.lineWidth = 2.4; B.stroke(sm([[0, 46], [12, 56], [10, 62], [0, 64], [-10, 62], [-12, 56]]));
+  B.beginPath(); B.moveTo(0, 46); B.lineTo(0, 30); B.stroke();
+  B.beginPath(); B.moveTo(0, 30); B.quadraticCurveTo(12, 20, 24, 26); B.moveTo(0, 30); B.quadraticCurveTo(-12, 20, -24, 26); B.stroke();
+  B.lineWidth = 2.6; B.stroke(head);
+  // hibiscus flowers (pink) with blue stamens at the foot of the picture
+  const hib = (x, y, r) => { ink(P, 1); for (let k = 0; k < 5; k++) { const a = k / 5 * 6.283 + 0.3; P.beginPath(); P.ellipse(x + Math.cos(a) * r * 0.55, y + Math.sin(a) * r * 0.55, r * 0.55, r * 0.4, a, 0, 7); P.fill(); }
+    ink(B, 1); B.lineWidth = 1.6; B.beginPath(); B.moveTo(x, y); B.lineTo(x + r * 0.9, y + r * 0.5); B.stroke(); for (let k = 0; k < 5; k++) { B.beginPath(); B.arc(x + r * 0.9 + Math.cos(k) * 2.2, y + r * 0.5 + Math.sin(k * 1.7) * 2.2, 1.2, 0, 7); B.fill(); } };
+  hib(-112, -42, 22); hib(118, -36, 18);
+  // --- the lower third: a big pink sun disc; blue wave bands over its lower half (the overlaps print purple)
+  ink(P, 1); P.beginPath(); P.arc(0, -126, 74, 0, 7); P.fill();
+  ink(B, 1);
+  for (let k = 0; k < 6; k++) { const y0 = -128 - k * 12.6, amp = 2.6 + k * 0.25, ph = k * 1.3, wv = new Path2D();
+    for (let i = 0; i <= 120; i++) { const x = -131 + i * 262 / 120; const y = y0 + amp * Math.sin(x * 0.055 + ph); if (i) wv.lineTo(x, y); else wv.moveTo(x, y); }
+    for (let i = 120; i >= 0; i--) { const x = -131 + i * 262 / 120; wv.lineTo(x, y0 - 5.6 + amp * Math.sin(x * 0.055 + ph + 0.35)); }
+    wv.closePath(); B.fill(wv); }
+  // --- a printable area: stencil duplicators cannot print to the edge (5 mm), with a wider top margin for the target
+  for (const g of [P, B]) { g.save(); g.globalCompositeOperation = 'destination-in'; g.fillStyle = '#000'; g.fillRect(-PW / 2 + 5, -PH / 2 + 5, PW - 10, PH - 19); g.restore(); }
+  // registration target in the top margin, printed by both drums: on every sheet it shows how far that sheet's blue drifted
+  const reg = (g) => { ink(g, 1); g.lineWidth = 0.6; g.beginPath(); g.arc(0, 202.5, 3.2, 0, 7); g.stroke(); g.beginPath(); g.moveTo(-6.5, 202.5); g.lineTo(6.5, 202.5); g.moveTo(0, 196); g.lineTo(0, 209); g.stroke(); };
+  reg(P); reg(B);
+  // the edition number (pink): the hero is № 01, the next sheet № 02
+  const txt = (g, s, x, y, font, d, ls = 0, align = 'center') => { g.save(); g.scale(1, -1); ink(g, d); g.font = font; g.textAlign = align; g.textBaseline = 'middle'; if ('letterSpacing' in g) g.letterSpacing = ls + 'px'; g.fillText(s, x, -y); g.restore(); };
+  const [cN1, N1] = mk(), [cN2, N2] = mk();
+  txt(N1, C.ed, 136, -200, '700 8px "Inter"', 1, 0.5, 'right'); txt(N2, C.ed2, 136, -200, '700 8px "Inter"', 1, 0.5, 'right');
+  const dn1 = N1.getImageData(0, 0, W, H).data, dn2 = N2.getImageData(0, 0, W, H).data;
+  // --- combine into one texture (r = pink, g = blue, b = pink number of sheet 1, a = pink number of sheet 2)
+  const dp = P.getImageData(0, 0, W, H).data, db = B.getImageData(0, 0, W, H).data, out = new Uint8Array(W * H * 4);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { const i = (y * W + x) * 4, j = ((H - 1 - y) * W + x) * 4; out[j] = dp[i + 3]; out[j + 1] = db[i + 3]; out[j + 2] = dn1[i + 3]; out[j + 3] = dn2[i + 3]; }
+  tInk = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tInk); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, out); gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+/* ------------------------------------------------------------------ timeline */
+// pass 1 (pink) lands on 1.5; cut on 2.0 (new drum, a low angle from the left): pass 2 (blue) lands on 3.0; the crane starts
+// on 3.5 and never stops: top view by ~4.85, then a slow push; 5.0 the trailing edge settles; 6.0 the next sheet slides out
+// and lands ON TOP on 6.5; 6.75 -> 8.0 window light; 8.5 -> 10 it holds, still drifting a hair
+const NIPZ = -112, ZEND = 520;
+const sheetZ = (t, t0, t1) => { if (t < t0) return NIPZ; const u = clamp((t - t0) / (t1 - t0)); return lerp(NIPZ, ZEND, 1 - Math.pow(1 - u, 2.2)); };
+const v3 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], norm: (a) => { const l = Math.hypot(...a) || 1; return a.map((x) => x / l); }, cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]], lerp: (a, b, t) => a.map((x, i) => lerp(x, b[i], t)) };
+const CUT = 2.0;
+// shot B (after the cut): one C1 track [eye xyz, target xyz, top-down mix, roll, aperture]
+const CAMB = Track([
+  { t: 2.0, v: [-150, 34, 455, 30, 6, 205, 0, 0, 16] },
+  { t: 3.0, v: [-122, 58, 486, 18, 2, 282, 0, 0, 16] },
+  { t: 3.5, v: [-72, 170, 472, 8, 0, 300, 0.06, 0, 14] },
+  { t: 4.2, v: [-14, 560, 362, 2, 0, 311, 0.65, 0.02, 7] },
+  { t: 4.85, v: [6, 866, 312, 6, 0, 308, 1, 0.028, 5] },
+  { t: 6.5, v: [0, 860, 305, 1, 0, 302, 1, 0.012, 5] },
+  { t: 8.5, v: [-12, 848, 298, -6, 0, 296, 1, -0.008, 5] },
+  { t: 10.0, v: [-16, 844, 296, -8, 0, 294, 1, -0.013, 5] },
+], { easeIn: false, easeOut: false });
+function camAt(t) {
+  const shake = (k) => [Reel.noise1(t * 31 + k) * 0.35, Reel.noise1(t * 27 + k + 5) * 0.3, 0];
+  if (t < CUT) { const u = E.inOutSine(clamp(t / 2.0)) * 0.85 + 0.15 * clamp(t / 2.0); const zf = sheetZ(t, -0.2, 1.5);
+    const e = [lerp(70, 36, u), lerp(46, 74, u), lerp(310, 344, u)].map((x, i) => x + shake(1)[i]);
+    return { e, a: [lerp(-4, 5, u), lerp(26, 6, u), lerp(-70, 70, u)], up: [0, 1, 0], f: [0, 10, clamp(zf - 60, -80, 300)], ap: 16, fov: 34 }; }
+  const k = CAMB(t), m = clamp(k[6]), ro = k[7];
+  const e = [k[0], k[1], k[2]].map((x, i) => x + shake(2)[i] * (1 - m));
+  const a = [k[3], k[4], k[5]];
+  const up = v3.norm(v3.lerp([0, 1, 0], [Math.sin(ro), 0, -Math.cos(ro)], m));
+  // focus: on the sheet as it lands, then on the poster plane from above
+  const zf = sheetZ(t, CUT, 3.0);
+  const f = t < 3.4 ? [0, 2, clamp(zf - 120, 0, 330)] : a;
+  return { e, a, up, f, ap: k[8], fov: 32 + 2 * (1 - m) };
+}
+/* ------------------------------------------------------------------ the ending (after the hook) */
+const Z2 = 507, X2 = 4.0, R2 = 0.009;
+function endState(t) {
+  const st = { curl: 0, zl2: NIPZ - 900, x2: 0, r2: 0, on2: 0, wet2: 1, curl2: 0, float2: 0, winX: -900, winI: 0, open: 0, bump: 0 };
+  if (t >= 2.8) {   // the trailing edge springs up as it leaves the exit rollers and stays curled ...
+    let c = 4.2 * E.outCubic(clamp((t - 2.8) / 0.35));
+    if (t >= 5.0) { const s = t - 5.0; c = 4.2 * (1 - E.inQuad(clamp(s / 0.16))) + 0.45 * Math.sin(Math.PI * clamp((s - 0.16) / 0.14)); }   // ... until it drops on the beat
+    st.curl = c;
+  }
+  if (t >= 5.95) {  // the next sheet: out of the machine fast, gliding over the hero on its air film, down on 6.5
+    const u = clamp((t - 6.0) / 0.5);
+    st.on2 = 1; st.zl2 = lerp(NIPZ, Z2, 1 - Math.pow(1 - u, 2.4));
+    const k = E.inOutSine(clamp((t - 6.2) / 0.3)); st.x2 = X2 * k; st.r2 = R2 * k;
+    st.float2 = t < 6.5 ? 3.0 * (1 - Math.pow(u, 3)) : 0.35 * Math.sin(Math.PI * clamp((t - 6.5) / 0.12));
+    st.wet2 = 1 - clamp((t - 6.5) / 2.5);
+    st.curl2 = 2.8 * (1 - E.inOutSine(clamp((t - 6.5) / 0.25))) * clamp((t - 6.2) / 0.15);
+    st.bump = t > 6.5 ? Math.exp(-(t - 6.5) / 0.08) * Math.sin((t - 6.5) * 60) : 0;
+  }
+  if (t >= 6.7) { const k = E.inOutSine(clamp((t - 6.75) / 1.25)); st.winI = 1; st.winX = lerp(-520, 380, k); st.open = k; }
+  return st;
+}
+/* ------------------------------------------------------------------ frame */
+function frame(tr) {
+  // the cut is decided per output frame: the sub-frames of the 2.00 s frame all belong to shot B, those of 1.97 s all to shot A
+  const fo = Math.round(tr * 30), t = fo >= Math.round(CUT * 30) ? Math.max(tr, CUT) : Math.min(tr, CUT - 1e-4);
+  const cam = camAt(t);
+  const fwd = v3.norm(v3.sub(cam.a, cam.e)); let rt = v3.cross(fwd, cam.up); if (Math.hypot(...rt) < 1e-4) rt = [1, 0, 0]; rt = v3.norm(rt); const up = v3.cross(rt, fwd);
+  const jit = Reel.jit || [0, 0];
+  const pass2 = t >= CUT;
+  const zl = pass2 ? sheetZ(t, CUT, 3.0) : sheetZ(t, -0.2, 1.5);
+  const p1 = pass2 ? 9999 : zl - NIPZ, p2 = pass2 ? zl - NIPZ : -1;
+  const drumA = (pass2 ? (t - CUT) : t) * 700 + (pass2 ? 137 : 0);
+  const E2 = endState(t);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T_MAIN.f); gl.viewport(0, 0, OW, OH);
+  gl.useProgram(pScene);
+  U(pScene, 'uCam', [cam.e[0] + Reel.noise1(t * 0.9) * 0.8, cam.e[1] + Reel.noise1(t * 0.8 + 4) * 0.6 + E2.bump * 1.2, cam.e[2]]); U(pScene, 'uCR', rt); U(pScene, 'uCU', up); U(pScene, 'uCF', fwd);
+  U(pScene, 'uTanH', Math.tan(cam.fov * Math.PI / 360)); U(pScene, 'uAsp', 1920 / 1080); U(pScene, 'uRes', [OW, OH]); U(pScene, 'uJn', [2 * jit[0] / OW, -2 * jit[1] / OH]);
+  U(pScene, 'uZL', zl); U(pScene, 'uP1', p1); U(pScene, 'uP2', p2); U(pScene, 'uDrumCol', pass2 ? 1 : 0); U(pScene, 'uDrumA', drumA); U(pScene, 'uT', t);
+  U(pScene, 'uWet', pass2 ? 1 - clamp((t - 3.0) / 2.5) : 1 - clamp((t - 1.55) / 1.0)); U(pScene, 'uRoll', pass2 ? clamp((t - 2.8) / 0.4) : clamp((t - 1.35) / 0.4));
+  U(pScene, 'uL', v3.norm([-0.35, 1.0, 0.45]));
+  U(pScene, 'uCurl', E2.curl); U(pScene, 'uFloat2', E2.float2); U(pScene, 'uZL2', E2.zl2); U(pScene, 'uP2b', E2.zl2 - NIPZ); U(pScene, 'uWet2', E2.wet2); U(pScene, 'uCurl2', E2.curl2);
+  U(pScene, 'uS2', [E2.x2, E2.r2, E2.on2]); U(pScene, 'uWinX', E2.winX); U(pScene, 'uWinI', E2.winI);
+  bindTex(pScene, 'uInk', tInk, 0);
+  gl.bindVertexArray(vaoFS); gl.drawArrays(gl.TRIANGLES, 0, 3);
+  const focus = Math.hypot(...v3.sub(cam.f, cam.e));
+  gl.bindFramebuffer(gl.FRAMEBUFFER, T_DOF.f); gl.useProgram(pDof); bindTex(pDof, 'uS', T_MAIN.t, 0); U(pDof, 'uRes', [OW, OH]); U(pDof, 'uFocus', focus); U(pDof, 'uAper', cam.ap * RS); U(pDof, 'uMaxC', 20 * RS);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.useProgram(pFinal); bindTex(pFinal, 'uS', T_DOF.t, 0);
+  U(pFinal, 'uExpo', 1.0 - 0.5 * E2.open); U(pFinal, 'uFrame', Math.floor(t * 30)); U(pFinal, 'uFade', 1);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.finish();
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  fonts: ['700 20px "Inter"'],
+  async setup() { drawArt(); },
+  cues: [
+    { t: 0.0, sfx: 'riso_run', gain: 0.7 }, { t: 0.0, sfx: 'paper_out', gain: 0.7 }, { t: 1.5, sfx: 'paper_land', gain: 0.75 },
+    { t: 2.0, sfx: 'drum_swap', gain: 0.9 }, { t: 2.0, sfx: 'riso_run', gain: 0.7 }, { t: 2.0, sfx: 'paper_out', gain: 0.7 }, { t: 3.0, sfx: 'paper_land', gain: 0.85 },
+    { t: 3.5, sfx: 'reveal_rise', gain: 0.7 }, { t: 5.0, sfx: 'paper_settle', gain: 0.6 }, { t: 5.5, sfx: 'riso_run', gain: 0.45 }, { t: 6.0, sfx: 'paper_out', gain: 0.6 },
+    { t: 6.5, sfx: 'paper_land', gain: 0.8 }, { t: 6.5, sfx: 'stamp_hit', gain: 0.6 }, { t: 6.75, sfx: 'curtain', gain: 0.6 },
+  ],
+  render(t) { frame(t); },
+});
+</script></body></html>

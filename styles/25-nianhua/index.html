@@ -1,0 +1,606 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>25 木版年画 · Woodblock Print</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 25 木版年画 · WOODBLOCK PRINT (连年有余) =====
+   Shot top-down on a printer's bench, the way the Yangliuqing / Taohuawu shops work: the paper is clamped at
+   one edge like a book page, the carved block lies on the other side, mirror-reversed. The key block is inked,
+   the sheet turns over onto it, the palm brush rubs it down, it turns back carrying the black line. Then on
+   every beat the sheet flips over to the next colour block and comes back with one more colour — peach, yellow,
+   green, indigo — and the picture comes alive. On the gong the last, vermilion block lands a twin-fish
+   roundel in the yellow cartouche (asymmetric, so the block beside it reads reversed); the camera settles on the print.
+   The page turn is a real cylinder curl (front/back faces, shading, cast shadow); xuan-paper fibres, wood grain
+   printed into the flats, speckle where ink missed, and each colour a little off register. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#2a1a10');
+Reel.ownJitter = true;
+
+const AS = 1400;                                  // artwork size (px), square page
+const DBG = +(Reel.Q.get('dbg') || 0);
+
+/* ---------------- the artwork: one canvas per block ---------------- */
+function mkCanvas() { const c = document.createElement('canvas'); c.width = AS; c.height = AS; const g = c.getContext('2d', { willReadFrequently: true }); g.lineCap = 'round'; g.lineJoin = 'round'; return [c, g]; }
+function smooth(g, pts, closed) {      // Catmull-Rom through points
+  const n = pts.length; g.moveTo(pts[0][0], pts[0][1]);
+  const P = (i) => pts[closed ? (i + n) % n : Math.max(0, Math.min(n - 1, i))];
+  for (let i = 0; i < (closed ? n : n - 1); i++) {
+    const p0 = P(i - 1), p1 = P(i), p2 = P(i + 1), p3 = P(i + 2);
+    g.bezierCurveTo(p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6, p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6, p2[0], p2[1]);
+  }
+  if (closed) g.closePath();
+}
+// a leaping carp; local coords: length 1 along +x (head at +x), y up. T maps local -> canvas px
+function carpT(cx, cy, len, ang, flip, bend) {
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  return (x, y) => {
+    const yb = (y * 1.22) + bend * (x - 0.55) * (x - 0.55) - bend * 0.1;
+    const lx = x * len, ly = -yb * len * flip;
+    return [cx + lx * ca - ly * sa, cy + lx * sa + ly * ca];
+  };
+}
+const BODY = [[0.16, 0.055], [0.3, 0.14], [0.48, 0.2], [0.66, 0.195], [0.8, 0.15], [0.92, 0.085], [1.0, 0.02], [1.0, -0.01], [0.95, -0.065], [0.82, -0.13], [0.62, -0.165], [0.42, -0.145], [0.26, -0.09], [0.16, -0.048]];
+const TAIL = [[0.17, 0.05], [0.06, 0.1], [-0.06, 0.2], [-0.15, 0.27], [-0.08, 0.12], [-0.02, 0.0], [-0.08, -0.13], [-0.15, -0.26], [-0.05, -0.19], [0.06, -0.09], [0.17, -0.045]];
+const DORSAL = [[0.3, 0.14], [0.36, 0.25], [0.46, 0.3], [0.58, 0.29], [0.68, 0.24], [0.72, 0.19]];
+const PECT = [[0.8, -0.1], [0.74, -0.2], [0.66, -0.25], [0.68, -0.17], [0.75, -0.12]];
+const PELV = [[0.52, -0.16], [0.46, -0.26], [0.38, -0.29], [0.4, -0.2], [0.45, -0.15]];
+function carpOutline(g, T, lw) {
+  const tp = (pts) => pts.map(([x, y]) => T(x, y));
+  g.lineWidth = lw;
+  g.beginPath(); smooth(g, tp(TAIL), true); g.stroke();
+  g.beginPath(); smooth(g, tp(DORSAL), false); g.stroke();
+  g.beginPath(); smooth(g, tp(PECT), true); g.stroke();
+  g.beginPath(); smooth(g, tp(PELV), true); g.stroke();
+  g.beginPath(); smooth(g, tp(BODY), true); g.stroke();
+  // fin rays
+  g.lineWidth = lw * 0.45;
+  for (let k = 0; k < 9; k++) { const u = k / 8; const e = [lerp(-0.13, -0.13, u), lerp(0.24, -0.23, u)]; g.beginPath(); const a = T(0.16, 0), b = T(e[0] + 0.04 * Math.abs(u - 0.5), e[1] * 0.92); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke(); }
+  for (let k = 0; k < 6; k++) { const x = lerp(0.36, 0.68, k / 5); const a = T(x, 0.16 + 0.02 * Math.sin(k)), b = T(x + 0.03, 0.27 - 0.06 * Math.abs(k / 5 - 0.4)); g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke(); }
+  // gill cover, eye, mouth, barbels
+  g.lineWidth = lw * 0.8;
+  g.beginPath(); smooth(g, [T(0.84, 0.135), T(0.8, 0.04), T(0.81, -0.06), T(0.85, -0.115)], false); g.stroke();
+  const ec = T(0.905, 0.055), er = 0.03 * Math.hypot(T(1, 0)[0] - T(0, 0)[0], T(1, 0)[1] - T(0, 0)[1]);
+  g.beginPath(); g.arc(ec[0], ec[1], er, 0, 7); g.stroke();
+  g.beginPath(); g.arc(ec[0], ec[1], er * 0.45, 0, 7); g.fill();
+  g.lineWidth = lw * 0.6;
+  g.beginPath(); smooth(g, [T(0.985, -0.012), T(1.05, -0.05), T(1.08, -0.11), T(1.04, -0.15)], false); g.stroke();
+  g.beginPath(); smooth(g, [T(0.97, -0.03), T(1.0, -0.09), T(0.98, -0.14)], false); g.stroke();
+}
+function carpScales(g, T, lw) {
+  g.save();
+  g.beginPath(); smooth(g, BODY.map(([x, y]) => T(x, y)), true); g.clip();
+  g.lineWidth = lw * 0.5;
+  const sc = Math.hypot(T(1, 0)[0] - T(0, 0)[0], T(1, 0)[1] - T(0, 0)[1]);
+  for (let i = 0; i < 12; i++) for (let j = -5; j <= 5; j++) {
+    const x = 0.24 + i * 0.05, y = j * 0.042 + (i % 2) * 0.021;
+    if (x > 0.8) continue;
+    const c = T(x, y), a = Math.atan2(T(1, y)[1] - c[1], T(1, y)[0] - c[0]);
+    g.beginPath(); g.arc(c[0], c[1], 0.034 * sc, a + Math.PI * 0.5, a + Math.PI * 1.5); g.stroke();
+  }
+  g.restore();
+}
+function petalPath(g, cx, cy, ang, len, wid) {
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  const P = (x, y) => [cx + x * ca - y * sa, cy + x * sa + y * ca];
+  const b = P(0, 0), tip = P(len, 0), l1 = P(len * 0.35, wid), l2 = P(len * 0.8, wid * 0.55), r1 = P(len * 0.35, -wid), r2 = P(len * 0.8, -wid * 0.55);
+  g.moveTo(b[0], b[1]); g.bezierCurveTo(l1[0], l1[1], l2[0], l2[1], tip[0], tip[1]); g.bezierCurveTo(r2[0], r2[1], r1[0], r1[1], b[0], b[1]);
+}
+const LOTUS = { x: 700, y: 660, s: 1 };
+const PETALS = [[-2.5, 220, 80], [-0.64, 220, 80], [-1.57, 250, 86], [-2.02, 262, 90], [-1.12, 262, 90], [-2.75, 175, 66], [-0.39, 175, 66], [-1.57, 150, 66]];
+const LEAVES = [[290, 640, 215, -0.25], [1110, 640, 215, 0.25], [700, 930, 140, 0]];
+function leafPath(g, cx, cy, r, rot) {
+  const pts = [];
+  for (let k = 0; k < 28; k++) { const a = rot + (k / 28) * Math.PI * 2; const rr = r * (1 + 0.05 * Math.sin(a * 7 + 1) + 0.03 * Math.sin(a * 13)); pts.push([cx + Math.cos(a) * rr, cy + Math.sin(a) * rr * 0.62]); }
+  smooth(g, pts, true);
+}
+const CARPS = [carpT(200, 1150, 520, -0.62, 1, 0.62), carpT(1200, 1150, 520, Math.PI + 0.62, -1, 0.62)];
+const WAVE_Y = 1085;
+const STEMS = [[[700, 700], [688, 820], [706, 990], [700, 1110]], [[290, 700], [310, 860], [350, 1100]], [[1110, 700], [1090, 860], [1050, 1100]]];
+
+function drawArt() {
+  const L = {};
+  // ---- K: the key block (black lines) ----
+  { const [c, g] = mkCanvas(); L.K = c; g.fillStyle = '#000'; g.fillRect(0, 0, AS, AS); g.strokeStyle = '#fff'; g.fillStyle = '#fff';
+    // frames
+    g.lineWidth = 13; g.strokeRect(70, 70, AS - 140, AS - 140);
+    g.lineWidth = 7; g.strokeRect(100, 100, AS - 200, AS - 200);
+    // the band between frames: a running key pattern (回纹)
+    g.lineWidth = 4.6;
+    const key = (x, y, s) => { g.beginPath(); g.moveTo(x, y + s); g.lineTo(x, y); g.lineTo(x + s, y); g.lineTo(x + s, y + s * 0.7); g.lineTo(x + s * 0.3, y + s * 0.7); g.lineTo(x + s * 0.3, y + s * 0.35); g.stroke(); };
+    for (let x = 80; x < AS - 100; x += 26) { key(x, 77, 16); key(x, AS - 93, 16); }
+    for (let y = 106; y < AS - 106; y += 26) { key(77, y, 16); key(AS - 93, y, 16); }
+    // cartouche
+    g.lineWidth = 11; const rr = (x, y, w, h, r) => { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); g.stroke(); };
+    rr(380, 140, 640, 210, 40); g.lineWidth = 6; rr(398, 158, 604, 174, 30);
+    // lotus leaves with veins
+    g.lineWidth = 11;
+    for (const [x, y, r, rot] of LEAVES) {
+      g.beginPath(); leafPath(g, x, y, r, rot); g.stroke();
+      g.lineWidth = 5.8;
+      for (let k = 0; k < 11; k++) { const a = rot + k / 11 * Math.PI * 2; g.beginPath(); g.moveTo(x, y); g.quadraticCurveTo(x + Math.cos(a + 0.15) * r * 0.5, y + Math.sin(a + 0.15) * r * 0.31, x + Math.cos(a) * r * 0.93, y + Math.sin(a) * r * 0.58); g.stroke(); }
+      g.beginPath(); g.arc(x, y, 14, 0, 7); g.fill(); g.lineWidth = 11;
+    }
+    // stems (outlined)
+    const stems = STEMS;
+    for (const s of stems) { g.lineWidth = 26; g.beginPath(); smooth(g, s, false); g.stroke(); }
+    g.globalCompositeOperation = 'destination-out';
+    for (const s of stems) { g.lineWidth = 13; g.beginPath(); smooth(g, s, false); g.stroke(); }
+    g.globalCompositeOperation = 'source-over';
+    // lotus petals
+    g.lineWidth = 11;
+    for (const [a, l, w] of PETALS) { g.beginPath(); petalPath(g, LOTUS.x, LOTUS.y, a, l, w); g.fillStyle = '#000'; g.fill(); g.stroke(); g.lineWidth = 5.5; g.beginPath(); const ca = Math.cos(a), sa = Math.sin(a); g.moveTo(LOTUS.x + ca * l * 0.15, LOTUS.y + sa * l * 0.15); g.lineTo(LOTUS.x + ca * l * 0.75, LOTUS.y + sa * l * 0.75); g.stroke(); g.lineWidth = 11; }
+    g.fillStyle = '#fff';
+    // seed pod + stamens
+    g.beginPath(); g.ellipse(LOTUS.x, LOTUS.y - 52, 60, 26, 0, 0, 7); g.fillStyle = '#000'; g.fill(); g.fillStyle = '#fff'; g.stroke();
+    for (let k = 0; k < 7; k++) { g.beginPath(); g.arc(LOTUS.x - 39 + k * 13, LOTUS.y - 55 + (k % 2) * 8, 5, 0, 7); g.fill(); }
+    // carp
+    for (const T of CARPS) { g.fillStyle = '#000'; g.beginPath(); smooth(g, BODY.map(([x, y]) => T(x, y)), true); g.fill(); g.fillStyle = '#fff'; carpOutline(g, T, 12); carpScales(g, T, 11); }
+    // waves: rows of fish-scale arcs + curling crests
+    g.lineWidth = 5.6;
+    for (let r = 0; r < 7; r++) for (let i = -1; i < 16; i++) {
+      const cx = 130 + i * 84 + (r % 2) * 42, cy = WAVE_Y + 40 + r * 34;
+      if (cy > AS - 130) continue;
+      for (let k = 1; k <= 3; k++) { g.beginPath(); g.arc(cx, cy, k * 13, Math.PI, 2 * Math.PI); g.stroke(); }
+    }
+    g.lineWidth = 11;
+    for (let i = 0; i < 8; i++) { const x = 170 + i * 152, y = WAVE_Y + 10 + 12 * Math.sin(i * 1.7);
+      g.beginPath(); smooth(g, [[x - 70, y + 30], [x - 30, y - 10], [x + 20, y - 22], [x + 48, y], [x + 30, y + 20], [x + 8, y + 6], [x + 18, y - 4]], false); g.stroke(); }
+    // clip everything to inside the inner frame except frames
+    g.globalCompositeOperation = 'destination-out'; g.fillRect(0, 0, AS, 66); g.fillRect(0, AS - 66, AS, 66); g.fillRect(0, 0, 66, AS); g.fillRect(AS - 66, 0, 66, AS); g.globalCompositeOperation = 'source-over';
+  }
+  // ---- colour blocks (white = colour) ----
+  const fillCanvas = (fn, noClip) => { const [c, g] = mkCanvas(); g.fillStyle = '#000'; g.fillRect(0, 0, AS, AS); g.fillStyle = '#fff'; g.strokeStyle = '#fff'; fn(g);
+    if (!noClip) { g.globalCompositeOperation = 'destination-out'; g.beginPath(); g.rect(0, 0, AS, AS); g.rect(104, 1296, AS - 208, -1192); g.fill('evenodd'); g.globalCompositeOperation = 'source-over'; } return c; };
+  L.P = fillCanvas((g) => {             // peach / rose: lotus petals, carp fins, a few wave crests
+    for (const [a, l, w] of PETALS) { g.beginPath(); petalPath(g, LOTUS.x, LOTUS.y, a, l * 0.97, w * 0.95); g.fill(); }
+    for (const T of CARPS) { for (const F of [TAIL, DORSAL.concat([[0.5, 0.17]]), PECT, PELV]) { g.beginPath(); smooth(g, F.map(([x, y]) => T(x, y)), true); g.fill(); } }
+    g.beginPath(); g.ellipse(700, 1210, 520, 40, 0, 0, 7); g.globalAlpha = 0; g.fill(); g.globalAlpha = 1;
+  });
+  L.Y = fillCanvas((g) => {             // yellow: carp bodies, cartouche, lotus pod
+    for (const T of CARPS) { g.beginPath(); smooth(g, BODY.map(([x, y]) => T(x, y)), true); g.fill(); }
+    g.beginPath(); g.roundRect ? g.roundRect(396, 156, 608, 178, 30) : g.rect(396, 156, 608, 178); g.fill();
+    g.beginPath(); g.ellipse(LOTUS.x, LOTUS.y - 52, 58, 24, 0, 0, 7); g.fill();
+  });
+  L.G = fillCanvas((g) => {             // green: leaves and stems
+    for (const [x, y, r, rot] of LEAVES) { g.beginPath(); leafPath(g, x, y, r * 0.985, rot); g.fill(); }
+    g.lineWidth = 15; for (const s of STEMS) { g.beginPath(); smooth(g, s, false); g.stroke(); }
+    g.globalCompositeOperation = 'destination-out';
+    for (const T of CARPS) { g.beginPath(); smooth(g, BODY.map(([x, y]) => T(x, y)), true); g.fill(); for (const F of [TAIL, DORSAL, PECT, PELV]) { g.beginPath(); smooth(g, F.map(([x, y]) => T(x, y)), true); g.fill(); } }
+    for (const [a, l, w] of PETALS) { g.beginPath(); petalPath(g, LOTUS.x, LOTUS.y, a, l, w); g.fill(); }
+    g.globalCompositeOperation = 'source-over';
+  });
+  L.B = fillCanvas((g) => {             // indigo: water and the border band
+    g.fillRect(104, WAVE_Y + 4, AS - 208, AS - 104 - WAVE_Y - 4);
+    g.fillRect(74, 74, AS - 148, 26); g.fillRect(74, AS - 100, AS - 148, 26); g.fillRect(74, 74, 26, AS - 148); g.fillRect(AS - 100, 74, 26, AS - 148);
+    g.globalCompositeOperation = 'destination-out';
+    for (const T of CARPS) { g.beginPath(); smooth(g, BODY.map(([x, y]) => T(x, y)), true); g.fill(); for (const F of [TAIL, PECT, PELV]) { g.beginPath(); smooth(g, F.map(([x, y]) => T(x, y)), true); g.fill(); } }
+    for (let i = 0; i < 8; i++) { const x = 170 + i * 152, y = WAVE_Y + 10 + 12 * Math.sin(i * 1.7); g.beginPath(); g.ellipse(x - 5, y + 2, 55, 22, -0.2, 0, 7); g.fill(); }
+    g.lineWidth = 20; for (const s of STEMS) { g.beginPath(); smooth(g, s, false); g.stroke(); }
+    g.globalCompositeOperation = 'source-over';
+  }, true);
+  L.R = fillCanvas((g) => {             // vermilion: a twin-fish roundel for the cartouche + a square seal
+    const cx = 700, cy = 247, R0 = 78;
+    g.lineWidth = 11; g.beginPath(); g.arc(cx, cy, R0, 0, 7); g.stroke();
+    // two little carp chasing round the ring, one larger than the other (so the block reads reversed)
+    const fish = (a0, sc, dir) => {
+      const pts = [];
+      for (let i = 0; i <= 24; i++) {
+        const u = i / 24, a = a0 + dir * u * 2.3, rr = R0 * (0.56 + 0.07 * Math.sin(u * Math.PI));
+        const w = sc * 16 * Math.sin(Math.PI * Math.min(1, u * 1.15)) ** 0.7 * (1 - 0.55 * u);
+        pts.push([cx + Math.cos(a) * (rr + w), cy + Math.sin(a) * (rr + w)]);
+      }
+      for (let i = 24; i >= 0; i--) {
+        const u = i / 24, a = a0 + dir * u * 2.3, rr = R0 * (0.56 + 0.07 * Math.sin(u * Math.PI));
+        const w = sc * 16 * Math.sin(Math.PI * Math.min(1, u * 1.15)) ** 0.7 * (1 - 0.55 * u);
+        pts.push([cx + Math.cos(a) * (rr - w), cy + Math.sin(a) * (rr - w)]);
+      }
+      g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(x, y) : g.moveTo(x, y))); g.closePath(); g.fill();
+      const ta = a0 + dir * 2.35, tr = R0 * 0.56;                       // the tail, a forked flick
+      const tx = cx + Math.cos(ta) * tr, ty = cy + Math.sin(ta) * tr;
+      g.beginPath(); g.moveTo(tx, ty);
+      g.lineTo(tx + Math.cos(ta + dir * 1.9) * 22 * sc, ty + Math.sin(ta + dir * 1.9) * 22 * sc);
+      g.lineTo(tx + Math.cos(ta + dir * 1.2) * 14 * sc, ty + Math.sin(ta + dir * 1.2) * 14 * sc);
+      g.lineTo(tx + Math.cos(ta + dir * 0.6) * 22 * sc, ty + Math.sin(ta + dir * 0.6) * 22 * sc); g.closePath(); g.fill();
+      g.fillStyle = '#000';                                             // the eye, cut out of the block
+      g.beginPath(); g.arc(cx + Math.cos(a0 + dir * 0.18) * R0 * 0.6, cy + Math.sin(a0 + dir * 0.18) * R0 * 0.6, 4.5 * sc, 0, 7); g.fill();
+      g.fillStyle = '#fff';
+    };
+    fish(-2.2, 1.12, 1); fish(0.95, 0.86, 1);
+    g.beginPath(); g.arc(cx + 8, cy - 6, 11, 0, 7); g.fill();          // the pearl they chase, off centre
+    // a ruyi cloud-head either side, the left one larger (keeps the block visibly reversed)
+    const ruyi = (x, y, k, dir) => {
+      g.beginPath(); g.arc(x, y + 6 * k, 15 * k, 0, 7); g.arc(x - dir * 17 * k, y - 4 * k, 12 * k, 0, 7); g.arc(x + dir * 17 * k, y - 4 * k, 12 * k, 0, 7); g.fill();
+      g.beginPath(); g.moveTo(x - dir * 4 * k, y + 18 * k); g.quadraticCurveTo(x + dir * 30 * k, y + 40 * k, x + dir * 70 * k, y + 26 * k); g.lineWidth = 8 * k; g.stroke();
+      g.fillStyle = '#000'; g.beginPath(); g.arc(x, y + 5 * k, 5 * k, 0, 7); g.fill(); g.fillStyle = '#fff';
+    };
+    ruyi(cx - 175, cy - 6, 1.25, -1); ruyi(cx + 170, cy - 2, 0.95, 1);
+    // a small square seal (a fish in a frame, no characters) in the lower right margin
+    g.fillRect(1190, 1326, 66, 66);
+    g.fillStyle = '#000'; g.fillRect(1199, 1335, 48, 48); g.fillStyle = '#fff';
+    g.beginPath(); g.ellipse(1223, 1359, 17, 8, -0.5, 0, 7); g.fill();
+    g.beginPath(); g.moveTo(1208, 1368); g.lineTo(1203, 1378); g.lineTo(1214, 1373); g.closePath(); g.fill();
+  }, true);
+  return L;
+}
+
+/* ---------------- GL ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.06, th: 1.6, expo: 0.97, vig: 0.38, grain: 0.03, ca: 0.25, contrast: 1.07, sat: 1.12, bands: 4,
+  lift: [0.004, 0.002, 0.0], gain: [1.02, 1.0, 0.96],
+  uniforms: `
+uniform sampler2D uA, uB;          // A: K, P, Y, G   B: Ind, Red
+uniform vec4 uCam;                 // centre xy, half height, rotation
+uniform vec4 uPage;                // mode (0 left, 1 turning right, 2 right, 3 turning left), c, r, layers printed
+uniform vec4 uBlk;                 // block layer index, inked fraction (sweep), rub fraction, show-through wetness
+uniform vec4 uBrush;               // ink brush xy, palm brush xy
+uniform vec2 uBrushA;              // brush alphas
+uniform float uDbg, uWet, uSheen; uniform vec2 uTh;`,
+  scene: `
+const vec3 INK = vec3(.022, .02, .024);
+vec3 LCOL(int i){
+  if (i == 1) return vec3(.80, .14, .26);    // 桃红, leaning to rouge
+  if (i == 2) return vec3(.88, .58, .06);    // 槐黄, warm
+  if (i == 3) return vec3(.10, .40, .26);    // 翠绿 / 石绿, deep
+  if (i == 4) return vec3(.10, .16, .40);    // 靛蓝, greyed
+  return vec3(.78, .12, .07);                // 朱红
+}
+// every colour block is a different plank: its grain runs its own way and prints into the flat
+float grainL(int i, vec2 uv){
+  float a = float(i)*1.37 + .5;
+  vec2 q = mat2(cos(a), sin(a), -sin(a), cos(a))*uv;
+  float w = fbm2(q*2.5 + float(i)*3.1);
+  return fbm2(vec2(q.x*2.2 + w*.6, q.y*95. + w*4.));
+}
+vec2 OFF(int i){                              // a little off register, as every real print is
+  if (i == 1) return vec2(.0052, -.0031);
+  if (i == 2) return vec2(-.0041, .0046);
+  if (i == 3) return vec2(.0028, .0062);
+  if (i == 4) return vec2(-.0063, -.0022);
+  return vec2(.0034, .0027);
+}
+float layerMask(int i, vec2 uv){
+  vec2 q = uv + OFF(i) + (vnoise2(uv*260. + float(i)*7.)-.5)*.0011;
+  if (i == 0) return texture(uA, q).r;
+  if (i == 1) return texture(uA, q).g;
+  if (i == 2) return texture(uA, q).b;
+  if (i == 3) return texture(uA, q).a;
+  if (i == 4) return texture(uB, q).r;
+  return texture(uB, q).g;
+}
+float maskLod(int i, vec2 q, float lod){
+  if (i == 0) return textureLod(uA, q, lod).r;
+  if (i == 1) return textureLod(uA, q, lod).g;
+  if (i == 2) return textureLod(uA, q, lod).b;
+  if (i == 3) return textureLod(uA, q, lod).a;
+  if (i == 4) return textureLod(uB, q, lod).r;
+  return textureLod(uB, q, lod).g;
+}
+float paperFib(vec2 p){
+  float f = 0.;
+  mat2 r1 = mat2(.8, .6, -.6, .8), r2 = mat2(.2, -.98, .98, .2), r3 = mat2(-.7, .71, -.71, -.7);
+  f += smoothstep(.72, .9, vnoise2(r1*p*vec2(28., 380.)));
+  f += smoothstep(.74, .92, vnoise2(r2*p*vec2(22., 300.) + 9.));
+  f += smoothstep(.76, .94, vnoise2(r3*p*vec2(30., 420.) + 3.));
+  return f;
+}
+vec3 paperCol(vec2 uv, bool back){
+  float m = fbm2(uv*7.) - .5;
+  vec3 c = vec3(.86, .77, .60)*(1. + m*.09);                      // warm 毛边纸
+  c *= 1. - paperFib(uv)*.075;
+  c += vec3(.022, .018, .01)*smoothstep(.6, .9, vnoise2(uv*90.));
+  c *= 1. - .3*smoothstep(.94, .995, vnoise2(uv*480. + 3.));          // bits of bark in the pulp
+  if (back) c *= vec3(.95, .95, .97);
+  return c;
+}
+// the printed face: everything transferred so far
+vec3 printFace(vec2 uv, float n){
+  vec3 c = paperCol(uv, false);
+  for (int i=1;i<=5;i++){
+    if (float(i) + .5 > n) break;
+    float m = layerMask(i, uv);
+    float mb = maskLod(i, uv + OFF(i), 2.2);                              // the water colour wicks a little past the cut edge
+    float en = vnoise2(uv*170. + float(i)*11.);
+    float a = max(smoothstep(.22 + .3*en, .5 + .25*en, m), smoothstep(.1, .55, mb)*.35);
+    float g = grainL(i, uv);
+    float mott = fbm2(uv*14. + float(i)*5.3);
+    float dens = (.74 + .32*smoothstep(.3, .72, g))*(.76 + .3*mott)*(.88 + .24*fbm2(uv*3.1 + float(i)*7.7));   // grain, mottling, ±12 % load
+    dens *= 1. - .45*step(.94, vnoise2(uv*380. + float(i)*3.));           // specks the block missed
+    c *= pow(LCOL(i), vec3(clamp(a*dens, 0., 1.25)));                     // water colour soaks into the fibres
+    if (float(i) + .5 > n - 1. && uWet > 0.) c *= 1. + uWet*.1*a;        // the newest colour is wet: a brief lift as it lands
+  }
+  if (n > .5) {
+    float km = layerMask(0, uv);
+    float kn = vnoise2(uv*240.);
+    float k = smoothstep(.22 + .3*kn, .48 + .2*kn, km);                  // where the ink ran thin the line breaks
+    float kd = .86 + .14*smoothstep(.25, .75, fbm2(uv*7. + 3.));           // ink load varies from stroke to stroke
+    kd *= .9 + .1*grainL(0, uv);
+    kd *= 1. - .4*step(.95, vnoise2(uv*600.));
+    c = mix(c, INK*(1. + 2.5*(1. - kd)), clamp(k*(.9 + .1*kd)*1.08, 0., 1.));   // thin ink reads as a softer black, not grey
+  }
+  return c;
+}
+// back of the sheet: the print shows through the thin paper (darker where it is still wet)
+vec3 backFace(vec2 uvMirror, float n, float wet){
+  vec3 b = paperCol(uvMirror*vec2(-1., 1.) + vec2(.37, .11), true);
+  vec3 f = printFace(uvMirror, n);
+  vec3 ratio = f/max(paperCol(uvMirror, false), vec3(.05));
+  return b*mix(vec3(1.), ratio, .55 + .3*wet);
+}
+// carved block: raised where the layer's mask is set (mirror of the print)
+vec3 blockFace(vec2 xy, int layer, float inked, out float h){
+  vec2 uv = vec2(1. - xy.x, .5 - xy.y);                            // block point under page point uv
+  float m = layerMask(layer, uv - OFF(layer));
+  float mb = maskLod(layer, uv, 2.5);
+  h = smoothstep(.35, .6, m);
+  float gw = fbm2(vec2(xy.x*2.2, xy.y*7.));
+  float rings = fract(xy.y*38. + gw*5.5 + fbm2(xy*vec2(1.5, 9.))*2.);
+  vec3 wood = mix(vec3(.52, .35, .21), vec3(.63, .45, .28), fbm2(vec2(xy.x*3., xy.y*60.)));
+  wood *= .9 + .1*smoothstep(.0, .25, rings)*smoothstep(1., .55, rings);
+  vec3 cut = wood*.45*(.8 + .2*vnoise2(xy*400.));                 // the carved-away ground, gouge marks
+  vec2 g = vec2(maskLod(layer, uv + vec2(.0025, 0.), 1.5) - maskLod(layer, uv - vec2(.0025, 0.), 1.5), maskLod(layer, uv + vec2(0., .0025), 1.5) - maskLod(layer, uv - vec2(0., .0025), 1.5));
+  vec3 c = mix(cut, wood, h);
+  c *= 1. + .9*dot(g, vec2(.7, .7));          // bevel of the carved edges catches the window light (uv.x runs against x)
+  // ink on the raised parts: black for the key block, the colour for the others; wet sheen
+  vec3 inkC = layer == 0 ? INK : LCOL(layer)*.85;
+  float ik = h*inked;
+  c = mix(c, inkC, ik*.95);
+  c += vec3(.25)*ik*smoothstep(.55, .95, vnoise2(xy*vec2(80., 300.)))*.35;
+  c *= 1. - .25*(1. - h)*smoothstep(.0, .3, mb);
+  return c;
+}
+vec3 table(vec2 xy){
+  float gw = fbm2(vec2(xy.x*.9, xy.y*4.));
+  float rings = fract(xy.y*9. + gw*4.5 + fbm2(xy*vec2(.8, 6.))*1.5);
+  vec3 w = mix(vec3(.15, .085, .05), vec3(.23, .135, .075), fbm2(vec2(xy.x*1.5, xy.y*22.)));
+  w *= .88 + .12*smoothstep(.0, .3, rings)*smoothstep(1., .6, rings);
+  w *= .92 + .08*vnoise2(vec2(xy.x*8., xy.y*260.));
+  w *= 1. - .5*smoothstep(.55, .75, fbm2(xy*2.3 + 5.));                // old ink stains
+  return w;
+}
+// what is under the turning page at x: the paper stack on the left, the block on the right
+vec3 under(vec2 xy, out float onBlock){
+  onBlock = 0.;
+  // the rest of the run lies clamped underneath: every sheet in the stack has had the same colours up to the last pass
+  if (xy.x < 0. && xy.x > -1.012 && abs(xy.y) < .506) {
+    float nStack = max(uPage.w - (uPage.x > 1.5 && uPage.x < 3.5 ? 1. : 0.), 0.);
+    if (uBlk.x < .5) nStack = 0.;
+    return printFace(vec2(xy.x + 1.004, .497 - xy.y), nStack)*.95;
+  }
+  if (xy.x > -.002 && xy.x < 1.03 && abs(xy.y) < .53) { float h; onBlock = 1.; return blockFace(xy, int(uBlk.x + .5), uBlk.y, h); }
+  return table(xy);
+}
+vec3 render(vec2 fc){
+  vec2 sp = (fc - .5*uRes)/uRes.y;
+  float cr = cos(uCam.w), sr = sin(uCam.w);
+  vec2 xy = uCam.xy + mat2(cr, sr, -sr, cr)*sp*2.*uCam.z;
+  float mode = uPage.x, c = uPage.y, r = max(uPage.z, 1e-4), n = uPage.w;
+  vec3 col;
+  float ob;
+  vec3 base = under(xy, ob);
+  // ink brush (a big soft round brush passing close to the lens)
+  // turning page geometry; mirror the turning-left case so one routine handles both
+  bool mir = mode > 2.5;
+  float X = mir ? -xy.x : xy.x;
+  float y = xy.y;
+  float v = .5 - y;
+  bool inV = abs(y) < .5;
+  vec3 L = normalize(vec3(-.5, .45, .75));
+  float shadow = 0.;
+  bool drawn = false;
+  if (mode < .5) {                       // page lying on the left, face up
+    if (xy.x <= 0. && xy.x >= -1. && inV) { col = printFace(vec2(xy.x + 1., v), n); drawn = true; }
+  } else if (mode > 1.5 && mode < 2.5) { // page lying face down on the block
+    if (xy.x >= 0. && xy.x <= 1. && inV) {
+      vec3 bf = backFace(vec2(1. - xy.x, v), n, uBlk.w);
+      // show-through of the block's wet ink appears where the brush has rubbed
+      vec2 uv = vec2(1. - xy.x, v);
+      float m = smoothstep(.35, .6, layerMask(int(uBlk.x + .5), uv));
+      float thr = .5 - uBlk.z*1.06;
+      float rub = smoothstep(thr - .03, thr + .03, y);
+      vec3 inkC = uBlk.x < .5 ? INK : LCOL(int(uBlk.x + .5));
+      bf = mix(bf, bf*mix(vec3(1.), inkC/.9, .6), m*(.18 + .55*rub)*uBlk.y);
+      bf *= 1. - .045*rub;                // rubbed paper is pressed flat and a touch darker
+      col = bf; drawn = true;
+    }
+  } else {                                // turning: the sheet swings over the hinge like a book page (seen from above)
+    // the page moves several thousand px/s mid-turn: integrate the whole shutter of this frame in the shader (32 angles),
+    // so every motion-blur sub-frame already carries a smooth streak
+    vec3 acc = vec3(0.);
+    for (int k=0;k<32;k++){
+    float th = mix(uTh.x, uTh.y, (float(k) + .5)/32.);
+    float pu = -1.; bool flipped = false; float ndl = 1.;
+    // solve X = -pu*cos(th - bend*pu) by fixed-point iteration
+    float bend = .22*sin(th);
+    float q = clamp(-X, -1.2, 1.2);
+    float pg = .5;
+    for (int i=0;i<8;i++){ float cs = cos(th - bend*pg); pg = abs(cs) > 1e-3 ? q/cs : 9.; pg = clamp(pg, -1., 2.); }
+    float thl = th - bend*pg;
+    if (inV && pg >= 0. && pg <= 1. && abs(-pg*cos(thl) - X) < .004) {
+      pu = pg; flipped = cos(thl) < 0.;
+      vec3 nF = vec3(sin(thl), 0., cos(thl));                // normal of the face that started up
+      vec3 nv = flipped ? -nF : nF;
+      if (mir) nv.x = -nv.x;
+      ndl = dot(nv, L)/L.z;
+    }
+    // shadow of the raised sheet on whatever lies under it (light from the upper left -> shadow to the lower right)
+    float sxM = mir ? -.67 : .67;
+    float den = -cos(th) + sxM*sin(th);
+    float ps = abs(den) > 1e-3 ? X/den : -1.;
+    float hS = ps*sin(th);
+    float shk = (ps > 0. && ps < 1.) ? .42*(1. - .45*hS)*(1. - smoothstep(.47, .53, abs(y + .6*hS)))*smoothstep(0., .04, ps)*smoothstep(1., .96, ps) : 0.;
+    if (pu >= 0.) {
+      float u = 1. - pu;
+      vec2 uvp = vec2(u, v);
+      bool showBack = mir ? !flipped : flipped;               // mode 3 starts face down
+      vec3 pc = showBack ? backFace(uvp, n, uBlk.w) : printFace(uvp, n);
+      acc += pc*(.38 + .62*clamp(ndl, 0., 1.15)) + vec3(.05)*pow(max(ndl - .98, 0.)*8., 2.);
+    } else acc += base*(1. - shk);
+    }
+    col = acc/32.; drawn = true;
+  }
+  if (!drawn) col = base*(1. - shadow);
+  else if (mode > .5 && mode < 1.5 || mode > 2.5) { /* turning sheet already shaded */ }
+  // contact shadow of the sheet edges on the bench / stack
+  if (!drawn && (mode < .5 || mode > 1.5 && mode < 2.5)) {
+    vec2 q = vec2(mode < .5 ? xy.x + .5 : xy.x - .5, xy.y);
+    vec2 d2 = abs(q - vec2(-.006, .008)) - vec2(.5, .5);
+    float ds = length(max(d2, 0.));
+    col *= 1. - .35*exp(-ds*90.)*step(0., max(d2.x, d2.y));
+  }
+  // the wooden clamp holding the stack along the hinge
+  float clampD = abs(xy.x + .018);
+  if (clampD < .016 && abs(xy.y) < .62) { vec3 wc = mix(vec3(.30, .18, .09), vec3(.42, .27, .15), fbm2(vec2(xy.x*40., xy.y*30.))); col = wc*(.8 + .25*smoothstep(.016, .0, clampD)); }
+  if (clampD >= .016 && clampD < .028 && abs(xy.y) < .62) col *= .7 + .3*smoothstep(.016, .028, clampD);
+  // brushes passing close above the work: soft, out-of-focus dark shapes
+  // the tools, close above the work (a little soft): their shadows first, then the tools themselves
+  if (uBrushA.x > .001) {                               // round ink brush: dark wet bristles on a bamboo handle running off frame
+    vec2 b = uBrush.xy;
+    float shd = length((xy - b - vec2(.05, -.06))/vec2(.12, .15));
+    col *= 1. - uBrushA.x*.45*smoothstep(1.3, .4, shd);
+    vec2 q = xy - b;
+    float head = length(q/vec2(.085, .1));
+    vec2 hd = normalize(vec2(.55, .8)); float along = dot(q, hd), across = dot(q, vec2(-hd.y, hd.x));
+    float handle = step(.05, along)*step(along, 1.6)*(1. - smoothstep(.022, .03, abs(across)));
+    vec3 bristle = vec3(.025, .02, .02)*(.7 + .6*vnoise2(vec2(across*900., along*40.)));
+    vec3 bamboo = mix(vec3(.55, .42, .22), vec3(.68, .54, .3), smoothstep(-.02, .02, across))*(1. - .25*step(.92, fract(along*7.)));
+    col = mix(col, bristle, uBrushA.x*(1. - smoothstep(.85, 1.05, head)));
+    col = mix(col, bamboo, uBrushA.x*handle*(1. - smoothstep(.85, 1.05, head)*0. ));
+  }
+  if (uBrushA.y > .001) {                               // 棕刷: a long bundle of palm fibre, bound with cord
+    vec2 q = xy - uBrush.zw;
+    float shd = length((q - vec2(.04, -.05))/vec2(.09, .32));
+    col *= 1. - uBrushA.y*.42*smoothstep(1.25, .45, shd);
+    vec2 bq = abs(q) - vec2(.06, .27);
+    float body = length(max(bq, 0.)) + min(max(bq.x, bq.y), 0.) - .02;
+    float fib = vnoise2(vec2(q.x*700., q.y*18.));
+    vec3 palm = mix(vec3(.22, .13, .07), vec3(.42, .27, .14), fib)*(.8 + .3*smoothstep(-.06, .06, q.x));
+    float cord = step(abs(q.y - .12), .018) + step(abs(q.y + .05), .014);
+    palm = mix(palm, vec3(.12, .08, .05), clamp(cord, 0., 1.)*.8);
+    col = mix(col, palm, uBrushA.y*(1. - smoothstep(-.004, .004, body)));
+    // the rubbed band behind it: pressed paper reads a touch darker and flatter
+  }
+  if (uSheen > 0. && mode < .5 && xy.x < 0. && xy.x > -1. && abs(xy.y) < .5) {
+    vec2 uvr = vec2(xy.x + 1., .5 - xy.y);
+    float red = smoothstep(.4, .6, layerMask(5, uvr));
+    float band = exp(-pow((xy.x + xy.y*.6 - mix(-1.6, .6, uSheen))*7., 2.));
+    col += vec3(.22, .2, .17)*red*band*(1. - smoothstep(.9, 1., uSheen));
+  }
+  // window light from the upper left
+  float lightF = .78 + .32*smoothstep(1.4, -1.2, xy.x - xy.y*.7);
+  col *= lightF*.98;
+  gDepth = 2.;
+  if (uDbg > .5) col = vec3(layerMask(int(uDbg) - 1, vec2(xy.x + 1., .5 - xy.y)));
+  return col;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+let texA, texB;
+function packTextures(L) {
+  const get = (c) => c.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, AS, AS).data;
+  const K = get(L.K), P = get(L.P), Y = get(L.Y), Gr = get(L.G), B = get(L.B), Rd = get(L.R);
+  const a = new Uint8Array(AS * AS * 4), b = new Uint8Array(AS * AS * 4);
+  for (let i = 0; i < AS * AS; i++) {
+    a[i * 4] = K[i * 4]; a[i * 4 + 1] = P[i * 4]; a[i * 4 + 2] = Y[i * 4]; a[i * 4 + 3] = Gr[i * 4];
+    b[i * 4] = B[i * 4]; b[i * 4 + 1] = Rd[i * 4]; b[i * 4 + 2] = 0; b[i * 4 + 3] = 255;
+  }
+  const mk = (data) => {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, AS, AS, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  };
+  texA = mk(a); texB = mk(b);
+}
+
+/* ---------------- the printing session ---------------- */
+// passes: layer, page turns over [o0,o1], lies on the block [o1,b1], turns back [b1,b2]
+const PASSES = [
+  { layer: 0, o0: 1.0, o1: 1.45, b1: 2.5, b2: 3.0 },
+  { layer: 1, o0: 3.54, o1: 3.74, b1: 3.78, b2: 4.0 },
+  { layer: 2, o0: 4.04, o1: 4.24, b1: 4.28, b2: 4.5 },
+  { layer: 3, o0: 4.54, o1: 4.74, b1: 4.78, b2: 5.0 },
+  { layer: 4, o0: 5.04, o1: 5.24, b1: 5.28, b2: 5.5 },
+  { layer: 5, o0: 6.6, o1: 7.0, b1: 7.06, b2: 7.5 },
+];
+function pageState(t) {
+  let printed = 0, mode = 0, c = 1, r = 0, layer = 0, rub = 0, wet = 0;
+  for (const p of PASSES) {
+    if (t >= p.o1) printed = Math.max(printed, p.layer + 1);
+    if (t >= p.o0 - 0.15) layer = p.layer;
+    if (t >= p.o0 && t < p.o1) { const u = E.inOutSine((t - p.o0) / (p.o1 - p.o0)); mode = 1; c = Math.PI * u; r = 0; }
+    else if (t >= p.o1 && t < p.b1) { mode = 2; rub = p.layer === 0 ? clamp((t - 1.5) / 0.95) : 1; wet = 1; }
+    else if (t >= p.b1 && t < p.b2) { const u = E.inOutSine((t - p.b1) / (p.b2 - p.b1)); mode = 3; c = Math.PI * u; r = 0; wet = 1 - u; }
+  }
+  // the sheet carries the layer it is receiving only after it has lain on the block
+  return { mode, c, r, printed: printed, layer, rub, wet };
+}
+const cr1 = (p0, p1, p2, p3, u) => { const u2 = u * u, u3 = u2 * u; return 0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3); };
+function keyed(K, t, fields) {
+  let i = 0; while (i < K.length - 2 && t > K[i + 1].t) i++;
+  const k0 = K[Math.max(0, i - 1)], k1 = K[i], k2 = K[i + 1], k3 = K[Math.min(K.length - 1, i + 2)];
+  const u = (k2.e || E.inOutSine)(clamp((t - k1.t) / (k2.t - k1.t)));
+  const o = {}; for (const f of fields) o[f] = Array.isArray(k1[f]) ? k1[f].map((_, j) => cr1(k0[f][j], k1[f][j], k2[f][j], k3[f][j], u)) : cr1(k0[f], k1[f], k2[f], k3[f], u);
+  return o;
+}
+// one continuous camera: inking close on the block, follows the sheet across, pushes in through the colours,
+// eases out for the red pass, then settles centred on the finished print (still from 8.5)
+const camT = Track([
+  { t: 0.0, v: [0.5, 0.03, 0.46, 0.04] },
+  { t: 1.1, v: [0.42, 0.02, 0.5, 0.03] },
+  { t: 2.5, v: [0.3, 0.0, 0.56, 0.015] },
+  { t: 3.4, v: [-0.5, 0.0, 0.545, 0.0] },
+  { t: 6.0, v: [-0.5, 0.0, 0.475, -0.014] },
+  { t: 6.9, v: [-0.45, 0.0, 0.575, -0.01] },
+  { t: 8.5, v: [-0.5, 0.0, 0.515, -0.004] },
+]);
+const LANDS = [4.0, 4.5, 5.0, 5.5, 7.5];
+const DUR = 10;
+Reel.scene({
+  duration: DUR, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'ink_brush', gain: 0.6 }, { t: 0.5, sfx: 'ink_brush', gain: 0.55 },
+    { t: 1.0, sfx: 'paper_flip', gain: 0.7 },
+    { t: 1.5, sfx: 'palm_rub', gain: 0.7 }, { t: 2.0, sfx: 'palm_rub', gain: 0.65 },
+    { t: 2.5, sfx: 'paper_flip', gain: 0.6 },
+    { t: 3.54, sfx: 'flip_fast', gain: 0.5 }, { t: 4.04, sfx: 'flip_fast', gain: 0.5 }, { t: 4.54, sfx: 'flip_fast', gain: 0.5 }, { t: 5.04, sfx: 'flip_fast', gain: 0.5 },
+    { t: 4.0, sfx: 'print_beat', gain: 0.8 }, { t: 4.5, sfx: 'print_beat', gain: 0.85 }, { t: 5.0, sfx: 'print_beat', gain: 0.8 }, { t: 5.5, sfx: 'print_beat', gain: 0.85 },
+    { t: 6.6, sfx: 'paper_flip', gain: 0.6 },
+    { t: 7.06, sfx: 'paper_flip', gain: 0.5 },
+    { t: 7.5, sfx: 'gong_small', gain: 0.8 },
+  ],
+  async setup() { packTextures(drawArt()); },
+  render(t) {
+    const cv = camT(t);
+    // each colour lands with a small press: the frame dips 2-3 px and recovers in 0.12 s
+    let press = 0, wet = 0;
+    for (const L of LANDS) if (t >= L) { press += Math.exp(-(t - L) / 0.04) * 0.0028; wet = Math.max(wet, Math.exp(-(t - L) * 15)); }
+    const cam = { c: [cv[0], cv[1] - press], h: cv[2], rot: cv[3] };
+    const sheen = clamp((t - 7.55) / 0.7);
+    const ps = pageState(t);
+    // the page angle across this frame's whole shutter (180 degrees), whichever sub-frame we are
+    const tf = Math.round(t * 30) / 30, pa = pageState(tf - 0.25 / 30), pb = pageState(tf + 0.25 / 30);
+    const turning = ps.mode === 1 || ps.mode === 3;
+    const thr = turning && pa.mode === ps.mode && pb.mode === ps.mode ? [pa.c, pb.c] : [ps.c, ps.c];
+    // the key block is inked by two brush strokes 0 - 1 s (sweeping down the block)
+    const inkK = clamp(t / 1.0);
+    const inked = ps.layer === 0 ? clamp(0.1 + inkK) : 1;
+    const bA = t < 1.05 ? Math.sin(Math.PI * clamp(t / 1.05)) ** 0.5 : 0;
+    const bp = [0.5 + 0.28 * Math.sin(t * Math.PI * 2 + 0.6), 0.45 - 0.95 * clamp(t / 1.0)];
+    // the palm brush rubs the back of the sheet 1.5 - 2.45 s (two strokes, down the sheet)
+    const rubA = t > 1.45 && t < 2.5 ? Math.sin(Math.PI * clamp((t - 1.45) / 1.05)) ** 0.4 : 0;
+    const rp = [0.5 + 0.2 * Math.sin((t - 1.45) * Math.PI * 4), 0.55 - 1.06 * clamp((t - 1.45) / 1.0)];
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, texA);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texB);
+    gl.activeTexture(gl.TEXTURE0);
+    rm.set('uA', { __ints: 1, v: 4 }).set('uB', { __ints: 1, v: 5 })
+      .set('uCam', [cam.c[0], cam.c[1], cam.h, cam.rot])
+      .set('uPage', [ps.mode, ps.c, ps.r, ps.printed])
+      .set('uBlk', [ps.layer, inked, ps.layer === 0 ? ps.rub : 1, ps.wet])
+      .set('uBrush', [bp[0], bp[1], rp[0], rp[1]]).set('uBrushA', [bA * 0.95, rubA * 0.95]).set('uDbg', DBG).set('uWet', wet).set('uTh', thr).set('uSheen', t > 7.55 && t < 8.3 ? sheen : 0);
+    rm.render(t, {});
+  },
+});
+</script></body></html>

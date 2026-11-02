@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>32 低多边形 · Low Poly</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 32 低多边形 · LOW POLY =====
+   A faceted valley at dawn, built like a cut-facet sculpture: every triangle is one flat plane of colour.
+   The camera flies low up the river while the sun clears the ridge on the left; because each face takes a
+   single shadow sample, sunlight arrives face by face, a ridge at a time on the bells. At the hook the
+   valley floor ahead flips over like cards — a wave of gilded backs — and stands up into the mountain,
+   slapping down on the beat. As the camera pulls back, meadow faces flip up into the trunk of a big
+   low-poly tree and its crown pops in cluster by cluster; on the downbeat the sun breaks onto the snow. Real triangle meshes (WebGL2), per-face shadow map, aerial
+   perspective + valley mist, MSAA, bloom and filmic grade. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#aab6c4');
+Reel.ownJitter = true;
+
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float');
+const G = Reel.GL(cv);
+const R = Reel.rng(3203);
+const n2 = Reel.noise2;
+const sm = (a, b, x) => { const t = clamp((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const lin = (c) => c.map((v) => Math.pow(v, 2.2));
+
+/* ---------------- terrain ---------------- */
+function fbm(x, z) { let a = 0.5, s = 0; for (let i = 0; i < 5; i++) { s += a * n2(x, z); x = x * 2.03 + 1.7; z = z * 2.03 + 9.2; a *= 0.5; } return s; }
+const riverX = (z) => 4 * Math.sin(z * 0.045) + 2 * Math.sin(z * 0.11 + 1) + 17 * sm(30, 58, z);
+// the meadow the title stands on
+const flatW = (x, z) => sm(30, 18, Math.abs(x - 0.6 + Math.max(0, 40 - z) * 0.2)) * sm(22, 32, z) * sm(58, 51, z);
+function Hbase(x, z) {
+  const d = x - riverX(z);
+  let h = 0.02 * d * d;
+  h = Math.min(h, 13 + 5 * fbm(x * 0.05 + 3, z * 0.05)) + 4 * fbm(x * 0.07, z * 0.07) * Math.min(1, Math.abs(d) / 9);
+  h += 30 * sm(105, 150, z) * (0.55 + 0.45 * fbm(x * 0.04 + 7, z * 0.03));
+  h = lerp(h, (1.4 + 0.6 * fbm(x * 0.2, z * 0.2)) * sm(1.2, 4.5, Math.abs(d)), flatW(x, z));
+  return Math.max(h, 0);
+}
+const MZ = 86;                                     // the mountain that rises at the hook
+function Hmount(x, z) {
+  const dx = x, dz = z - MZ;
+  let m = 34 * Math.exp(-(dx * dx * 0.9 + dz * dz * 1.2) / (2 * 14 * 14));
+  m += 12 * Math.exp(-((dx + 14) ** 2 + (dz - 4) ** 2) / (2 * 8 * 8));
+  m += 10 * Math.exp(-((dx - 15) ** 2 + (dz + 1) ** 2) / (2 * 7 * 7));
+  m *= 0.8 + 0.4 * fbm(x * 0.13 + 5, z * 0.13);
+  return m * sm(49, 72, z) * (1 - flatW(x, z));
+}
+
+/* vertex layout: B(3) A(3) CB(3) CA(3) axis(3) T(2) col(3) M(2) = 22 floats */
+const FL = 22;
+const VB = [];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const crs = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const nrm = (a) => { const l = Math.hypot(...a) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const cen = (p) => [(p[0][0] + p[1][0] + p[2][0]) / 3, (p[0][1] + p[1][1] + p[2][1]) / 3, (p[0][2] + p[1][2] + p[2][2]) / 3];
+function tri(B, A, ax, t0, dur, col, mat, mode) {
+  const cb = cen(B), ca = cen(A);
+  for (let k = 0; k < 3; k++) VB.push(...B[k], ...A[k], ...cb, ...ca, ...ax, t0, dur, ...col, mat, mode);
+}
+// orient so the face normal points toward `up` (for CCW front faces)
+function orient(B, A, up) { const n = crs(sub(B[1], B[0]), sub(B[2], B[0])); if (n[0] * up[0] + n[1] * up[1] + n[2] * up[2] < 0) { [B[1], B[2]] = [B[2], B[1]]; [A[1], A[2]] = [A[2], A[1]]; } }
+
+const COL = {
+  water: lin([0.16, 0.30, 0.36]), meadow: lin([0.55, 0.66, 0.36]), grass: lin([0.43, 0.56, 0.32]), forest: lin([0.30, 0.44, 0.28]),
+  dry: lin([0.66, 0.62, 0.46]), rock: lin([0.56, 0.50, 0.45]), rock2: lin([0.46, 0.43, 0.42]), snow: lin([0.94, 0.95, 0.97]),
+};
+function faceColor(c, ny, isWater, rnd) {
+  let col;
+  if (isWater) col = COL.water;
+  else if (c[1] > 25 + rnd * 4) col = COL.snow;
+  else if (ny < 0.72) col = c[1] > 12 ? COL.rock : COL.rock2;
+  else if (c[1] < 2.2) col = COL.meadow;
+  else if (c[1] < 8) col = COL.grass;
+  else if (c[1] < 15) col = COL.forest;
+  else col = COL.dry;
+  const v = 0.9 + 0.2 * rnd;
+  return [col[0] * v, col[1] * v, col[2] * v];
+}
+function mountColor(c, ny, rnd) {
+  let col;
+  const y = c[1] + (rnd - 0.5) * 3;
+  if (y > 24) col = COL.snow;
+  else if (y < 5.5) col = ny > 0.7 ? COL.grass : COL.forest;
+  else if (y < 9) col = ny > 0.75 ? COL.forest : COL.rock2;
+  else if (y < 16) col = rnd < 0.5 ? lin([0.64, 0.55, 0.46]) : lin([0.58, 0.50, 0.44]);
+  else col = rnd < 0.5 ? lin([0.55, 0.53, 0.55]) : lin([0.62, 0.60, 0.60]);
+  const v = 0.9 + 0.2 * rnd;
+  return [col[0] * v, col[1] * v, col[2] * v];
+}
+// slant-length table of the main peak's profile (for re-spacing mountain vertices)
+const SL = (() => {
+  const R = 38, N = 760, s = [0];
+  const h = (r) => 34 * Math.exp(-(r * r) / (2 * 14 * 14));
+  for (let i = 1; i <= N; i++) { const r0 = (i - 1) * R / N, r1 = i * R / N; s.push(s[i - 1] + Math.hypot(r1 - r0, (h(r1) - h(r0)) * 1.15)); }
+  const inv = (st) => { let i = 0; while (i < N && s[i + 1] < st) i++; const u = (st - s[i]) / Math.max(1e-6, s[i + 1] - s[i]); return (i + clamp(u)) * R / N; };
+  return { R, k: s[N] / R, inv };
+})();
+const hookT = { t0: 3.75, span: 1.18, dur: 0.5 };
+const trees = [];
+function buildTerrain() {
+  const X0 = -66, X1 = 66, Z0 = -14, Z1 = 175, S = 2.5;
+  const nx = Math.round((X1 - X0) / S), nz = Math.round((Z1 - Z0) / S);
+  const P = [];
+  for (let j = 0; j <= nz; j++) for (let i = 0; i <= nx; i++) {
+    const jx = (i > 0 && i < nx) ? (R() - 0.5) * S * 0.7 : 0, jz = (j > 0 && j < nz) ? (R() - 0.5) * S * 0.7 : 0;
+    let x = X0 + i * S + jx, z = Z0 + j * S + jz;
+    // on the mountain, re-space vertices by slant length so steep faces come out near-equilateral, not long slivers
+    if (Hmount(x, z) > 0.05) {
+      const re = Math.sqrt(x * x * 0.9 + (z - MZ) ** 2 * 1.2);  // (main peak frame)
+      if (re > 0.5 && re < SL.R) {
+        const st = re * SL.k, rs = SL.inv(st);
+        const w = sm(0.05, 1.5, Hmount(x, z));
+        const f = lerp(1, rs / re, w);
+        x = x * f; z = MZ + (z - MZ) * f;
+      }
+    }
+    const hb = Hbase(x, z), hm = Hmount(x, z);
+    const dRiver = Math.abs(x - riverX(z));
+    const wet = dRiver < 3.1 && hb + hm < 1.9;
+    const wy = Math.min(hb, 0.25) + 0.05;             // wet vertices are lowered once, for every face that shares them: no cracks
+    P.push({ A: [x, wet ? wy : hb, z], B: [x, wet ? wy : hb + hm, z], hm, water: wet });
+  }
+  const at = (i, j) => P[j * (nx + 1) + i];
+  for (let j = 0; j < nz; j++) for (let i = 0; i < nx; i++) {
+    const a = at(i, j), b = at(i + 1, j), c = at(i + 1, j + 1), d = at(i, j + 1);
+    const tris = R() < 0.5 ? [[a, b, c], [a, c, d]] : [[a, b, d], [b, c, d]];
+    for (const t of tris) {
+      const B = t.map((p) => p.B.slice()), A = t.map((p) => p.A.slice());
+      orient(B, A, [0, 1, 0]);
+      const cb = cen(B), n = nrm(crs(sub(B[1], B[0]), sub(B[2], B[0])));
+      const water = t.filter((p) => p.water).length >= 2;     // two wet corners is river: keeps it one unbroken ribbon
+      const rnd = R();
+      const col = faceColor(cb, n[1], water, rnd);
+      const animated = t.some((p) => p.hm > 0.05);
+      if (animated) {
+        // a soil floor under the cards, so lifting cards never open a hole to the sky
+        { const F = A.map((p) => [p[0], p[1] - 0.3, p[2]]); tri(F, F.map((p) => p.slice()), [1, 0, 0], -1, 1, lin([0.30, 0.24, 0.20]), 0, 0); }
+        const ca = cen(A);
+        const dd = Math.hypot(ca[0] * 0.8, Math.max(0, ca[2] - 52));
+        const t0 = hookT.t0 + Math.min(1, dd / 54) * hookT.span + R() * 0.07;
+        // flip about a horizontal axis perpendicular to the direction from the wave origin
+        const dir = nrm([ca[0], 0, ca[2] - 48]);
+        const mc = mountColor(cb, n[1], rnd);
+        tri(B, A, [-dir[2], 0, dir[0]], t0, hookT.dur, mc, 0, 0);
+        if (cb[1] > 2.5 && cb[1] < 11 && n[1] > 0.6 && R() < 0.3) trees.push({ p: cb, s: 0.9 + R() * 0.7, t0: t0 + 0.45 });
+      } else {
+        tri(B, A, [1, 0, 0], -1, 1, col, water ? 1 : 0, 0);
+        const dRiver = Math.abs(cb[0] - riverX(cb[2]));
+        if (!water && dRiver > (cb[2] < 48 ? 11 : 6) && cb[1] > 1.5 && cb[1] < 16 && n[1] > 0.8 && cb[2] < 110 && R() < 0.2 && !(cb[2] > 24 && cb[2] < 66 && cb[0] > -26 && cb[0] < 18))
+          trees.push({ p: cb, s: 0.8 + R() * 0.8, t0: -1 });
+      }
+    }
+  }
+}
+// low-poly conifer: two hexagonal cones + trunk
+function buildTrees() {
+  for (const tr of trees) {
+    const [x, y, z] = tr.p, s = tr.s * 1.05, rot = R() * 6.283, sides = 5;
+    const base = [x, y - 0.2, z];
+    const g = 0.85 + R() * 0.3;
+    const foliage = lin([0.20 * g, 0.36 * g, 0.24 * g]), foliage2 = lin([0.26 * g, 0.44 * g, 0.27 * g]), bark = lin([0.36, 0.26, 0.2]);
+    const cone = (y0, r, hgt, col) => {
+      const top = [x, y0 + hgt, z];
+      for (let k = 0; k < sides; k++) {
+        const a0 = rot + (k / sides) * 6.283, a1 = rot + ((k + 1) / sides) * 6.283;
+        const p0 = [x + Math.cos(a0) * r, y0, z + Math.sin(a0) * r], p1 = [x + Math.cos(a1) * r, y0, z + Math.sin(a1) * r];
+        const B = [p0, p1, top];
+        const out = nrm([Math.cos((a0 + a1) / 2), 0.4, Math.sin((a0 + a1) / 2)]);
+        const A = [base.slice(), base.slice(), base.slice()];
+        orient(B, A, out);
+        tri(B, A, [1, 0, 0], tr.t0, 0.8, col, 2, tr.t0 >= 0 ? 1 : 0);
+      }
+    };
+    cone(y + 0.4 * s, 0.25 * s, 0.9 * s, bark);
+    cone(y + 0.7 * s, 1.0 * s, 1.9 * s, foliage);
+    cone(y + 1.6 * s, 0.72 * s, 1.6 * s, foliage2);
+  }
+}
+// low-poly clouds: flattened icosahedra
+function ico() {
+  const t = (1 + Math.sqrt(5)) / 2;
+  const v = [[-1, t, 0], [1, t, 0], [-1, -t, 0], [1, -t, 0], [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t], [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1]].map(nrm);
+  const f = [[0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11], [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8], [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9], [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1]];
+  return { v, f };
+}
+function buildClouds() {
+  const I = ico();
+  const spots = [[-52, 41, 138, 7], [-14, 55, 196, 14], [24, 46, 158, 8.5], [66, 37, 128, 6], [-78, 34, 112, 5.5], [10, 63, 232, 16], [44, 52, 205, 11], [-34, 48, 170, 9.5]];
+  for (const [cx, cy, cz, sc] of spots) {
+    const nb = 2 + Math.floor(R() * 3);
+    for (let b = 0; b < nb; b++) {
+      const ox = (b - (nb - 1) / 2) * sc * 0.7 + (R() - 0.5) * sc * 0.5, oy = (R() - 0.3) * sc * 0.3, r = sc * (0.5 + R() * 0.45);
+      for (const fc of I.f) {
+        const B = fc.map((k) => [cx + ox + I.v[k][0] * r, cy + oy + I.v[k][1] * r * 0.45, cz + I.v[k][2] * r * 0.6]);
+        const c = cen(B); const out = nrm(sub(c, [cx + ox, cy + oy, cz]));
+        const A = B.map((p) => p.slice()); orient(B, A, out);
+        const v = 0.93 + R() * 0.07;
+        tri(B, A, [1, 0, 0], -1, 1, lin([v, v * 0.97, v * 0.96]), 3, 2);
+      }
+    }
+  }
+}
+
+/* ---------------- the hero tree: meadow faces flip up into the trunk, crown clusters pop on the beat ---------------- */
+const HT = { x: 5.2, z: 44, h: 6.2 };
+function buildHeroTree() {
+  const gy = Hbase(HT.x, HT.z) - 0.1;
+  const toFlat = (p, k) => {                 // where a trunk card lies before it stands up: on the meadow, toward the camera
+    const dx = p[0] - HT.x, dz = p[2] - HT.z, up = p[1] - gy;
+    return [HT.x + dx * 1.2 + (k % 2 ? 0.6 : -0.6), gy + 0.05, HT.z - 2.2 - up * 0.75 + dz * 0.4];
+  };
+  const bark = lin([0.40, 0.29, 0.21]), bark2 = lin([0.33, 0.23, 0.17]);
+  // a 5-sided tapering trunk with a gentle lean, and two forked limbs into the crown
+  const prism = (b0, b1, r0, r1, sides, rot, t0, cA, cB) => {
+    for (let k = 0; k < sides; k++) {
+      const a0 = rot + (k / sides) * 6.283, a1 = rot + ((k + 1) / sides) * 6.283;
+      const P0 = [b0[0] + Math.cos(a0) * r0, b0[1], b0[2] + Math.sin(a0) * r0], P1 = [b0[0] + Math.cos(a1) * r0, b0[1], b0[2] + Math.sin(a1) * r0];
+      const Q0 = [b1[0] + Math.cos(a0) * r1, b1[1], b1[2] + Math.sin(a0) * r1], Q1 = [b1[0] + Math.cos(a1) * r1, b1[1], b1[2] + Math.sin(a1) * r1];
+      const out = nrm([Math.cos((a0 + a1) / 2), 0, Math.sin((a0 + a1) / 2)]);
+      for (const [T, j] of [[[P0, P1, Q1], 0], [[P0, Q1, Q0], 1]]) {
+        const Bv = T.map((q) => q.slice()), Av = T.map((q, i) => toFlat(q, k + j + i));
+        orient(Bv, Av, out);
+        tri(Bv, Av, nrm([-out[2], 0, out[0]]), t0 + 0.035 * k + 0.02 * j, 0.42, (k + j) % 2 ? bark : bark2, 4, 3);
+      }
+    }
+  };
+  const top = [HT.x + 0.35, gy + HT.h, HT.z + 0.2];
+  prism([HT.x, gy, HT.z], top, 0.95, 0.5, 5, 0.3, 6.5, bark, bark2);
+  const L1 = [HT.x + 2.6, gy + HT.h + 2.4, HT.z + 0.6], L2 = [HT.x - 2.1, gy + HT.h + 2.0, HT.z - 0.4];
+  prism(top, L1, 0.48, 0.24, 4, 0.8, 6.6, bark, bark2);
+  prism(top, L2, 0.45, 0.22, 4, 1.4, 6.65, bark, bark2);
+  // crown: four jittered icosahedra, one per beat
+  const I = ico();
+  const CL = [
+    { c: [HT.x + 0.3, gy + HT.h + 3.6, HT.z + 0.4], r: 3.9, t0: 7.0 },
+    { c: [HT.x + 3.6, gy + HT.h + 2.6, HT.z + 1.0], r: 2.9, t0: 7.25 },
+    { c: [HT.x - 3.1, gy + HT.h + 2.2, HT.z - 0.6], r: 2.8, t0: 7.5 },
+    { c: [HT.x + 0.9, gy + HT.h + 6.3, HT.z - 0.4], r: 2.6, t0: 7.75 },
+  ];
+  for (const cl of CL) {
+    const jv = I.v.map((v) => { const k = 0.82 + R() * 0.32; return [v[0] * k, v[1] * k * 0.86, v[2] * k]; });
+    for (const fc of I.f) {
+      const Bv = fc.map((k) => [cl.c[0] + jv[k][0] * cl.r, cl.c[1] + jv[k][1] * cl.r, cl.c[2] + jv[k][2] * cl.r]);
+      const out = nrm(sub(cen(Bv), cl.c));
+      const Av = [cl.c.slice(), cl.c.slice(), cl.c.slice()];
+      orient(Bv, Av, out);
+      const g = 0.86 + R() * 0.28;
+      const col = R() < 0.5 ? lin([0.36 * g, 0.55 * g, 0.24 * g]) : lin([0.44 * g, 0.62 * g, 0.26 * g]);
+      tri(Bv, Av, [1, 0, 0], cl.t0, 0.75, col, 2, 1);
+    }
+  }
+}
+
+/* ---------------- GL programs ---------------- */
+const VS = `#version 300 es
+precision highp float;
+in vec3 aB, aA, aCB, aCA, aAx; in vec2 aT; in vec3 aCol; in vec2 aM;
+uniform mat4 uVP; uniform float uTime; uniform vec3 uDrift;
+out vec3 vW; flat out vec3 vC; flat out vec3 vCol; flat out float vMat; flat out float vS;
+vec3 rotA(vec3 v, vec3 k, float a){ float c = cos(a), s = sin(a); return v*c + cross(k, v)*s + k*dot(k, v)*(1. - c); }
+void main(){
+  vec3 pos = aB, cen = aCB; float s = 1.;
+  if (aT.x >= 0.) {
+    s = clamp((uTime - aT.x)/aT.y, 0., 1.);
+    float e = 1. + 2.6*pow(s - 1., 3.) + 1.6*pow(s - 1., 2.);           // back-ease: over by ~7 degrees, then slaps flat
+    if (aM.y < .5 || aM.y > 2.5) {                      // card flip (3 = flip that pops out of the ground)
+      vec3 oA = aA - aCA, oB = aB - aCB;
+      vec3 o = rotA(mix(rotA(oA, aAx, 3.14159265), oB, e), aAx, 3.14159265*(1. - e));
+      if (aM.y > 2.5) o *= clamp(s*5., 0., 1.);
+      cen = mix(aCA, aCB, min(e, 1.)) + vec3(0., (1.6 + .3*length(aCB - aCA))*sin(3.14159265*min(e, 1.)), 0.);
+      pos = cen + o;
+    } else {                                            // grow from the base point (trees)
+      float g = s <= 0. ? 0. : (s >= 1. ? 1. : 1. - exp(-6.*s)*cos(9.*s));
+      pos = aA + (aB - aA)*g; cen = aA + (aCB - aA)*g;
+    }
+  }
+  if (aM.y > 1.5 && aM.y < 2.5) { pos += uDrift; cen += uDrift; }
+  vW = pos; vC = cen; vCol = aCol; vMat = aM.x; vS = s;
+  gl_Position = uVP*vec4(pos, 1.);
+}`;
+const SKYF = `
+uniform vec3 uSun, uSunCol, uZen, uHor, uHorS;
+vec3 skyCol(vec3 rd){
+  float sd = dot(rd, uSun);
+  vec3 hor = mix(uHor, uHorS, pow(clamp(sd*.5 + .5, 0., 1.), 4.));
+  vec3 c = mix(hor, uZen, smoothstep(-.03, .5, rd.y));
+  c += uSunCol*pow(max(sd, 0.), 9.)*.35*smoothstep(-.1, .1, rd.y);
+  return c;
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 vW; flat in vec3 vC; flat in vec3 vCol; flat in float vMat; flat in float vS;
+uniform vec3 uCam; uniform mat4 uLVP; uniform sampler2D uShadow; uniform float uTime, uSunI, uDbg, uAmb;
+float hashF(vec3 p){ p = fract(p*.3183099 + .1); p *= 17.; return fract(p.x*p.y*p.z*(p.x + p.y + p.z)); }
+out vec4 o;
+${SKYF}
+float hash(vec3 p){ p = fract(p*.3183099 + .1); p *= 17.; return fract(p.x*p.y*p.z*(p.x + p.y + p.z)); }
+float shadowAt(vec3 p, vec3 n){
+  vec4 l = uLVP*vec4(p + n*.25 + uSun*.15, 1.); vec3 q = l.xyz/l.w*.5 + .5;
+  if (q.x < 0. || q.x > 1. || q.y < 0. || q.y > 1.) return 1.;
+  vec2 px = 1./vec2(textureSize(uShadow, 0)); float s = 0.;
+  for (int i=-1;i<=1;i++) for (int j=-1;j<=1;j++) s += q.z - .0008 > texture(uShadow, q.xy + vec2(i, j)*px*1.5).r ? 0. : 1.;
+  return s/9.;
+}
+void main(){
+  vec3 n = normalize(cross(dFdx(vW), dFdy(vW)));
+  vec3 V = normalize(uCam - vW);
+  if (dot(n, V) < 0.) n = -n;
+  bool back = !gl_FrontFacing;
+  vec3 alb = vCol;
+  if (back && vMat != 2.) alb = vec3(1., .66, .26);
+  float ndl = max(dot(n, uSun), 0.);
+  float sh = ndl > 0. ? shadowAt(vC, n) : 0.;
+  // the summit sits under a cloud shadow until the downbeat, then the sun breaks onto it face by face
+  float summit = smoothstep(20., 26., vC.y)*step(60., vC.z);
+  float tOn = 8.0 + .07*hashF(vC*1.7);
+  float lit = smoothstep(tOn, tOn + .034, uTime);
+  sh *= mix(1., mix(.1, 1., lit), summit);
+  float glint = summit*lit*exp(-max(uTime - tOn, 0.)*7.)*1.4;
+  vec3 amb = mix(vec3(.10, .10, .15), vec3(.20, .28, .50), n.y*.5 + .5)*uAmb;
+  vec3 col = alb*(uSunCol*uSunI*ndl*sh + amb) + vec3(1., .62, .32)*glint*max(ndl, .3);
+  if (uDbg > .5) { o = vec4(uDbg < 1.5 ? vec3(sh) : vec3(ndl), 1.); return; }
+  if (back && vMat != 2.) col += vec3(1., .68, .3)*(.45 + 2.2*pow(max(dot(reflect(-uSun, n), V), 0.), 5.))*sin(3.14159*vS);
+  if (vMat == 1.) {                                   // faceted river: sky reflection + sun glints per face
+    n = normalize(mix(n, vec3(0., 1., 0.), .8));
+    vec3 r = reflect(-V, n);
+    float fr = .08 + .92*pow(1. - max(dot(n, V), 0.), 4.);
+    col = mix(alb*amb*.6, skyCol(normalize(vec3(r.x, abs(r.y), r.z))), fr) + uSunCol*uSunI*pow(max(dot(r, uSun), 0.), 80.)*sh*6.;
+  }
+  if (vMat == 4.) {                                   // letters: painted, faint gloss
+    vec3 r = reflect(-uSun, n);
+    col += uSunCol*uSunI*.35*pow(max(dot(r, V), 0.), 24.)*sh;
+  }
+  // aerial perspective + valley mist
+  float d = length(vW - uCam);
+  vec3 rd = (vW - uCam)/d;
+  float fa = (1. - exp(-d*.0042))*.92;
+  float mistN = .6 + .4*sin(vW.x*.09 + uTime*.25)*sin(vW.z*.07 - uTime*.18);
+  float mist = exp(-max(vW.y - .2, 0.)/1.5)*mistN*smoothstep(25., 90., d);
+  fa = clamp(fa + mist*.45*(1. - fa), 0., 1.);
+  vec3 fogC = skyCol(normalize(vec3(rd.x, max(rd.y, .0) + .02, rd.z)))*.95 + uSunCol*uSunI*.06;
+  col = mix(col, fogC, fa*(vMat == 3. ? .7 : 1.));
+  o = vec4(col, 1.);
+}`;
+const SHV = `#version 300 es
+precision highp float;
+in vec3 aB, aA, aCB, aCA, aAx; in vec2 aT; in vec3 aCol; in vec2 aM;
+uniform mat4 uVP; uniform float uTime; uniform vec3 uDrift;
+vec3 rotA(vec3 v, vec3 k, float a){ float c = cos(a), s = sin(a); return v*c + cross(k, v)*s + k*dot(k, v)*(1. - c); }
+void main(){
+  vec3 pos = aB;
+  if (aT.x >= 0.) {
+    float s = clamp((uTime - aT.x)/aT.y, 0., 1.), e = 1. + 2.6*pow(s - 1., 3.) + 1.6*pow(s - 1., 2.);
+    if (aM.y < .5 || aM.y > 2.5) {
+      vec3 oA = aA - aCA, oB = aB - aCB;
+      vec3 o = rotA(mix(rotA(oA, aAx, 3.14159265), oB, e), aAx, 3.14159265*(1. - e));
+      if (aM.y > 2.5) o *= clamp(s*5., 0., 1.);
+      pos = mix(aCA, aCB, min(e, 1.)) + vec3(0., (1.6 + .3*length(aCB - aCA))*sin(3.14159265*min(e, 1.)), 0.) + o;
+    } else { float g = s <= 0. ? 0. : (s >= 1. ? 1. : 1. - exp(-6.*s)*cos(9.*s)); pos = aA + (aB - aA)*g; }
+  }
+  if (aM.y > 1.5 && aM.y < 2.5) pos += uDrift;
+  gl_Position = uVP*vec4(pos, 1.);
+}`;
+const SHF = `#version 300 es
+precision highp float; out vec4 o; void main(){ o = vec4(1.); }`;
+function compile(vs, fs, attribs) {
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw gl.getShaderInfoLog(s); } return s; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  attribs.forEach((a, i) => gl.bindAttribLocation(p, i, a));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p);
+  const loc = {}; const u = (n) => (loc[n] === undefined ? (loc[n] = gl.getUniformLocation(p, n)) : loc[n]);
+  return { p, u };
+}
+const ATTR = ['aB', 'aA', 'aCB', 'aCA', 'aAx', 'aT', 'aCol', 'aM'], SIZES = [3, 3, 3, 3, 3, 2, 3, 2];
+let progM, progS, vao, nVerts, shadowFB, shadowTex, msFB, sceneT, sceneFB;
+const SHD = 4096;
+const HD = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+`;
+const skyP = G.program(HD + `uniform vec3 uCR, uCU, uCF; uniform float uTan, uAsp;
+${SKYF}
+void main(){
+  vec2 p = uv*2. - 1.;
+  vec3 rd = normalize(uCF + uCR*p.x*uTan*uAsp + uCU*p.y*uTan);
+  vec3 c = skyCol(rd);
+  float sd = dot(rd, uSun);
+  c += uSunCol*smoothstep(.99955, .99975, sd)*30.;       // the disc
+  c += uSunCol*pow(max(sd, 0.), 120.)*1.5;
+  o = vec4(c, 1.);
+}`);
+const dw = W / 4 | 0, dh = H / 4 | 0;
+const BA = G.target(dw, dh, { float: true }), BB = G.target(dw, dh, { float: true }), BA2 = G.target(dw / 2 | 0, dh / 2 | 0, { float: true }), BB2 = G.target(dw / 2 | 0, dh / 2 | 0, { float: true });
+const brightP = G.program(HD + `uniform sampler2D s; uniform vec2 px; uniform float th;
+void main(){ vec3 c = vec3(0.); for (int i=-1;i<=1;i++) for (int j=-1;j<=1;j++) c += texture(s, uv + vec2(i, j)*px).rgb; c /= 9.;
+  float l = max(c.r, max(c.g, c.b)); o = vec4(c*smoothstep(th, th*1.8, l), 1.); }`);
+const blurP = G.program(HD + `uniform sampler2D s; uniform vec2 dir;
+void main(){ vec3 c = texture(s, uv).rgb*.227;
+  c += (texture(s, uv + dir*1.3846).rgb + texture(s, uv - dir*1.3846).rgb)*.3162; c += (texture(s, uv + dir*3.2308).rgb + texture(s, uv - dir*3.2308).rgb)*.0703; o = vec4(c, 1.); }`);
+const compP = G.program(HD + `uniform sampler2D s, b1, b2; uniform float expo, frame, bloom; uniform vec2 res;
+float h12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+vec3 aces(vec3 x){ return clamp((x*(2.51*x + .03))/(x*(2.43*x + .59) + .14), 0., 1.); }
+void main(){
+  vec2 d = uv - .5; float k = .8/res.x;
+  vec3 c = vec3(texture(s, uv - d*k*2.).r, texture(s, uv).g, texture(s, uv + d*k*2.).b);
+  c += (texture(b1, uv).rgb*.5 + texture(b2, uv).rgb*.8)*bloom;
+  c = aces(c*expo);
+  c = pow(c, vec3(1./2.2));
+  float l = dot(c, vec3(.2126, .7152, .0722));
+  c = mix(vec3(l), c, 1.12);
+  c = (c - .5)*1.06 + .5;
+  c += vec3(.012, .004, -.01)*smoothstep(.4, 1., l) + vec3(-.006, 0., .012)*(1. - smoothstep(0., .4, l));
+  c *= 1. - .32*smoothstep(.35, 1.05, length(d*vec2(1.3, 1.)));
+  c += (h12(gl_FragCoord.xy + frame*17.3) - .5)*.035;
+  o = vec4(clamp(c, 0., 1.), 1.);
+}`);
+
+function setupGL() {
+  progM = compile(VS, FS, ATTR); progS = compile(SHV, SHF, ATTR);
+  const data = new Float32Array(VB); nVerts = data.length / FL;
+  vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  let off = 0;
+  SIZES.forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, FL * 4, off * 4); off += n; });
+  gl.bindVertexArray(null);
+  // shadow map
+  shadowTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, shadowTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT32F, SHD, SHD, 0, gl.DEPTH_COMPONENT, gl.FLOAT, null);
+  for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+  shadowFB = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, shadowTex, 0);
+  gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE);
+  // MSAA scene buffer -> resolved float texture
+  msFB = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, msFB);
+  const cRB = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, cRB); gl.renderbufferStorageMultisample(gl.RENDERBUFFER, 4, gl.RGBA16F, W, H);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, cRB);
+  const dRB = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, dRB); gl.renderbufferStorageMultisample(gl.RENDERBUFFER, 4, gl.DEPTH_COMPONENT24, W, H);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, dRB);
+  sceneT = G.target(W, H, { float: true });
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+/* ---------------- matrices ---------------- */
+const M4 = {
+  persp(fy, asp, n, f) { const t = 1 / Math.tan(fy / 2); return [t / asp, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, (2 * f * n) / (n - f), 0]; },
+  ortho(l, r, b, t, n, f) { return [2 / (r - l), 0, 0, 0, 0, 2 / (t - b), 0, 0, 0, 0, -2 / (f - n), 0, -(r + l) / (r - l), -(t + b) / (t - b), -(f + n) / (f - n), 1]; },
+  look(e, a, up) {
+    const z = nrm(sub(e, a)), x = nrm(crs(up, z)), y = crs(z, x);
+    return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -(x[0] * e[0] + x[1] * e[1] + x[2] * e[2]), -(y[0] * e[0] + y[1] * e[1] + y[2] * e[2]), -(z[0] * e[0] + z[1] * e[1] + z[2] * e[2]), 1];
+  },
+  mul(a, b) { const o = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; },
+};
+
+/* ---------------- camera + sun ---------------- */
+const cr1 = (p0, p1, p2, p3, u) => { const u2 = u * u, u3 = u2 * u; return 0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3); };
+function keyed(K, t, fields) {
+  let i = 0; while (i < K.length - 2 && t > K[i + 1].t) i++;
+  const k0 = K[Math.max(0, i - 1)], k1 = K[i], k2 = K[i + 1], k3 = K[Math.min(K.length - 1, i + 2)];
+  const u = (k2.e || E.inOutSine)(clamp((t - k1.t) / (k2.t - k1.t)));
+  const o = {}; for (const f of fields) o[f] = Array.isArray(k1[f]) ? k1[f].map((_, j) => cr1(k0[f][j], k1[f][j], k2[f][j], k3[f][j], u)) : cr1(k0[f], k1[f], k2[f], k3[f], u);
+  return o;
+}
+const CAMP = Track([
+  { t: 0.0, v: [-3.0, 8.5, -8.0] },
+  { t: 2.0, v: [-1.2, 8.8, 6.0] },
+  { t: 3.9, v: [1.2, 9.4, 24.0] },
+  { t: 5.6, v: [2.6, 10.0, 31.0] },
+  { t: 7.8, v: [-5.5, 6.4, 13.5] },
+  { t: 10.0, v: [-5.2, 6.3, 15.4] },
+], { easeIn: true, easeOut: true });
+const CAMA = Track([
+  { t: 0.0, v: [2.0, 4.6, 30.0] },
+  { t: 2.0, v: [2.5, 5.0, 45.0] },
+  { t: 3.9, v: [0.5, 8.5, 70.0] },
+  { t: 5.6, v: [0.0, 19.5, 84.0] },
+  { t: 7.8, v: [0.4, 17.2, 80.0] },
+  { t: 10.0, v: [0.4, 17.2, 80.0] },
+], { easeIn: true, easeOut: true });
+const CAMF = Track([{ t: 0, v: [46, 0.03] }, { t: 2, v: [46, -0.02] }, { t: 3.9, v: [46, 0.0] }, { t: 5.6, v: [50, -0.015] }, { t: 7.8, v: [47, 0.0] }, { t: 10, v: [46, 0.0] }]);
+function sunAt(t) {
+  // the sun climbs in three quick steps on the bells (1, 2, 3 s), each one lighting another row of ridges
+  const step = (a) => E.outCubic(clamp((t - a) / 0.15));
+  const el = (-1.2 + 2.9 * (step(1) + step(2) + step(3)) + 2.0 * clamp(t / 4) + 12 * E.outCubic(clamp((t - 4) / 6))) * Math.PI / 180;
+  const az = 0.62;
+  return nrm([-Math.cos(el) * Math.cos(az), Math.sin(el), -Math.cos(el) * Math.sin(az)]);
+}
+
+const DUR = 10;
+Reel.scene({
+  duration: DUR, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'wind_dawn', gain: 0.7 },
+    { t: 1.0, sfx: 'facet_chime', gain: 0.4 },
+    { t: 2.0, sfx: 'facet_chime', gain: 0.4 },
+    { t: 3.0, sfx: 'facet_chime', gain: 0.4 },
+    { t: 3.0, sfx: 'riser_short', gain: 0.35 },
+    { t: 3.75, sfx: 'card_wave', gain: 0.85 },
+    { t: 4.5, sfx: 'impact', gain: 0.7 },
+    { t: 5.0, sfx: 'card_wave', gain: 0.4 },
+    { t: 5.5, sfx: 'mountain_land', gain: 0.8 },
+    { t: 6.5, sfx: 'card_wave', gain: 0.5 },
+    { t: 7.0, sfx: 'leaf_pop', gain: 0.7 }, { t: 7.25, sfx: 'leaf_pop', gain: 0.6 }, { t: 7.5, sfx: 'leaf_pop', gain: 0.65 }, { t: 7.75, sfx: 'leaf_pop', gain: 0.6 },
+    { t: 8.0, sfx: 'facet_lock', gain: 0.85 },
+  ],
+  async setup() {
+    buildTerrain(); buildTrees(); buildClouds();
+    buildHeroTree();
+    setupGL();
+  },
+  render(t) {
+    const cf = CAMF(t), cam = { p: CAMP(t), a: CAMA(t), fov: cf[0], roll: cf[1] };
+    // gentle aerial float
+    const ro = [cam.p[0] + 0.12 * Math.sin(t * 0.7), cam.p[1] + 0.1 * Math.sin(t * 1.1 + 1), cam.p[2]];
+    const sun = sunAt(t);
+    const warm = 1 - clamp(t / 10), kS = 0.55 + 0.12 * (E.outCubic(clamp((t - 1) / 0.15)) + E.outCubic(clamp((t - 2) / 0.15)) + E.outCubic(clamp((t - 3) / 0.15))) + 0.09 * clamp((t - 3) / 3);
+    const sunCol = [3.0 * kS, (2.05 - 0.55 * warm) * kS, (1.35 - 0.6 * warm) * kS];
+    const up = [Math.sin(cam.roll), Math.cos(cam.roll), 0];
+    const V = M4.look(ro, cam.a, up);
+    const fy = cam.fov * Math.PI / 180;
+    const P = M4.persp(fy, W / H, 0.5, 600);
+    const jit = Reel.jit || [0, 0];
+    P[8] -= 2 * jit[0] / W; P[9] += 2 * jit[1] / H;
+    const VP = M4.mul(P, V);
+    // sun shadow camera
+    const ctr = [0, 8, 70];
+    const LV = M4.look([ctr[0] + sun[0] * 150, ctr[1] + sun[1] * 150, ctr[2] + sun[2] * 150], ctr, [0, 1, 0]);
+    const LP = M4.ortho(-100, 100, -100, 100, 1, 320);
+    const LVP = M4.mul(LP, LV);
+    const drift = [t * 0.6, 0, 0];
+    gl.bindVertexArray(vao);
+    gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+    // 1. shadow pass
+    gl.bindFramebuffer(gl.FRAMEBUFFER, shadowFB); gl.viewport(0, 0, SHD, SHD);
+    gl.clear(gl.DEPTH_BUFFER_BIT);
+    gl.useProgram(progS.p);
+    gl.uniformMatrix4fv(progS.u('uVP'), false, LVP); gl.uniform1f(progS.u('uTime'), t); gl.uniform3fv(progS.u('uDrift'), drift);
+    gl.drawArrays(gl.TRIANGLES, 0, nVerts);
+    // 2. sky into the MSAA buffer
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msFB); gl.viewport(0, 0, W, H);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.disable(gl.DEPTH_TEST);
+    const fwd = nrm(sub(cam.a, ro)), rgt = nrm(crs(fwd, up)), cup = crs(rgt, fwd);
+    const dawn = clamp(t / 9);
+    const skyU = { uSun: sun, uSunCol: sunCol, uZen: lin([lerp(0.30, 0.38, dawn), lerp(0.42, 0.55, dawn), lerp(0.66, 0.80, dawn)]), uHor: lin([lerp(0.80, 0.80, dawn), lerp(0.74, 0.80, dawn), lerp(0.74, 0.84, dawn)]), uHorS: lin([1.0, lerp(0.70, 0.80, dawn), lerp(0.46, 0.62, dawn)]) };
+    skyP.use(); for (const k in skyU) skyP.set(k, skyU[k]);
+    skyP.set('uCR', rgt).set('uCU', cup).set('uCF', fwd).set('uTan', Math.tan(fy / 2)).set('uAsp', W / H);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msFB);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+    skyP.draw({ fb: msFB, w: W, h: H });
+    // 3. meshes
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+    gl.bindVertexArray(vao);
+    gl.useProgram(progM.p);
+    gl.uniformMatrix4fv(progM.u('uVP'), false, VP); gl.uniformMatrix4fv(progM.u('uLVP'), false, LVP);
+    gl.uniform1f(progM.u('uTime'), t); gl.uniform3fv(progM.u('uDrift'), drift); gl.uniform3fv(progM.u('uCam'), ro);
+    for (const k in skyU) gl.uniform3fv(progM.u(k), skyU[k]);
+    gl.uniform1f(progM.u('uSunI'), 1.0); gl.uniform1f(progM.u('uDbg'), +(Reel.Q.get('dbg') || 0)); gl.uniform1f(progM.u('uAmb'), 0.8 + 0.5 * clamp(t / 8));
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, shadowTex); gl.uniform1i(progM.u('uShadow'), 5);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.drawArrays(gl.TRIANGLES, 0, nVerts);
+    gl.bindVertexArray(null);
+    // 4. resolve + post
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msFB); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, sceneT.fb);
+    gl.blitFramebuffer(0, 0, W, H, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    gl.disable(gl.DEPTH_TEST);
+    brightP.use().set('s', { tex: sceneT.tex, unit: 0 }).set('px', [1 / W, 1 / H]).set('th', 1.5).draw(BA);
+    blurP.use().set('s', { tex: BA.tex, unit: 0 }).set('dir', [1 / dw, 0]).draw(BB);
+    blurP.use().set('s', { tex: BB.tex, unit: 0 }).set('dir', [0, 1 / dh]).draw(BA);
+    blurP.use().set('s', { tex: BA.tex, unit: 0 }).set('dir', [2 / dw, 0]).draw(BB2);
+    blurP.use().set('s', { tex: BB2.tex, unit: 0 }).set('dir', [0, 2 / dh]).draw(BA2);
+    compP.use().set('s', { tex: sceneT.tex, unit: 0 }).set('b1', { tex: BA.tex, unit: 1 }).set('b2', { tex: BA2.tex, unit: 2 })
+      .set('expo', 0.92).set('frame', Math.floor(t * 30)).set('bloom', 0.35).set('res', [W, H]).draw(null);
+    gl.finish();
+  },
+});
+</script></body></html>

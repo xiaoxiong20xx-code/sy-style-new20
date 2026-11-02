@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>31 建筑投影秀 · Projection Mapping</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 31 建筑投影秀 · PROJECTION MAPPING =====
+   A night square. A neoclassical facade (of our own design: portico of six columns, pediment, two arcaded
+   wings) is the screen. Projectors on a tower behind the crowd paint it: a scan line draws the architecture,
+   colour fills land on the beat, the wall breaks into blocks that push in and out, the columns run with water,
+   windows light up on the eighths; at the hook the whole wall leans out over the audience (a black gap opens
+   under the cornice, the base cracks and sheds dust), crumbles toward the crowd, and slams back. A two-colour
+   section chases light along the mouldings; the finale crowns the building bay by bay on the eighths — wings,
+   portico, pediment — and a run of light climbs the architecture into a projected sun emblem.
+   Everything is lit BY the projector: the content is computed in projector space, so it bends over the relief,
+   the columns throw projector shadows, beams show in the haze, and the crowd + raised phones sit in front, out of focus. */
+const { E, clamp, inv, lerp } = Reel;
+// ★ 改光色改这里：着色器里的 LIGHT_COL（搜 LIGHT_COL）。它乘在整场投影机的光（墙面、雾里的光柱、湿地面倒影、人群轮廓光、手机屏）上。
+//   vec3(1.) = 原样（和成片一模一样）；更暖例如 vec3(1.1, .95, .8)；想换某一段画面的颜色，改 content() 里那一段的色值。只想换物体/纸/颜料的颜色是“配色”，不是光，见 SKILL 的对照表。
+const stage = Reel.makeStage('#020208');
+Reel.ownJitter = true;
+
+const TXW = 2048, TXH = 1024;     // title texture: facade elevation u in [-24,24], v in [0,24]
+
+const rm = Reel.RM(stage, {
+  bloom: 0.55, th: 0.9, expo: 1.0, vig: 0.4, grain: 0.035, ca: 0.6, contrast: 1.05, sat: 1.08, bands: 8,
+  uniforms: `
+uniform sampler2D uTx;
+uniform vec3 uRo, uTa; uniform float uF, uRoll;
+uniform float uT, uTilt, uVoid, uFlash, uDbg, uGap, uCrack;
+uniform vec3 uPj;`,
+  scene: `
+// ---------------- the building (metres; front wall plane z = 0, building extends to +z; camera at -z) ----------------
+const float CZ = -3.;                       // column centre line
+float sdBox2(vec2 p, vec2 b){ vec2 q = abs(p) - b; return length(max(q, 0.)) + min(max(q.x, q.y), 0.); }
+float colR(float y){ return mix(.78, .64, clamp((y - 1.6)/12.6, 0., 1.)); }
+// material: 0 limestone wall, 1 column, 2 window glass/void, 3 ground, 4 dark door
+vec2 bld(vec3 p){
+  float d = 1e3, m = 0.;
+  // main mass
+  float wall = sdBox(p - vec3(0., 8.5, 10.), vec3(24., 8.5, 10.));
+  // windows on the wings (arched, recessed), two floors
+  float ax = abs(p.x);
+  float wx = ax - (11.6 + 4.*clamp(floor((ax - 9.6)/4.), 0., 2.));
+  if (ax > 9.6 && ax < 22.) {
+    vec2 q = vec2(wx, p.y - 5.);
+    float arch = min(sdBox2(q - vec2(0., -.6), vec2(1., 1.9)), length(q - vec2(0., 1.3)) - 1.);
+    float win1 = max(arch, abs(p.z - .25) - .5);
+    float win2 = sdBox(vec3(wx, p.y - 11.6, p.z - .25), vec3(.95, 1.5, .5));
+    wall = max(wall, -min(win1, win2));
+  }
+  // portico recess + central door
+  if (ax < 9.) {
+    float door = max(min(sdBox2(vec2(p.x, p.y - 4.2), vec2(1.6, 2.6)), length(vec2(p.x, p.y - 6.8) ) - 1.6), abs(p.z - .3) - .6);
+    float pw = sdBox(vec3(abs(p.x) - 5.2, p.y - 6.2, p.z - .2), vec3(.9, 1.7, .45));
+    wall = max(wall, -min(door, pw));
+  }
+  d = wall;
+  // pilasters + string course + plinth on the wings
+  float pil = sdBox(vec3(ax - (9.6 + 4.*clamp(floor((ax - 7.6)/4.), 0., 3.)), p.y - 8.2, p.z + .12), vec3(.42, 6.6, .14));
+  pil = ax > 9.2 ? pil : 1e3;
+  float sc = sdBox(vec3(p.x, p.y - 8.9, p.z + .15), vec3(24., .28, .17));
+  float plinth = sdBox(vec3(p.x, p.y - .8, p.z + .25), vec3(24.2, .8, .27));
+  d = min(d, min(pil, min(sc, plinth)));
+  // entablature across the whole front, deeper over the portico
+  float porti = ax < 9.4 ? 1. : 0.;
+  float zf = porti > .5 ? -3.8 : -.2;
+  float arch_ = sdBox(vec3(p.x, p.y - 14.6, p.z - (zf + .25 + 10.)*.0 - (zf*.5 + .1)), vec3(porti > .5 ? 9.4 : 24., .4, abs(zf*.5) + .25));
+  float frieze = sdBox(vec3(p.x, p.y - 15.6, p.z - zf*.5 - .1), vec3(porti > .5 ? 9.4 : 24., .6, abs(zf*.5) + .1));
+  float corn = sdBox(vec3(p.x, p.y - 16.6, p.z - zf*.5 + .3), vec3(porti > .5 ? 9.8 : 24.4, .4 - max(0., (p.z - zf*.5 + .3))*.0, abs(zf*.5) + .6));
+  d = min(d, min(arch_, min(frieze, corn)));
+  // pediment
+  vec2 pq = vec2(ax, p.y - 17.);
+  float tri = max(max(-pq.y, pq.y - 5.5 + ax*(5.5/9.6)), abs(p.z + 3.3) - .5);
+  float trirec = max(max(-(pq.y - .55), pq.y - 4.7 + ax*(4.7/8.4)), abs(p.z + 3.6) - .25);
+  d = min(d, max(tri, -trirec));
+  // balustrade on the wing roofs
+  float bal = sdBox(vec3(p.x, p.y - 17.6, p.z + .1), vec3(24., .6, .2));
+  float bars = abs(fract(p.x*2.2) - .5) - .3;
+  bal = max(bal, -max(bars, abs(p.y - 17.55) - .38));
+  if (ax > 9.8) d = min(d, bal);
+  // steps in front of the portico
+  float st = 1e3;
+  for (int i=0;i<5;i++){ float fi = float(i); float fr = -6.1 + fi*.42; st = min(st, sdBox(vec3(p.x, p.y - (fi + 1.)*.16, p.z - (fr - 2.)*.5), vec3(9.6 + (4. - fi)*.15, (fi + 1.)*.16, (-2. - fr)*.5))); }
+  st = min(st, sdBox(vec3(p.x, p.y - .8, p.z + 2.3), vec3(9.6, .8, 2.)));
+  d = min(d, st);
+  // columns: fluted shafts with bases and capitals
+  float cx = (floor((p.x + 9.6)/3.2) )*3.2 - 9.6 + 1.6;
+  cx = clamp(cx, -8., 8.);
+  vec3 cp = p - vec3(cx, 0., CZ);
+  float r = colR(p.y);
+  float ang = atan(cp.z, cp.x);
+  float flute = .035*smoothstep(.2, .9, abs(sin(ang*12.)));
+  float shaft = max(length(cp.xz) - r + flute, max(1.6 - p.y, p.y - 14.2));
+  float base = max(length(cp.xz) - .98, abs(p.y - 1.85) - .25);
+  float cap = max(length(cp.xz) - .92, abs(p.y - 13.95) - .25);
+  float abac = sdBox(cp - vec3(0., 14.1, 0.), vec3(.98, .12, .98));
+  float col = min(min(shaft, base), min(cap, abac));
+  if (col < d) { d = col; m = 1.; }
+  return vec2(d, m);
+}
+vec2 map(vec3 p){
+  vec2 b = bld(p);
+  float g = p.y;
+  if (g < b.x) return vec2(g, 3.);
+  return b;
+}
+vec3 nrmB(vec3 p){ vec2 e = vec2(.004, 0.); return normalize(vec3(map(p + e.xyy).x - map(p - e.xyy).x, map(p + e.yxy).x - map(p - e.yxy).x, map(p + e.yyx).x - map(p - e.yyx).x)); }
+
+// ---------------- the show: content in projector image space (u,v = point on the wall plane seen from the projector) ----------------
+float h21(vec2 p){ return hash12(p); }
+float E_outCubic(float x){ return 1. - pow(1. - x, 3.); }
+// architectural line drawing of the elevation: distance to the nearest edge + region id
+vec2 elev(vec2 q){
+  float u = q.x, v = q.y, au = abs(u);
+  float d = 1e3, id = 0.;
+  // wing windows
+  if (au > 9.6 && au < 22.) {
+    float wx = au - (11.6 + 4.*clamp(floor((au - 9.6)/4.), 0., 2.));
+    vec2 w = vec2(wx, v - 5.);
+    float a1 = min(sdBox2(w - vec2(0., -.6), vec2(1., 1.9)), length(w - vec2(0., 1.3)) - 1.);
+    float a2 = sdBox2(vec2(wx, v - 11.6), vec2(.95, 1.5));
+    d = min(d, min(abs(a1), abs(a2)));
+    if (min(a1, a2) < 0.) id = 1.;
+    float pil = abs(abs(au - (9.6 + 4.*clamp(floor((au - 7.6)/4.), 0., 3.))) - .42);
+    if (v > 1.6 && v < 14.2) d = min(d, pil);
+  }
+  // horizontal courses
+  d = min(d, min(abs(v - 1.6), abs(v - 8.62)));
+  d = min(d, min(abs(v - 9.18), abs(v - 14.2)));
+  d = min(d, min(abs(v - 15.), abs(v - 16.2)));
+  d = min(d, abs(v - 17.));
+  if (v > 14.2 && v < 17.) id = 3.;
+  if (v < 1.6) id = 5.;
+  // columns (projector space: they stand 3 m in front, so they read 6% wider)
+  float k = 48./45.;
+  float cx = clamp(floor((u/k + 9.6)/3.2)*3.2 - 9.6 + 1.6, -8., 8.)*k;
+  float cr = mix(.78, .64, clamp((v - 1.6)/12.6, 0., 1.))*k;
+  float cd = abs(u - cx) - cr;
+  if (v > 1.6 && v < 14.2) { d = min(d, abs(cd)); if (cd < 0.) id = 2.; }
+  // door
+  if (au < 9.) {
+    float door = min(sdBox2(vec2(u, v - 4.2), vec2(1.6, 2.6)), length(vec2(u, v - 6.8)) - 1.6);
+    if (cd > 0. || v < 1.6) { d = min(d, abs(door)); if (door < 0.) id = 6.; }
+  }
+  // pediment
+  if (v > 17. && au < 9.8) { float tri = max(-(v - 17.), v - 17. - 5.5 + au*(5.5/9.6)); d = min(d, abs(tri)); d = min(d, abs(max(-(v - 17.55), v - 17. - 4.7 + au*(4.7/8.4)))); if (tri < 0.) id = 4.; }
+  if (au > 24.) d = 1e3;
+  return vec2(d, id);
+}
+vec3 hsv(float h, float s, float v){ vec3 c = clamp(abs(mod(h*6. + vec3(0., 4., 2.), 6.) - 3.) - 1., 0., 1.); return v*mix(vec3(1.), c, s); }
+float beatPulse(float t, float rate){ return exp(-fract(t*rate)*6.); }
+const vec3 LIGHT_COL = vec3(1.);   // light colour, vec3(1.) = as delivered (see the Chinese note at the top of the script)
+vec3 content(vec2 q, float lod){
+  float t = uT;
+  vec3 c = vec3(0.);
+  vec2 e = elev(q);
+  float line = 1. - smoothstep(.0, .06 + lod*.2, e.x);
+  float glowL = exp(-e.x*3.)*.25;
+  float u = q.x, v = q.y;
+  // 1. scan line draws the architecture (0 - 1.2 s)
+  float scanV = mix(-1., 24., E_outCubic(clamp(t/1.15, 0., 1.)));
+  if (t < 2.) {
+    float drawn = step(v, scanV);
+    c += vec3(.85, .92, 1.)*line*drawn*1.4 + vec3(.3, .5, 1.)*glowL*drawn;
+    c += vec3(.6, .8, 1.)*exp(-abs(v - scanV)*3.)*1.6*step(t, 1.25);
+    // colour fills on the beats 1.0 and 1.5
+    float f1 = smoothstep(.98, 1.02, t)*(1. - smoothstep(1.4, 1.5, t)), f2 = smoothstep(1.48, 1.52, t);
+    if (e.y == 2.) c += vec3(.9, .2, .5)*f1*.8;
+    if (e.y == 1. || e.y == 6.) c += vec3(.1, .7, 1.)*(f1 + f2)*.9;
+    if (e.y == 3. || e.y == 4.) c += vec3(1., .65, .1)*f2*.9;
+    c *= 1. - smoothstep(1.85, 2., t)*.6;
+  }
+  // 2. blocks push in and out, columns run with water, windows light one by one (2 - 4 s)
+  if (t >= 1.85 && t < 4.15) {
+    float w = smoothstep(1.85, 2.05, t)*(1. - smoothstep(3.95, 4.15, t));
+    vec2 cell = floor(q/vec2(1.8, 1.5));
+    vec2 fq = fract(q/vec2(1.8, 1.5));
+    float ph = h21(cell);
+    float beat = floor((t - 2.)*2.);
+    float kb = clamp((t - 2. - beat*.5)/.12, 0., 1.);
+    kb = 1. + 2.7*pow(kb - 1., 3.) + 1.7*pow(kb - 1., 2.);          // out-back: push past and settle, every beat
+    float dep = mix(sin((beat - 1.)*1.7 + ph*6.28), sin(beat*1.7 + ph*6.28), kb)*.5 + .5;
+    float push = dep*(.6 + .4*sin(cell.x*.7 + t*3.));
+    // fake extrusion: lit top/left bevel, shadowed bottom/right, dark gaps
+    float bev = .12*push + .02;
+    float lit = smoothstep(bev, 0., fq.y) - smoothstep(1. - bev, 1., fq.x);
+    float gap = smoothstep(.0, .025, fq.x)*smoothstep(.0, .025, fq.y)*smoothstep(1., .975, fq.x)*smoothstep(1., .975, fq.y);
+    vec3 base = mix(vec3(.10, .12, .22), vec3(.30, .34, .55), push);
+    vec3 blk = base*(1. + lit*.9)*gap;
+    blk += vec3(.7, .8, 1.)*line*.6;
+    if (e.y == 2.) {                              // water down the columns
+      float fl = fbm2(vec2(u*3., v*.5 + t*3.2)) ;
+      float st = pow(abs(sin(u*9. + fl*6.)), 18.);
+      blk = vec3(.05, .25, .6)*(.6 + .8*fl) + vec3(.6, .9, 1.)*st*.9 + vec3(.8, .95, 1.)*pow(fbm2(vec2(u*8., v*1.5 + t*6.)), 3.)*1.6;
+    }
+    if (e.y == 1.) {                              // windows: one per beat
+      float wid = floor(u/4.) + floor(v/6.)*7.;
+      float t0w = 2. + .25*floor(h21(vec2(wid, 3.))*8.);            // every window lands on an eighth note
+      float on = smoothstep(t0w, t0w + .08, t)*(1. + .3*exp(-max(t - t0w - .08, 0.)*10.)*step(t0w + .08, t));
+      blk = mix(vec3(.02, .02, .05), vec3(1., .72, .35)*1.6, on);
+    }
+    c = mix(c, blk, w);
+  }
+  // 3. HOOK: the wall leans out over the audience, cracks, drops into black, slams back (4 - 5.5 s)
+  if (t >= 3.95 && t < 5.7) {
+    vec3 E3 = uRo;                                // the illusion is drawn for the audience's eye
+    float th = uTilt;
+    vec3 P = vec3(u, v, 0.);
+    vec3 dir = P - E3;
+    // tilted plane hinged at the base: points (x, s cos th, -s sin th)
+    float tn = tan(th);
+    float lam = -(E3.z + tn*E3.y)/(dir.z + tn*dir.y);
+    vec3 R = E3 + dir*lam;
+    float s = R.y/max(cos(th), .01);
+    vec2 tq = vec2(R.x, s);
+    vec3 img = vec3(0.); float cover = 0.;
+    // ashlar courses: 1.25 m high, 2.5 m blocks, alternate courses offset; after 4.5 s each block drops on its own beat
+    const float BH = 1.25, BWd = 2.5;
+    float row0 = floor(s/BH);
+    for (int k=8;k>=0;k--){
+      float r = row0 + float(k);
+      if (r < 0. || r > 18.) continue;
+      float off = mod(r, 2.)*BWd*.5;
+      float bi = floor((tq.x + off)/BWd);
+      float td = 4.48 + .3*h21(vec2(bi, r)) + .022*(18. - r);
+      float ft = max(0., t - td);
+      float dy = 30.*ft*ft;                             // falls (in the leaning wall's own plane)
+      float rot = ft*ft*(h21(vec2(r, bi)) - .5)*2.2;
+      float grow = 1. + .6*clamp(ft/.55, 0., 1.);       // and tips out toward the audience: it grows as it comes
+      vec2 lc = vec2(tq.x + off - (bi + .5)*BWd, s + dy - (r + .5)*BH)/grow;
+      float cs = cos(rot), sn = sin(rot); lc = mat2(cs, -sn, sn, cs)*lc;
+      if (abs(lc.x) < BWd*.5 && abs(lc.y) < BH*.5) {
+        vec2 sq = vec2((bi + .5)*BWd - off, (r + .5)*BH) + lc;     // the original spot on the wall this pixel shows
+        vec2 e2 = elev(sq);
+        float l2 = 1. - smoothstep(0., .07, e2.x);
+        vec3 stone = vec3(.42, .40, .38)*(.85 + .2*fbm2(sq*.6));
+        if (e2.y == 1. || e2.y == 6.) stone *= .25;
+        if (e2.y == 2.) stone *= 1.12;
+        stone *= .95 - 1.25*sin(th)*smoothstep(0., 20., s);          // the face turns down, away from the light: 40-50 % darker at the top
+        float joint = smoothstep(BWd*.5 - .05, BWd*.5 - .01, abs(lc.x)) + smoothstep(BH*.5 - .05, BH*.5 - .01, abs(lc.y));
+        stone *= 1. - .6*clamp(joint, 0., 1.)*smoothstep(4.3, 4.6, t);
+        stone *= 1. - .5*clamp(ft*2., 0., 1.);
+        img = stone + vec3(.9, .95, 1.)*l2*.22 + vec3(.6, .8, 1.)*clamp(joint, 0., 1.)*exp(-ft*6.)*step(.001, ft)*.8;
+        cover = 1.;
+        break;
+      }
+    }
+    if (!(lam > 0. && s > -1. && s < 24.)) cover = 0.;
+    // the wall has come away from the cornice: a black gap opens under it, and thin black slits at the sides
+    float gapW = uGap*2.6;
+    if (v > 14.2 - gapW && v < 14.25) cover = 0.;
+    if (abs(u) > 24. - uGap*1.1 && v < 14.2) cover = 0.;
+    // the base cracks: a hot line along the plinth, and dust pouring off it
+    float crack = uCrack*exp(-abs(v - 1.62 - .06*sin(u*2.3) - .04*sin(u*7.1))*14.);
+    img += vec3(1., .9, .75)*crack*1.8;
+    float dust = uCrack*smoothstep(.55, .9, fbm2(vec2(u*1.6, v*.9 + t*7.)))*smoothstep(1.6, .6, v)*smoothstep(-.4, .5, v);
+    img += vec3(.6, .58, .55)*dust*.6;
+    // what is behind the wall: black, with a cold rim
+    vec3 voidC = vec3(.004, .006, .015);
+    float a = smoothstep(3.95, 4.05, t)*(1. - smoothstep(5.48, 5.56, t));
+    c = mix(c, mix(voidC, img, cover), a);
+  }
+  // flash on the slam back
+  c += vec3(.9, .95, 1.)*uFlash*(.4 + line);
+  // 4. two colours swap every bar; light chases along the mouldings on the eighths; columns fill on every kick (5.5 - 7.6 s)
+  if (t >= 5.5 && t < 8.) {
+    float w = smoothstep(5.5, 5.6, t)*(1. - smoothstep(7.35, 7.6, t));
+    float bar = floor((t - 5.5 + 1.5)/2.);
+    vec3 cA = vec3(1., .12, .55), cB = vec3(.1, .75, 1.);
+    vec3 k1 = mod(bar, 2.) < .5 ? cA : cB, k2 = mod(bar, 2.) < .5 ? cB : cA;
+    float e8 = floor((t - 5.5)*4.);
+    float chase = fract((abs(u)*.09 + v*.11) - e8*.125);
+    float dash = smoothstep(.0, .05, chase)*smoothstep(.22, .12, chase);
+    vec3 cc = k2*.06 + k1*line*(.35 + 2.2*dash);
+    float kick = fract((t - 5.5)*2.);
+    if (e.y == 2.) { float fill = 1.6 + 12.6*E_outCubic(clamp(kick/.35, 0., 1.)); cc = k2*(.15 + 1.4*step(v, fill)*exp(-kick*2.5)) + k1*line; }
+    if (e.y == 1. || e.y == 6.) cc = k1*.05;
+    c = mix(c, cc, w);
+  }
+  // 5. finale (7.35 s ->): deep blue wash; wings, portico and pediment light up on the eighths; a run of light climbs into the emblem
+  if (t >= 7.35) {
+    float w = smoothstep(7.35, 7.5, t);
+    vec2 tuv = vec2((24. - u)/48., v/24.);
+    vec4 tx = texture(uTx, tuv);
+    float au = abs(u);
+    float tb = u > 9.4 ? 7.5 : (u < -9.4 ? 7.75 : (v < 16.9 ? 8.0 : 8.25));   // left wing, right wing, portico, pediment
+    float onb = smoothstep(tb, tb + .06, t);
+    float hitb = exp(-max(t - tb, 0.)*7.)*step(tb, t);
+    vec3 bg = mix(vec3(.02, .04, .12), vec3(.05, .09, .28), smoothstep(0., 20., v))*.9;
+    vec3 gold = vec3(1., .74, .36);
+    vec3 cc = bg + vec3(.45, .6, 1.)*line*(.25 + .55*onb + 1.2*hitb);
+    cc += gold*tx.g*onb*(1.3 + 1.5*hitb)*(lod < 1.5 ? 1. : .5);                // key-fret band on the frieze
+    // the run of light: from the ground up every line of the building, into the emblem (8.5 -> 8.85)
+    float vf = mix(-1., 23., clamp((t - 8.5)/.35, 0., 1.));
+    float run = exp(-abs(v - vf)*1.6)*step(8.5, t)*(1. - smoothstep(8.85, 9.2, t));
+    cc += vec3(1., .95, .85)*line*run*2.4;
+    float em = smoothstep(8.25, 8.31, t)*(1. + 1.4*exp(-max(t - 8.25, 0.)*8.) + 1.8*exp(-max(t - 8.8, 0.)*6.)*step(8.8, t));
+    cc += gold*tx.r*em*1.9*(lod < 1.5 ? 1. : .6);                                // the sun emblem in the pediment
+    c = mix(c, cc, w);
+  }
+  return c*LIGHT_COL;
+}
+
+// ---------------- rendering ----------------
+vec3 projLight(vec3 P, vec3 n, out float facing){
+  // projector space: ray from the projector through P, onto the wall plane z = 0
+  vec3 d = P - uPj;
+  vec2 q = (uPj + d*(-uPj.z/d.z)).xy;
+  vec3 L = normalize(uPj - P);
+  facing = max(dot(n, L), 0.);
+  float dist = length(P - uPj);
+  return content(q, 0.)*(48.*48.)/(dist*dist);
+}
+float projShadow(vec3 P, vec3 n){
+  vec3 L = uPj - P; float tm = length(L); L /= tm;
+  float t = .05;
+  for (int i=0;i<60;i++){ float h = bld(P + n*.02 + L*t).x; if (h < .002) return 0.; t += max(h, .05); if (t > 12.) break; }
+  return 1.;
+}
+vec3 sky(vec3 rd){
+  vec3 c = mix(vec3(.05, .035, .06), vec3(.008, .01, .03), smoothstep(-.05, .4, rd.y));
+  return c;
+}
+// crowd: rows of heads & shoulders, some phones held up (screens glowing with the show)
+float sdCap2(vec2 p, vec2 a, vec2 b, float r){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba)/dot(ba, ba), 0., 1.); return length(pa - ba*h) - r; }
+vec4 crowd(vec3 ro, vec3 rd, float tMax){
+  // returns rgb (light on the silhouette) and coverage a; also sets gDepth when hit
+  for (int L=0; L<4; L++){
+    float fl = float(L);
+    float zL = -39.4 + fl*1.6;
+    float tt = (zL - ro.z)/rd.z;
+    if (tt <= 0. || tt > tMax) continue;
+    vec2 q = (ro + rd*tt).xy;
+    float sp = .55;
+    float cell = floor(q.x/sp + fl*.37);
+    float sd = 1e3; float phoneLit = 0.; vec3 scr = vec3(0.);
+    for (int k=-1;k<=1;k++){
+      float cid = cell + float(k);
+      float rr = h21(vec2(cid, fl + 2.));
+      float hx = (cid + .5 - fl*.37)*sp + (h21(vec2(cid, fl)) - .5)*.25 + .025*sin(uT*1.3 + rr*6.28);
+      float hh = 1.62 + .16*h21(vec2(cid, fl + 5.)) - fl*.03 + .012*sin(uT*1.9 + rr*9.);
+      float dk = uT - 4.5 - fl*.05;                                  // the wall comes at them: heads go down, near rows first
+      hh -= (.12 + .07*rr)*smoothstep(0., .1, dk)*(1. - smoothstep(.25, .8, dk));
+      float kb = fract((uT - 5.5)*2.);                               // then they nod with the kick
+      hh -= .045*exp(-kb*9.)*step(5.5, uT)*step(rr, .7)*(1. - step(7.4, uT)*step(uT, 7.5));
+      float head = length((q - vec2(hx, hh))*vec2(1., .82)) - .115;
+      float sh = sdCap2(q, vec2(hx - .2, hh - .3), vec2(hx + .2, hh - .3), .12);
+      float body = sdBox2(q - vec2(hx, hh - 1.), vec2(.24, .7));
+      sd = min(sd, min(head, min(sh, body)));
+      // a raised phone on some people
+      if (h21(vec2(cid, fl + 9.)) > mix(.72, .48, clamp((uT - 5.)/3.4, 0., 1.)) && L < 3) {
+        vec2 pc = vec2(hx + .12, hh + .35 + .1*h21(vec2(cid, 2.)));
+        float arm = sdCap2(q, vec2(hx + .15, hh - .28), pc - vec2(0., .06), .045);
+        float ph = sdBox2(q - pc, vec2(.04, .075));
+        sd = min(sd, arm);
+        if (ph < 0.) { phoneLit = 1.; vec2 lq = (q - pc)/vec2(.04, .075); scr = content(vec2(-lq.x*13., 11. + lq.y*11.), 2.)*.1 + vec3(.012, .016, .03); }
+        sd = min(sd, ph);
+      }
+    }
+    if (sd < 0.) {
+      gDepth = tt;
+      // rim light: the glowing facade behind wraps a thin edge round every head and shoulder
+      vec3 rimC = content(vec2(-q.x*.6, 9.), 3.)*.06 + content(vec2(-q.x*.6, 14.), 3.)*.05;
+      vec3 body = vec3(.002, .002, .004) + rimC*.3*smoothstep(-.02, 0., sd);
+      return vec4(phoneLit > 0. ? scr : body, 1.);
+    }
+  }
+  return vec4(0.);
+}
+vec3 render(vec2 fc){
+  vec2 uv = (fc - .5*uRes)/uRes.y*2.;
+  mat3 cm = camMat(uRo, uTa, uRoll);
+  vec3 rd = normalize(cm*vec3(uv, uF));
+  vec3 ro = uRo;
+  // march the facade
+  float t = 1.;
+  float hitM = -1.;
+  for (int i=0;i<220;i++){ vec2 h = map(ro + rd*t); if (h.x < .002*t) { hitM = h.y; break; } t += h.x*.9; if (t > 140.) break; }
+  vec3 col;
+  float tHit = hitM < 0. ? 140. : t;
+  if (hitM < 0.) { col = sky(rd); gDepth = 140.; }
+  else {
+    vec3 P = ro + rd*t; vec3 n = nrmB(P);
+    gDepth = t;
+    vec3 alb = vec3(.62, .58, .52)*(.85 + .25*fbm2(P.xy*.7 + P.z*.3));
+    if (hitM == 3.) alb = vec3(.18, .17, .17)*(.8 + .3*fbm2(P.xz*.5));
+    if (hitM == 1.) alb *= 1.05;
+    float facing; vec3 pl = projLight(P, n, facing);
+    float sh = hitM == 3. ? 1. : projShadow(P, n);
+    vec3 amb = vec3(.025, .028, .045)*(.4 + .6*n.y*.5 + .3);
+    col = alb*(amb + pl*facing*sh);
+    if (hitM == 3.) {                              // wet square: blurry reflection of the show
+      vec3 r = reflect(rd, n);
+      float tf = (0. - (P.z))/max(r.z, .05);
+      vec3 Q = P + r*tf;
+      vec3 rf = vec3(0.);
+      for (int i=0;i<5;i++) rf += content(Q.xy + vec2(0., float(i)*1.2 - 1.), 2.);
+      float puddle = smoothstep(.45, .62, fbm2(P.xz*vec2(.35, .9) + 3.));
+      col += rf/5.*.07*puddle*smoothstep(0., 2., Q.y)*step(Q.y, 23.);
+    }
+  }
+  // haze lit by the projector beams
+  float scat = 0.; vec3 beam = vec3(0.);
+  float tb = 2.;
+  for (int i=0;i<36;i++){
+    float tt = tb + (min(tHit, 46.) - tb)*(float(i) + hash12(fc + float(i)))/36.;
+    vec3 X = ro + rd*tt;
+    vec3 d = X - uPj;
+    if (d.z <= .1) continue;
+    vec2 q = (uPj + d*(-uPj.z/d.z)).xy;
+    if (abs(q.x) > 24.5 || q.y < 0. || q.y > 23.) continue;
+    vec3 L = content(q, 3.);
+    float dist = length(d);
+    float dens = .0028*(.7 + .6*vnoise2(X.xy*.15 + uT*.1));
+    beam += L*dens*(48.*48.)/(dist*dist + 40.)*(min(tHit, 46.) - tb)/36.;
+  }
+  col += beam*.22;
+  // crowd in front (out of focus via DOF)
+  vec4 cr = crowd(ro, rd, tHit);
+  if (cr.a > 0.) col = cr.rgb;
+  if (uDbg > .5) col = vec3(gDepth/60.);
+  return col;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+
+function buildText() {
+  const cv = document.createElement('canvas'); cv.width = TXW; cv.height = TXH;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, TXW, TXH);
+  const PX = TXW / 48;                       // px per metre
+  const X = (u) => (u + 24) * PX, Y = (v) => (24 - v) * PX;
+  g.globalCompositeOperation = 'lighter'; g.lineCap = 'round'; g.lineJoin = 'round';
+  // r: a geometric sun / compass emblem in the tympanum (no letters, no heraldry)
+  g.strokeStyle = '#f00'; g.fillStyle = '#f00';
+  const cx = X(0), cy = Y(18.95);
+  const ring = (r, w) => { g.lineWidth = w * PX; g.beginPath(); g.arc(cx, cy, r * PX, 0, 7); g.stroke(); };
+  ring(1.62, 0.12); ring(1.32, 0.07); ring(0.5, 0.1);
+  for (let k = 0; k < 32; k++) {
+    const a = k / 32 * Math.PI * 2, long = k % 2 === 0, r0 = 0.62, r1 = long ? 1.22 : 0.95;
+    g.lineWidth = (long ? 0.09 : 0.05) * PX; g.beginPath(); g.moveTo(cx + Math.cos(a) * r0 * PX, cy + Math.sin(a) * r0 * PX); g.lineTo(cx + Math.cos(a) * r1 * PX, cy + Math.sin(a) * r1 * PX); g.stroke();
+  }
+  g.beginPath();
+  for (let k = 0; k < 16; k++) { const a = k / 16 * Math.PI * 2 - Math.PI / 2, r = (k % 2 ? 0.16 : 0.42) * PX; g.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r); }
+  g.closePath(); g.fill();
+  for (const sx of [-1, 1]) {                // flanking scrolls toward the pediment corners
+    g.lineWidth = 0.08 * PX; g.beginPath();
+    for (let i = 0; i <= 50; i++) { const u = i / 50, x = sx * (1.9 + u * 4.2), y = 18.2 + 0.55 * Math.sin(u * Math.PI) * (1 - u * 0.4); i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y)); }
+    g.stroke();
+  }
+  // g: a Greek-key (回纹) band along the whole frieze
+  g.strokeStyle = '#0f0'; g.lineWidth = 0.13 * PX; g.lineCap = 'square'; g.lineJoin = 'miter';
+  const gu = 0.2, yb = 15.18;
+  for (let x0 = -24; x0 < 24; x0 += 5 * gu) {
+    const P = [[0, 0], [0, 4], [3, 4], [3, 1], [1, 1], [1, 3], [2, 3], [2, 2]];
+    g.beginPath(); P.forEach(([u, v], i) => { const x = X(x0 + u * gu), y = Y(yb + v * gu); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke();
+  }
+  g.beginPath(); g.moveTo(X(-24), Y(yb - 0.04)); g.lineTo(X(24), Y(yb - 0.04)); g.stroke();
+  g.beginPath(); g.moveTo(X(-24), Y(yb + 4 * gu + 0.12)); g.lineTo(X(24), Y(yb + 4 * gu + 0.12)); g.stroke();
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+let tTx;
+
+const cr1 = (p0, p1, p2, p3, u) => { const u2 = u * u, u3 = u2 * u; return 0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3); };
+function keyed(K, t, fields) {
+  let i = 0; while (i < K.length - 2 && t > K[i + 1].t) i++;
+  const k0 = K[Math.max(0, i - 1)], k1 = K[i], k2 = K[i + 1], k3 = K[Math.min(K.length - 1, i + 2)];
+  const u = (k2.e || E.inOutSine)(clamp((t - k1.t) / (k2.t - k1.t)));
+  const o = {}; for (const f of fields) o[f] = Array.isArray(k1[f]) ? k1[f].map((_, j) => cr1(k0[f][j], k1[f][j], k2[f][j], k3[f][j], u)) : cr1(k0[f], k1[f], k2[f], k3[f], u);
+  return o;
+}
+// the camera drifts through the crowd (parallax on the heads), pushes in for the hook, eases back for the finale and stops
+const camT = Track([
+  { t: 0.0, v: [-6.0, 2.35, -43.5, -1.0, 10.5, 0, 2.25] },
+  { t: 3.8, v: [-2.0, 2.4, -42.5, 0.0, 10.8, 0, 2.4] },
+  { t: 5.4, v: [-0.6, 2.3, -40.6, 0.0, 11.5, 0, 2.55] },
+  { t: 7.4, v: [1.0, 2.45, -42.6, 0.0, 11.0, 0, 2.32] },
+  { t: 8.75, v: [1.3, 2.45, -42.9, 0.0, 11.0, 0, 2.3] },
+]);
+const DUR = 10;
+Reel.scene({
+  duration: DUR, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'crowd_murmur', gain: 0.5 },
+    { t: 0.0, sfx: 'proj_on', gain: 0.75 },
+    { t: 1.0, sfx: 'hit_bright', gain: 0.6 },
+    { t: 1.5, sfx: 'hit_bright', gain: 0.6 },
+    { t: 2.0, sfx: 'block_thud', gain: 0.6 }, { t: 2.5, sfx: 'block_thud', gain: 0.5 }, { t: 3.0, sfx: 'block_thud', gain: 0.6 }, { t: 3.5, sfx: 'block_thud', gain: 0.5 },
+    { t: 3.875, sfx: 'stone_creak', gain: 0.8 },
+    { t: 4.5, sfx: 'collapse', gain: 0.95 },
+    { t: 4.5, sfx: 'crowd_gasp', gain: 0.55 },
+    { t: 5.2, sfx: 'slam_back', gain: 0.9 },
+    { t: 7.5, sfx: 'bay_hit', gain: 0.55 }, { t: 7.75, sfx: 'bay_hit', gain: 0.55 }, { t: 8.0, sfx: 'bay_hit', gain: 0.65 }, { t: 8.25, sfx: 'emblem_on', gain: 0.6 },
+    { t: 8.5, sfx: 'light_run', gain: 0.6 },
+    { t: 8.5, sfx: 'crowd_cheer', gain: 0.5 },
+  ],
+  async setup() { tTx = buildText(); },
+  render(t) {
+    const cv = camT(t);
+    // at the collapse the camera really flinches: back 1.2 m and dips 2 degrees, then springs home
+    const fl = t > 4.5 ? Math.exp(-(t - 4.5) * 7) * Math.sin(Math.min(Math.PI, (t - 4.5) * 9)) : 0;
+    const ro = [cv[0] + 0.03 * Math.sin(t * 1.9), cv[1] + 0.02 * Math.sin(t * 2.7 + 1) - 0.12 * fl, cv[2] - 1.2 * fl];
+    const ta = [cv[3], cv[4] - 1.5 * fl, cv[5]];
+    // the lean: settle back first (anticipation), then out over the audience, two wobbles, snap home on 5.5
+    const back = -0.03 * Math.sin(Math.PI * clamp((t - 3.875) / 0.2));
+    const out = 0.55 * E.inOutCubic(clamp((t - 4.05) / 0.45));
+    const wob = 0.025 * Math.sin((t - 4.5) * 16) * Math.exp(-(t - 4.5) * 4) * (t > 4.5 ? 1 : 0);
+    const tilt = (back + out + wob) * (1 - E.outCubic(clamp((t - 5.45) / 0.08)));
+    const gap = clamp(out / 0.55) * (1 - clamp((t - 5.45) / 0.08));
+    const crack = clamp((t - 4.4) / 0.1) * (1 - clamp((t - 5.0) / 0.4)) * (t < 5.5 ? 1 : 0);
+    const voidA = E.inQuad(clamp((t - 4.55) / 0.55)) * (1 - clamp((t - 5.45) / 0.08));
+    const flash = Math.exp(-Math.max(0, t - 5.5) * 7) * (t >= 5.5 ? 1 : 0) + Math.exp(-Math.max(0, t - 1.0) * 9) * (t >= 1.0 ? 0.3 : 0) * (t < 1.4 ? 1 : 0);
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tTx); gl.activeTexture(gl.TEXTURE0);
+    rm.set('uTx', { __ints: 1, v: 4 }).set('uRo', ro).set('uTa', ta).set('uF', cv[6]).set('uRoll', 0.004 * Math.sin(t * 0.8))
+      .set('uT', t).set('uTilt', tilt).set('uVoid', voidA).set('uFlash', flash).set('uGap', gap).set('uCrack', crack).set('uDbg', +(Reel.Q.get('dbg') || 0))
+      .set('uPj', [-3.0, 9.0, -50.0]);
+    const fd = Math.hypot(ro[0], ro[1] - 9, ro[2]);
+    rm.render(t, { focus: fd, aperture: 45, maxCoc: 14 });
+  },
+});
+</script></body></html>

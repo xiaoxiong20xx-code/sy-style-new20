@@ -1,0 +1,1 @@
+[{"t":0.25,"sfx":"press_down","gain":0.6},{"t":1,"sfx":"press_hit","gain":1},{"t":1.5,"sfx":"press_lift","gain":0.55},{"t":3.25,"sfx":"foil_peel","gain":0.9},{"t":4.5,"sfx":"gold_glint","gain":0.7},{"t":6,"sfx":"light_sweep","gain":0.5},{"t":8.25,"sfx":"final_glint","gain":0.6}]

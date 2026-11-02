@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>29 沙画 · Sand Animation</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 29 沙画 · Sand Animation =====
+   Real world: fine sand on a light box, shot from above in a dark room. Light comes up through the glass: thin sand
+   glows warm white, thick sand goes amber -> brown -> black; a finger clears a line and banks the sand up on both
+   sides; loose grains everywhere. The artist's hand is a backlit silhouette whose fingers glow red at the edges.
+   0-4s: a fist pours the swell, the fingertip carves a breaking wave on the beat. 4s (hook): the palm sweeps and the
+   wave becomes a whale — the palm shoves the old sand ahead of it; 5.5s: another sweep, the whale's back becomes dunes,
+   a caravan under the moon. The fingertip spirals the moon open, taps the stars, a trail of footprints behind the
+   caravan, swipes a shooting star on 7.5, and the hand leaves the light box. */
+const { E, clamp, inv, lerp } = Reel;
+// ★ 改光色改这里：着色器里的 LIGHT_COL（搜 LIGHT_COL）。它乘在灯箱的光（沙子、刮开的玻璃、沙粒、沙流）上。
+//   vec3(1.) = 原样（和成片一模一样）；偏冷例如 vec3(.8, .95, 1.25)；厚沙的琥珀色由 k = vec3(2.05, 2.55, 3.45) 吸收系数决定。只想换物体/纸/颜料的颜色是“配色”，不是光，见 SKILL 的对照表。
+const stage = Reel.makeStage('#000');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+const SW = 1920, SH = 1080;
+
+/* ---------------- polylines ---------------- */
+const P = (fn, n = 60) => Array.from({ length: n + 1 }, (_, i) => fn(i / n));
+function plen(pts) { let L = [0]; for (let i = 1; i < pts.length; i++) L.push(L[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1])); return L; }
+function at(pts, u) {
+  const L = pts.L || (pts.L = plen(pts)); const s = clamp(u) * L[L.length - 1];
+  let i = 1; while (i < L.length - 1 && L[i] < s) i++;
+  const k = (s - L[i - 1]) / Math.max(1e-6, L[i] - L[i - 1]);
+  return [lerp(pts[i - 1][0], pts[i][0], k), lerp(pts[i - 1][1], pts[i][1], k)];
+}
+function drawPart(g, pts, u) {
+  if (u <= 0) return; const L = pts.L || (pts.L = plen(pts)); const s = clamp(u) * L[L.length - 1];
+  g.beginPath(); g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) { if (L[i] <= s) g.lineTo(pts[i][0], pts[i][1]); else { const p = at(pts, u); g.lineTo(p[0], p[1]); break; } }
+  g.stroke();
+}
+// A fingertip pushed through sand: width follows pressure (thin where the finger lands and lifts), the edge is
+// ragged, stamps overlap additively so the core clears fully and the rim only partly.
+function scrape(g, pts, u, w, seed = 1, depth = 1) {
+  if (u <= 0) return;
+  const L = pts.L || (pts.L = plen(pts)); const total = L[L.length - 1]; const s1 = clamp(u) * total;
+  const step = Math.max(1.2, w * 0.16);
+  for (let d = 0; d <= s1; d += step) {
+    const k = d / total, p = at(pts, k);
+    const press = Math.pow(Math.sin(Math.PI * clamp(k * 0.96 + 0.02)), 0.5) * (0.82 + 0.18 * Math.sin(d * 0.021 + seed * 3.1));
+    const n1 = Reel.hash(seed * 13.7 + d * 0.071), n2 = Reel.hash(seed * 7.1 + d * 0.13 + 3), n3 = Reel.hash(seed * 3.3 + d * 0.29 + 9);
+    const q = at(pts, Math.min(1, k + 0.002)), tx = q[0] - p[0], ty = q[1] - p[1], tl = Math.hypot(tx, ty) || 1;
+    const off = (n3 - 0.5) * w * 0.14;
+    const r = w * 0.5 * (0.3 + 0.7 * press) * (0.82 + 0.34 * n1);
+    g.fillStyle = 'rgba(255,0,0,' + (0.26 + 0.12 * n2) * depth * (0.55 + 0.45 * press) + ')';
+    g.beginPath(); g.arc(p[0] - ty / tl * off, p[1] + tx / tl * off, r, 0, 6.2832); g.fill();
+  }
+}
+// a fingertip tap: a few overlapping irregular dabs
+function dab(g, x, y, r, seed = 1, k = 1) {
+  if (k <= 0) return;
+  for (let i = 0; i < 5; i++) {
+    const a = Reel.hash(seed * 5.1 + i) * 6.28, d = Reel.hash(seed * 2.7 + i * 3.3) * r * 0.45;
+    g.fillStyle = 'rgba(255,0,0,' + (0.32 + 0.1 * Reel.hash(seed + i * 7.7)) + ')';
+    g.beginPath(); g.ellipse(x + Math.cos(a) * d, y + Math.sin(a) * d, r * k * (0.6 + 0.3 * Reel.hash(seed * 9.1 + i)), r * k * (0.5 + 0.35 * Reel.hash(seed * 4.3 + i)), a, 0, 6.2832); g.fill();
+  }
+}
+const bez = (a, b, c, d) => (u) => { const v = 1 - u; return [v * v * v * a[0] + 3 * v * v * u * b[0] + 3 * v * u * u * c[0] + u * u * u * d[0], v * v * v * a[1] + 3 * v * v * u * b[1] + 3 * v * u * u * c[1] + u * u * u * d[1]]; };
+const chain = (...segs) => segs.flatMap((s, i) => P(s, 30).slice(i ? 1 : 0));
+const RED = (a = 1) => `rgba(255,0,0,${a})`, GRN = (a = 1) => `rgba(0,255,0,${a})`;
+
+/* ---------------- the drawings ---------------- */
+// WAVE (0-4s)
+const POUR = chain(bez([60, 1010], [380, 900], [700, 760], [930, 560]), bez([930, 560], [1030, 470], [1120, 330], [1260, 250]));
+const WAVE_BODY = [[-30, 1110], [-30, 800], [260, 730], [560, 650], [820, 540], [980, 420], [1090, 300], [1200, 238], [1300, 246], [1370, 300], [1392, 370],
+  [1350, 428], [1290, 452], [1250, 440], [1280, 500], [1360, 600], [1520, 700], [1720, 760], [1950, 780], [1950, 1110]];
+const W_STROKES = [
+  // [t0, t1, polyline, width] — finger lines carved on the beat
+  [1.0, 1.42, chain(bez([1000, 410], [1080, 250], [1250, 200], [1340, 270]), bez([1340, 270], [1410, 330], [1360, 430], [1290, 440]), bez([1290, 440], [1230, 445], [1225, 380], [1275, 372])), 20],
+  [1.5, 1.92, chain(bez([1130, 330], [980, 520], [700, 690], [300, 820])), 16],
+  [2.0, 2.42, chain(bez([1250, 470], [1090, 640], [820, 800], [420, 960])), 16],
+  [3.5, 3.88, chain(bez([1420, 640], [1600, 700], [1760, 735], [1930, 742])), 12],
+];
+const CLAWS = [[1060, 300, -1.2], [1130, 252, -1.55], [1210, 228, -1.9], [1290, 236, -2.25], [1360, 282, -2.65]].map(([x, y, a], i) => ({ t0: 2.5 + i * 0.08, x, y, a }));
+const SPRAY = Array.from({ length: 6 }, (_, i) => { const a = Math.PI * (1.08 - i * 0.2); return { t0: 3.0 + i * 0.06, x: 1215 + Math.cos(a) * 175, y: 250 - Math.sin(a) * 120 - (i % 2) * 14, r: 9 + (i % 3) * 3 }; });
+const tmpW = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
+const tmpM = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
+function drawWave(g, t) {
+  // the artist's ground: sky thinned, sea a little thicker
+  const gr = g.createLinearGradient(0, 0, 0, SH); gr.addColorStop(0, RED(0.5)); gr.addColorStop(0.5, RED(0.28)); gr.addColorStop(0.75, RED(0.0));
+  g.fillStyle = gr; g.fillRect(0, 0, SW, SH);
+  // the poured swell: the body appears where the stream has passed
+  const u = inv(0.0, 0.92, t) * 0.94 + 0.06;
+  const w = tmpW.getContext('2d'); w.globalCompositeOperation = 'source-over'; w.filter = 'none'; w.clearRect(0, 0, SW, SH);
+  w.filter = 'blur(7px)'; w.fillStyle = GRN(0.85); w.beginPath(); WAVE_BODY.forEach((p, i) => (i ? w.lineTo(p[0], p[1]) : w.moveTo(p[0], p[1]))); w.closePath(); w.fill();
+  w.filter = 'blur(30px)'; w.fillStyle = GRN(0.35); w.fillRect(0, 760, SW, 400);
+  { // the stream's reach (and, as the last sand leaves the fist, the rest of the swell settles in softly)
+    const mk = tmpM.getContext('2d'); mk.globalCompositeOperation = 'source-over'; mk.filter = 'none'; mk.clearRect(0, 0, SW, SH);
+    mk.filter = 'blur(40px)'; mk.strokeStyle = '#000'; mk.lineCap = 'round'; mk.lineWidth = 760; drawPart(mk, POUR, u);
+    const kf = E.inOutSine(inv(0.72, 1.0, t)); if (kf > 0) { mk.filter = 'none'; mk.fillStyle = 'rgba(0,0,0,' + kf + ')'; mk.fillRect(0, 0, SW, SH); }
+    w.globalCompositeOperation = 'destination-in'; w.filter = 'none'; w.drawImage(tmpM, 0, 0); }
+  w.globalCompositeOperation = 'source-over'; w.filter = 'none';
+  g.drawImage(tmpW, 0, 0);
+  // the tube under the lip, rubbed clear with the fingertip, and the curl
+  const tu = inv(1.42, 1.5, t);
+  if (tu > 0) { g.save(); g.filter = 'blur(6px)'; g.fillStyle = RED(0.85 * tu); g.beginPath(); g.ellipse(1300, 400, 62 * (0.4 + 0.6 * tu), 48, 0.5, 0, 7); g.fill(); g.restore(); }
+  W_STROKES.forEach(([a, b, pts, wd], i) => scrape(g, pts, inv(a, b, t), wd * 1.25, 11 + i));
+  CLAWS.forEach((c, i) => { const k = inv(c.t0, c.t0 + 0.07, t); if (k <= 0) return;
+    const pts = c.pts || (c.pts = P((q) => [c.x + Math.cos(c.a) * 64 * q + Math.cos(c.a + 1.6) * 28 * q * q, c.y + Math.sin(c.a) * 64 * q + Math.sin(c.a + 1.6) * 28 * q * q], 16));
+    scrape(g, pts, k, 15, 31 + i); });
+  SPRAY.forEach((sp, i) => { if (t > sp.t0) dab(g, sp.x, sp.y, sp.r * 1.1, 41 + i, E.outCubic(inv(sp.t0, sp.t0 + 0.05, t))); });
+}
+// WHALE (after the first sweep)
+const WHALE = (() => {
+  const top = chain(bez([1600, 560], [1520, 400], [1180, 360], [860, 420]), bez([860, 420], [650, 460], [520, 470], [420, 420]), bez([420, 420], [370, 390], [340, 330], [330, 290]));
+  const bot = chain(bez([360, 300], [380, 380], [420, 470], [520, 540]), bez([520, 540], [700, 650], [900, 700], [1100, 700]), bez([1100, 700], [1350, 700], [1560, 660], [1600, 560]));
+  return top.concat(bot);
+})();
+const W2_STROKES = [
+  [4.75, 4.89, P((k) => [1470 + Math.cos(k * 6.3) * 8, 545 + Math.sin(k * 6.3) * 8], 16), 12],                         // eye
+  ...[0, 1, 2, 3].map((i) => [5.0 + i * 0.07, 5.07 + i * 0.07, chain(bez([1560 - i * 8, 610 + i * 13], [1420, 655 + i * 10], [1250, 680 + i * 6], [1080, 690 + i * 3])), 8]), // throat grooves
+  [5.3, 5.45, chain(bez([1225, 672], [1160, 780], [1040, 880], [900, 935])), 10],
+];
+const BUBBLES = Array.from({ length: 7 }, (_, i) => ({ t0: 5.2 + i * 0.04, x: 1640 + i * 22 + Math.sin(i * 3) * 18, y: 470 - i * 46, r: 7 + (i % 3) * 4 }));
+const WATER = [chain(bez([-40, 170], [400, 120], [800, 230], [1250, 150])), chain(bez([700, 90], [1100, 30], [1500, 140], [1960, 70])),
+  chain(bez([-40, 860], [300, 800], [600, 930], [900, 980])), chain(bez([1350, 880], [1600, 820], [1800, 900], [1960, 850]))];
+const WH_BACK = chain(bez([1520, 450], [1300, 395], [1000, 400], [760, 450]));
+const WH_MOUTH = chain(bez([1590, 585], [1540, 600], [1480, 605], [1420, 598]));
+function drawWhale(g, t) {
+  // underwater: the side of the finger draws a few soft curving water lines
+  const gr = g.createLinearGradient(0, 0, 0, SH); gr.addColorStop(0, RED(0.4)); gr.addColorStop(0.5, RED(0.12)); gr.addColorStop(1, RED(0));
+  g.fillStyle = gr; g.fillRect(0, 0, SW, SH);
+  // body (thick), fin, flukes
+  g.save(); g.globalCompositeOperation = 'source-over'; g.filter = 'blur(5px)'; g.fillStyle = 'rgb(0,255,0)';
+  g.beginPath(); WHALE.forEach((p, i) => (i ? g.lineTo(p[0], p[1]) : g.moveTo(p[0], p[1]))); g.closePath(); g.fill();
+  // flukes: a crescent seen from below as the tail lifts
+  g.beginPath(); g.moveTo(345, 300); g.bezierCurveTo(300, 250, 220, 220, 150, 240); g.bezierCurveTo(220, 260, 250, 290, 255, 300);
+  g.bezierCurveTo(270, 290, 300, 280, 345, 300); g.bezierCurveTo(380, 250, 430, 200, 520, 185); g.bezierCurveTo(450, 230, 410, 270, 345, 310); g.fill();
+  g.beginPath(); g.moveTo(1230, 660); g.bezierCurveTo(1160, 780, 1020, 900, 860, 960); g.bezierCurveTo(990, 870, 1090, 760, 1140, 668); g.fill();
+  g.restore();
+  g.fillStyle = GRN(0.6); for (let i = 0; i < 7; i++) { g.beginPath(); g.arc(1555 - i * 34, 470 - i * 9 + (i % 2) * 6, 7, 0, 7); g.fill(); }   // tubercles on the head
+  // belly lighter (sand thinned by the side of the finger)
+  g.save(); g.filter = 'blur(9px)'; g.strokeStyle = RED(0.32); g.lineWidth = 40; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(1540, 630); g.bezierCurveTo(1300, 690, 900, 690, 560, 560); g.stroke(); g.restore();
+  WATER.forEach((pts, i) => scrape(g, pts, 1, 30, 41 + i, 0.32));
+  g.save(); g.globalCompositeOperation = 'source-over'; g.filter = 'blur(4px)'; g.strokeStyle = 'rgb(0,255,0)'; g.lineCap = 'round'; g.lineWidth = 44;
+  g.beginPath(); g.moveTo(430, 430); g.quadraticCurveTo(380, 380, 345, 305); g.stroke(); g.restore();          // the tail stock into the flukes
+  W2_STROKES.forEach(([a, b, pts, w], i) => scrape(g, pts, inv(a, b, t), w * 1.3, 51 + i));
+  BUBBLES.forEach((b, i) => { if (t > b.t0) dab(g, b.x, b.y, b.r * 1.1, 61 + i, E.outCubic(inv(b.t0, b.t0 + 0.05, t))); });
+  // the whale's back highlight line
+  scrape(g, WH_BACK, 1, 12, 71, 0.9);
+  scrape(g, WH_MOUTH, 1, 8, 72, 0.9);   // mouth line
+}
+// CARAVAN UNDER THE MOON (after the second sweep)
+const RIDGE = (x) => 640 - 120 * Math.exp(-(((x - 820) / 520) ** 2)) + 30 * Math.sin(x / 260);
+const MOON = [1440, 270, 135];
+const STARS = [[1660, 120], [1745, 245], [1720, 395], [1640, 470], [1270, 450], [1205, 345]].map(([x, y], i) => ({ t0: 6.5 + i * 0.05, x, y, r: 4 + (i % 3) * 1.5 }))
+  .concat([[160, 90], [420, 210], [640, 70], [880, 160], [300, 330], [760, 300]].map(([x, y], i) => ({ t0: -1, x, y, r: 3 + (i % 2) * 1.5 })));
+function camel(g, x, s, step, neck = 0, hump = 1) {
+  const y = RIDGE(x) - 4;
+  g.save(); g.translate(x, y); g.scale(s, s);
+  g.lineCap = 'round'; g.strokeStyle = GRN(1); g.fillStyle = GRN(1);
+  // legs (walking)
+  g.lineWidth = 9;
+  [[-30, step], [-18, -step], [26, -step], [38, step]].forEach(([lx, ph]) => { g.beginPath(); g.moveTo(lx, -60); g.lineTo(lx + ph * 10, -4); g.stroke(); });
+  // body + hump
+  g.beginPath(); g.ellipse(4, -78, 52, 26, 0, 0, 7); g.fill();
+  g.beginPath(); g.ellipse(-2, -100, 26 * hump, 22 * hump, 0, 0, 7); g.fill();
+  // neck + head (forward, toward +x)
+  g.lineWidth = 15; g.beginPath(); g.moveTo(46, -82); g.quadraticCurveTo(78, -86 + neck, 80, -122 + neck); g.stroke();
+  g.beginPath(); g.ellipse(92, -126 + neck, 18, 9, 0.25 + neck * 0.01, 0, 7); g.fill();
+  // rider with a robe + a pole
+  g.beginPath(); g.ellipse(-2, -128, 13, 20, 0, 0, 7); g.fill();
+  g.beginPath(); g.arc(-1, -152, 9, 0, 7); g.fill();
+  g.lineWidth = 3; g.beginPath(); g.moveTo(-14, -120); g.lineTo(-40, -176); g.stroke();
+  g.restore();
+}
+const MOON_SPIRAL = Array.from({ length: 200 }, (_, i) => { const k = i / 199, a = -Math.PI / 2 + k * Math.PI * 2 * 3.2, r = MOON[2] * (0.08 + 0.86 * k); return [MOON[0] + Math.cos(a) * r, MOON[1] + Math.sin(a) * r]; });
+const STEPS = Array.from({ length: 7 }, (_, i) => { const x = 345 - i * 34; return { t0: 7.0 + i * 0.045, x, y: RIDGE(x) + 24 + (i % 2 ? 8 : -2) }; });
+const STAR_PATH = chain(bez([330, 120], [620, 120], [900, 150], [1180, 205]));
+const STAR_HEAD = [1180, 205];
+const RIDGE_LINE = Array.from({ length: 62 }, (_, i) => { const x = 980 + i * 15; return [x, RIDGE(x) + 6]; });
+// the shooting star: the finger starts light (a faint thin tail) and presses harder toward the head
+function starStroke(g, u) {
+  const L = STAR_PATH.L || (STAR_PATH.L = plen(STAR_PATH)), total = L[L.length - 1];
+  for (let d = 0; d <= u * total; d += 2.2) {
+    const k = d / total, q = at(STAR_PATH, k), n1 = Reel.hash(d * 0.37 + 5);
+    const r = (1.5 + 7.5 * Math.pow(k, 1.6)) * (0.85 + 0.3 * n1);
+    g.fillStyle = 'rgba(255,0,0,' + (0.06 + 0.3 * Math.pow(k, 1.3)) + ')';
+    g.beginPath(); g.arc(q[0] + (Reel.hash(d * 1.3) - 0.5) * 2, q[1] + (Reel.hash(d * 2.1) - 0.5) * 2, r, 0, 6.2832); g.fill();
+  }
+}
+function drawCaravan(g, t) {
+  // sky thinned by the palm, moon halo
+  const gr = g.createLinearGradient(0, 0, 0, SH); gr.addColorStop(0, RED(0.48)); gr.addColorStop(0.55, RED(0.3)); gr.addColorStop(0.62, RED(0));
+  g.fillStyle = gr; g.fillRect(0, 0, SW, SH);
+  // dunes: thick sand below the ridge, a second darker dune in front
+  g.save(); g.filter = 'blur(6px)'; g.fillStyle = GRN(0.75);
+  g.beginPath(); g.moveTo(-20, SH + 20); for (let x = -20; x <= SW + 20; x += 20) g.lineTo(x, RIDGE(x)); g.lineTo(SW + 20, SH + 20); g.fill();
+  g.fillStyle = GRN(0.55); g.beginPath(); g.moveTo(-20, SH + 20);
+  for (let x = -20; x <= SW + 20; x += 20) g.lineTo(x, 800 + 70 * Math.sin((x + 300) / 380) - 40 * Math.exp(-(((x - 1400) / 300) ** 2))); g.lineTo(SW + 20, SH + 20); g.fill();
+  g.restore();
+  // wind-combed ridge highlight
+  scrape(g, RIDGE_LINE, 1, 9, 81, 0.85);
+  // caravan
+  [[380, 0.98, 1, 6, 1.0], [565, 0.86, -0.4, -4, 0.85], [735, 0.93, 0.7, 10, 1.1], [895, 0.8, -1, 0, 0.9]].forEach(([x, s, st, nk, hu]) => camel(g, x, s, st * 0.6, nk, hu));
+  // moon: the fingertip spirals out from the centre; the pushed sand banks up in a ring around it
+  const mu = inv(6.0, 6.5, t);
+  if (mu > 0) {
+    g.save(); g.filter = 'blur(30px)'; g.fillStyle = RED(0.14 * mu); g.beginPath(); g.arc(MOON[0], MOON[1], MOON[2] * 1.5, 0, 7); g.fill(); g.restore();
+    dab(g, MOON[0], MOON[1], 26, 7, clamp(mu * 6));
+    scrape(g, MOON_SPIRAL, mu, 64, 9, 1.3);
+    const rr = MOON[2] * Math.sqrt(clamp(mu));
+    g.save(); g.filter = 'blur(9px)'; g.strokeStyle = GRN(0.55); g.lineWidth = 22; g.beginPath(); g.arc(MOON[0], MOON[1], rr + 16, 0, 7); g.stroke(); g.restore();
+  }
+  // footprints behind the caravan, tapped right to left, then a shooting star swiped toward the moon
+  STEPS.forEach((f, i) => { if (t > f.t0) dab(g, f.x, f.y, 6, 120 + i, E.outCubic(inv(f.t0, f.t0 + 0.04, t))); });
+  if (t > 7.5) { starStroke(g, E.outCubic(inv(7.5, 7.68, t)));
+    if (t > 7.66) [[0, 0, 9], [14, -6, 5], [-8, 10, 4]].forEach(([dx, dy, r], i) => dab(g, STAR_HEAD[0] + dx, STAR_HEAD[1] + dy, r, 140 + i, E.outCubic(inv(7.66 + i * 0.02, 7.72 + i * 0.02, t)))); }
+  if (mu >= 1) { g.save(); g.globalCompositeOperation = 'source-over'; g.filter = 'blur(10px)';
+    // one soft, irregular "sea" where a little sand was left (no symmetric spots — they read as a face)
+    g.filter = 'blur(16px)'; g.fillStyle = 'rgba(120,0,0,1)'; g.beginPath(); g.ellipse(MOON[0] - 28, MOON[1] - 18, 46, 30, 0.6, 0, 7); g.fill();
+    g.fillStyle = 'rgba(190,0,0,1)'; g.beginPath(); g.ellipse(MOON[0] + 8, MOON[1] + 2, 26, 18, 0.2, 0, 7); g.fill();
+    g.restore(); }
+  STARS.forEach((st, i) => { if (t > st.t0) dab(g, st.x, st.y, st.r * 1.25, 91 + i, E.outCubic(inv(st.t0, st.t0 + 0.04, t))); });
+}
+/* ---------------- sweeps between drawings (the palm) ---------------- */
+const SWEEP1 = { t0: 4.0, t1: 4.6, path: chain(bez([-150, 260], [500, 220], [600, 900], [1000, 820]), bez([1000, 820], [1400, 740], [1300, 230], [2080, 300])), w: 640 };
+const SWEEP2 = { t0: 5.5, t1: 6.0, path: chain(bez([2080, 120], [1300, 60], [700, 420], [-150, 360]), bez([-150, 360], [500, 640], [1300, 820], [2080, 900])), w: 600 };
+
+/* ---------------- canvases ---------------- */
+const mainCv = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
+const cvA = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
+const cvB = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
+const cvM = Object.assign(document.createElement('canvas'), { width: SW, height: SH });
+const ctx = (c) => c.getContext('2d', { willReadFrequently: false });
+function base(g) { g.globalCompositeOperation = 'source-over'; g.filter = 'none'; g.globalAlpha = 1; g.fillStyle = '#000'; g.fillRect(0, 0, SW, SH); g.globalCompositeOperation = 'lighter'; }
+function composite(drawOld, drawNew, sw, t) {
+  const g = ctx(mainCv), a = ctx(cvA), b = ctx(cvB), m = ctx(cvM);
+  base(a); drawOld(a); base(b); drawNew(b);
+  m.globalCompositeOperation = 'source-over'; m.filter = 'none'; m.clearRect(0, 0, SW, SH);
+  const u = inv(sw.t0, sw.t1, t);
+  m.save(); m.filter = 'blur(40px)'; m.strokeStyle = '#000'; m.lineCap = 'round'; m.lineJoin = 'round'; m.lineWidth = sw.w * 1.18; drawPart(m, sw.path, u); m.restore();
+  const tail = inv(sw.t1 - 0.05, sw.t1 + 0.12, t);
+  if (tail > 0) { m.fillStyle = `rgba(0,0,0,${E.inOutSine(tail)})`; m.fillRect(0, 0, SW, SH); }
+  g.globalCompositeOperation = 'source-over'; g.filter = 'none'; g.drawImage(cvA, 0, 0);
+  // ahead of the palm the old sand is shoved along: smeared copies of the old picture, clipped to the bow wave
+  if (u > 0 && u < 1) {
+    const p0 = at(sw.path, u), q0 = at(sw.path, Math.max(0, u - 0.025));
+    const dx0 = p0[0] - q0[0], dy0 = p0[1] - q0[1], L0 = Math.hypot(dx0, dy0) || 1, ux = dx0 / L0, uy = dy0 / L0;
+    for (let k = 1; k <= 6; k++) {
+      g.save(); g.beginPath(); g.arc(p0[0] + ux * (sw.w * 0.3 + k * 26), p0[1] + uy * (sw.w * 0.3 + k * 26), sw.w * (0.6 - k * 0.04), 0, 7); g.clip();
+      g.globalAlpha = 0.34; g.drawImage(cvA, ux * k * 34, uy * k * 34); g.restore();
+    }
+  }
+  g.drawImage(cvM, 0, 0);                         // erase where the palm has passed
+  b.globalCompositeOperation = 'destination-in'; b.drawImage(cvM, 0, 0);
+  g.globalCompositeOperation = 'lighter'; g.drawImage(cvB, 0, 0);
+  // the ridge of sand pushed ahead of the palm
+  if (u > 0 && u < 1) {
+    const p = at(sw.path, u), q = at(sw.path, Math.max(0, u - 0.03));
+    const dx = p[0] - q[0], dy = p[1] - q[1], L = Math.hypot(dx, dy) || 1;
+    g.save(); g.filter = 'blur(18px)'; g.strokeStyle = GRN(0.9); g.lineWidth = 70; g.lineCap = 'round';
+    g.beginPath(); g.arc(p[0] + dx / L * 150, p[1] + dy / L * 150, sw.w * 0.42, Math.atan2(dy, dx) - 1.1, Math.atan2(dy, dx) + 1.1); g.stroke(); g.restore();
+  }
+}
+function drawFrame(t) {
+  const g = ctx(mainCv); base(g);
+  if (t < SWEEP1.t0) drawWave(g, t);
+  else if (t < SWEEP1.t1 + 0.35) composite((a) => drawWave(a, 3.99), (b) => drawWhale(b, t), SWEEP1, t);
+  else if (t < SWEEP2.t0) drawWhale(g, t);
+  else if (t < SWEEP2.t1 + 0.35) composite((a) => drawWhale(a, 5.54), (b) => drawCaravan(b, t), SWEEP2, t);
+  else drawCaravan(g, t);
+}
+
+/* ---------------- the hand ---------------- */
+// pose: palm centre, finger direction angle, extensions [index, middle, ring, pinky, thumb], spread
+const FDIR = -1.95;   // fingers pointing up-left (arm comes from the bottom-right)
+const TIP_LOCAL = [-72, 105 + 180];
+function palmFromTip(tip, ang, sc = 1) {
+  const fd = [Math.cos(ang), Math.sin(ang)], pp = [-fd[1], fd[0]];
+  return [tip[0] - (pp[0] * TIP_LOCAL[0] + fd[0] * TIP_LOCAL[1]) * sc, tip[1] - (pp[1] * TIP_LOCAL[0] + fd[1] * TIP_LOCAL[1]) * sc];
+}
+const POINT = [1, 0.18, 0.15, 0.15, 0.35], FLAT = [1, 1, 1, 1, 0.8], FIST = [0.14, 0.14, 0.14, 0.14, 0.3];
+const mixE = (a, b, k) => a.map((v, i) => lerp(v, b[i], k));
+function strokesAt(t) {   // which fingertip target applies now
+  const L = [];
+  for (const [a, b, pts] of W_STROKES) L.push([a, b, (u) => at(pts, u)]);
+  for (const c of CLAWS) L.push([c.t0, c.t0 + 0.07, (u) => [c.x + Math.cos(c.a) * 70 * u, c.y + Math.sin(c.a) * 70 * u]]);
+  for (const s of SPRAY) L.push([s.t0, s.t0 + 0.04, () => [s.x, s.y]]);
+  for (const [a, b, pts] of W2_STROKES) L.push([a, b, (u) => at(pts, u)]);
+  for (const s of BUBBLES) L.push([s.t0, s.t0 + 0.035, () => [s.x, s.y]]);
+  L.push([6.0, 6.5, (u) => at(MOON_SPIRAL, u)]);
+  for (const s of STARS) if (s.t0 > 0) L.push([s.t0, s.t0 + 0.035, () => [s.x, s.y]]);
+  for (const f of STEPS) L.push([f.t0, f.t0 + 0.035, () => [f.x, f.y]]);
+  L.push([7.5, 7.68, (u) => at(STAR_PATH, E.outCubic(u))]);
+  L.push([7.68, 7.74, () => STAR_HEAD]);
+  return L.sort((x, y) => x[0] - y[0]);
+}
+let STROKES = null;
+function tipTarget(t) {
+  // on a stroke: its current point; between strokes: glide (lifted) from the end of one to the start of the next
+  let prev = null;
+  for (const s of STROKES) {
+    if (t >= s[0] && t <= s[1]) return { p: s[2](inv(s[0], s[1], t)), down: 1 };
+    if (s[0] > t) {
+      if (!prev) return { p: s[2](0), down: 0 };
+      const k = E.inOutSine(inv(prev[1], s[0], t));
+      const a = prev[2](1), b = s[2](0), dist = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      // lifted off the glass: the longer the hop, the higher the arc (the hand comes closer to the lens)
+      const lift = Math.sin(Math.PI * k) * Math.min(1, dist / 300);
+      return { p: [lerp(a[0], b[0], k), lerp(a[1], b[1], k) - (30 + 0.16 * dist) * Math.sin(Math.PI * k)], down: 0, lift };
+    }
+    prev = s;
+  }
+  return { p: prev[2](1), down: 0 };
+}
+function pointHand(t) {
+  const tt = tipTarget(t);
+  const ang = FDIR + 0.12 * Math.sin(t * 1.3) + 0.0008 * (tt.p[0] - 960);
+  const sc = 1.14 + 0.03 * (1 - tt.down) + 0.09 * (tt.lift || 0);
+  const pal = palmFromTip(tt.p, ang, sc);
+  return { x: pal[0], y: pal[1], ang, e: POINT, sc, vis: 1, pour: [0, 0, 0] };
+}
+function pourHand(t) {
+  const p = at(POUR, inv(0.0, 0.92, t) * 0.92 + 0.08);
+  return { x: p[0] + 110, y: p[1] + 150, ang: FDIR + 0.25, e: FIST, sc: 1.14, vis: 1, pour: [p[0], p[1], t < 0.92 ? 1 : 0] };
+}
+const blendH = (A, B, k) => ({ x: lerp(A.x, B.x, k), y: lerp(A.y, B.y, k), ang: lerp(A.ang, B.ang, k), e: mixE(A.e, B.e, k), sc: lerp(A.sc, B.sc, k), vis: 1, pour: k < 0.5 ? A.pour : B.pour });
+function hand(t) {
+  // 0-0.92 a fist pouring along the swell, then it opens into a pointing hand while travelling to the first line
+  if (t < 0.88) return pourHand(t);
+  if (t < 1.0) return blendH(pourHand(Math.min(t, 0.92)), pointHand(1.0), E.inOutSine(inv(0.88, 1.0, t)));
+  // the two palm sweeps (blended in and out of the pointing hand)
+  for (const sw of [SWEEP1, SWEEP2]) {
+    if (t > sw.t0 - 0.15 && t < sw.t1 + 0.15) {
+      const u = inv(sw.t0, sw.t1, t);
+      const p = at(sw.path, u), q = at(sw.path, Math.min(1, u + 0.02));
+      const a = Math.atan2(q[1] - p[1], q[0] - p[0]);
+      const S = { x: p[0], y: p[1], ang: a - 1.3, e: FLAT, sc: 1.08, vis: 1, pour: [0, 0, 0] };
+      const k = E.inOutSine(clamp((t - (sw.t0 - 0.15)) / 0.15)) * E.inOutSine(clamp((sw.t1 + 0.15 - t) / 0.15));
+      return blendH(pointHand(t), S, k);
+    }
+  }
+  // after the shooting star: the hand lifts and leaves the light box
+  if (t > 7.74) {
+    const H = pointHand(7.74), k = E.inCubic(inv(7.74, 8.3, t));
+    return { x: H.x + k * 1000, y: H.y + k * 760, ang: H.ang + 0.25 * k, e: mixE(POINT, FLAT, k), sc: H.sc + 0.08 * k, vis: t < 8.32 ? 1 : 0, pour: [0, 0, 0] };
+  }
+  return pointHand(t);
+}
+
+/* ---------------- renderer ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.28, th: 1.2, expo: 1.0, vig: 0.42, grain: 0.03, ca: 0.08, contrast: 1.03, sat: 1.0, bands: 2,
+  uniforms: `
+uniform sampler2D uSand;
+uniform vec4 uCam;     // centre x, y (design px), zoom, rotation
+uniform vec4 uHand;    // palm x, y, finger angle, scale
+uniform vec4 uFing;    // index, middle, ring, pinky extension
+uniform vec4 uFing2;   // thumb, visible, -, -
+uniform vec4 uPour;    // x, y, on, frame`,
+  scene: `
+const vec3 LIGHT_COL = vec3(1.);   // light colour, vec3(1.) = as delivered (see the Chinese note at the top of the script)
+float sdCap2(vec2 p, vec2 a, vec2 b, float r){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0., 1.); return length(pa - ba * h) - r; }
+float sdRB(vec2 p, vec2 b, float r){ vec2 q = abs(p) - b + r; return length(max(q, 0.)) + min(max(q.x, q.y), 0.) - r; }
+float sdHand(vec2 w){
+  vec2 fd = vec2(cos(uHand.z), sin(uHand.z)), pp = vec2(-fd.y, fd.x);
+  vec2 q = w - uHand.xy; q = vec2(dot(q, pp), dot(q, fd)) / uHand.w;
+  float d = sdRB(q - vec2(0., 5.), vec2(98., 112.), 52.);
+  d = smin(d, sdCap2(q, vec2(5., -60.), vec2(70., -980.), 86.), 40.);
+  vec4 bx = vec4(-70., -23., 24., 68.), ln = vec4(180., 198., 186., 146.), rd = vec4(21., 22.5, 21., 18.), sp = vec4(-.1, -.03, .04, .12);
+  for (int i = 0; i < 4; i++) {
+    float e = uFing[i];
+    float L = ln[i] * (.24 + .76 * e);
+    vec2 a = vec2(bx[i], 100.), dir = vec2(sin(sp[i]), cos(sp[i]));
+    // a curled finger folds under: from above it's a knuckle stub, slightly fatter
+    d = smin(d, sdCap2(q, a, a + dir * L, rd[i] * (1. + .25 * (1. - e))), 16.);
+  }
+  float et = uFing2.x;
+  vec2 ta = vec2(-92., -10.), tdir = normalize(vec2(-.62, .78));
+  d = smin(d, sdCap2(q, ta, ta + tdir * 150. * (.35 + .65 * et), 25.), 22.);
+  return d * uHand.w;
+}
+vec3 render(vec2 fc){
+  // design-space pixel, then the camera over the light box
+  vec2 ps = vec2(fc.x, uRes.y - fc.y) / uRes.y * 1080.;
+  float c = cos(uCam.w), s = sin(uCam.w);
+  vec2 w = uCam.xy + mat2(c, -s, s, c) * (ps - vec2(960., 540.)) / uCam.z;
+  vec2 uv = vec2(w.x / 1920., 1. - w.y / 1080.);
+  vec4 sm = texture(uSand, uv);
+  float Rb = textureLod(uSand, uv, 3.2).r;
+  float Rb2 = textureLod(uSand, uv, 5.).r;
+  float G = textureLod(uSand, uv, .8).g;
+  // grain-scale noise in sand coordinates (a grain is ~1.2 design px)
+  vec2 gc = floor(w / 1.25);
+  float g1 = hash12(gc), g2 = hash12(gc + 71.3), g3 = vnoise2(w / 3.5);
+  float rr = sm.r + (g3 - .5) * .38 + (g1 - .5) * .26;
+  float R = smoothstep(.24, .8, rr);
+  float Rb1 = textureLod(uSand, uv, 1.8).r;
+  float h0 = .95 + .3 * (fbm2(w / 380.) - .5) + .08 * (vnoise2(w / 40.) - .5);
+  float bank = max(Rb1 - sm.r, 0.) * 1.1 + max(Rb - sm.r, 0.) * 1.1 + max(Rb2 - Rb, 0.) * .5;   // sand pushed aside by the finger
+  // a finger never clears glass completely: a thin graded film stays in the channel (warm, not white)
+  float resid = .1 + .08 * vnoise2(w / 9.) + .06 * (1. - sm.r);
+  float h = (h0 + G * 1.55 + bank) * (1. - R * (1. - resid));
+  h *= .8 + .4 * g2;
+  // loose grains scattered over cleared glass
+  // loose grains on cleared glass: soft ~2px dots (never single-pixel specks), warm brown by transmission
+  vec2 sc2 = w / 2.2; vec2 ci = floor(sc2);
+  float hs2 = hash12(ci + 17.7);
+  float dotS = smoothstep(.5, .18, length(fract(sc2) - .5 - (hash12(ci + 3.3) - .5) * .35));
+  float speck = step(mix(.975, .92, R), hs2) * dotS * (.6 + .6 * hash12(ci + 9.1)) * (1. - smoothstep(.2, .9, h));
+  h += speck * .9;
+  // pour: grains falling around the stream
+  if (uPour.z > .5) {
+    float d = length(w - uPour.xy);
+    float core = exp(-d * d / 300.);
+    float fall = step(.93, hash12(floor(w / 1.6) + uPour.w * 13.1)) * exp(-d * d / 9000.);
+    h += core * 2.2 + fall * 1.5;
+  }
+  vec3 k = vec3(2.05, 2.55, 3.45);
+  vec3 T = exp(-h * k);
+  float box = 1. - .16 * smoothstep(300., 1300., length((w - vec2(960., 560.)) * vec2(1., 1.25)));
+  vec3 Lb = LIGHT_COL * vec3(1., .83, .62) * 1.75 * box;
+  vec3 col = Lb * T;
+  gDepth = 1.;
+  // the hand: backlit silhouette with sub-surface glow at its thin edges
+  if (uFing2.y > .5) {
+    float d = sdHand(w);
+    if (d < 60.) {
+      float a = smoothstep(4., -4., d);
+      float inside = max(-d, 0.);
+      vec3 skin = vec3(.012, .008, .006) * (1. + .6 * fbm2(w / 60.));
+      vec3 sss = vec3(.62, .16, .05) * .16 * exp(-inside / 2.4) + vec3(.35, .07, .025) * .022 * exp(-inside / 12.);
+      vec3 hc = skin + sss;
+      // light wraps around the very edge a little (halo onto the sand under the hand edge)
+      col = mix(col, hc, a);
+      col *= 1. - .25 * smoothstep(40., 0., d) * (1. - a);   // soft occlusion of the box light right next to the hand
+      if (a > .5) gDepth = .86;
+    }
+  }
+  return col;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+const sandTex = gl.createTexture();
+function uploadSand() {
+  gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, sandTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, mainCv);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0);
+}
+const CAMT = Track([
+  { t: 0.0, v: [960, 540, 1.07] }, { t: 2.0, v: [985, 548, 1.09] }, { t: 3.9, v: [975, 545, 1.12] }, { t: 5.0, v: [1000, 540, 1.19] },
+  { t: 6.2, v: [975, 546, 1.12] }, { t: 8.0, v: [962, 545, 1.065] }, { t: 10.0, v: [956, 543, 1.07] },
+]);
+function camAt(t) {
+  const [cx, cy, z] = CAMT(t);
+  return [cx + 6 * Math.sin(t * 0.45), cy + 4 * Math.sin(t * 0.37 + 1), z, 0.008 * Math.sin(t * 0.3)];
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() { STROKES = strokesAt(0); },
+  cues: [
+    { t: 0.0, sfx: 'sand_pour', gain: 0.8 },
+    { t: 1.0, sfx: 'sand_line', gain: 0.75 }, { t: 1.5, sfx: 'sand_line', gain: 0.7 }, { t: 2.0, sfx: 'sand_line', gain: 0.7 },
+    { t: 2.5, sfx: 'sand_flicks', gain: 0.6 }, { t: 3.0, sfx: 'sand_taps6', gain: 0.6 }, { t: 3.5, sfx: 'sand_line', gain: 0.55 },
+    { t: 4.0, sfx: 'sand_sweep', gain: 0.95 }, { t: 4.75, sfx: 'sand_taps', gain: 0.45 }, { t: 5.0, sfx: 'sand_line', gain: 0.5 },
+    { t: 5.5, sfx: 'sand_sweep', gain: 0.85 }, { t: 6.0, sfx: 'sand_swirl', gain: 0.65 }, { t: 6.5, sfx: 'sand_taps6', gain: 0.45 },
+    { t: 7.0, sfx: 'sand_steps', gain: 0.6 }, { t: 7.5, sfx: 'sand_line', gain: 0.6 }, { t: 7.5, sfx: 'star_bell', gain: 0.5 },
+  ],
+  render(t) {
+    drawFrame(t); uploadSand();
+    const h = hand(t), c = camAt(t);
+    rm.set('uSand', { __ints: 1, v: 5 }).set('uCam', c)
+      .set('uHand', [h.x, h.y, h.ang, h.sc]).set('uFing', h.e.slice(0, 4)).set('uFing2', [h.e[4], h.vis, 0, 0])
+      .set('uPour', [h.pour[0], h.pour[1], h.pour[2], Math.floor(t * 30)]);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, sandTex); gl.activeTexture(gl.TEXTURE0);
+    rm.render(t, { focus: 1.0, aperture: 70, maxCoc: 8 });
+  },
+});
+</script></body></html>

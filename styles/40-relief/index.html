@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>40 大理石浮雕 · Marble Relief</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script><script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 40 大理石浮雕 · MARBLE RELIEF =====
+   A cream marble panel in a dark museum: sea-and-cliff waves (海水江崖), auspicious ruyi clouds and a flaming
+   pearl, carved in high relief. A theatre spot rakes across it in the dark; at the hook it drops to a grazing
+   angle and swings round while the camera trucks low over the carving, so the long shadows make the stone move.
+   The light always travels over the top (as a museum light would), flaring on the drum; the camera pulls back
+   while the light is still settling, and on the closing bell a narrow raking light sweeps the incised key-fret band.
+   Height field (procedural SDF carving, baked once into a float texture) -> ray-marched with soft shadows,
+   baked AO, 3D marble veining, polished vs. stippled tooling, warm sub-surface wrap, GGX sheen, depth of field. */
+const { E, clamp, inv, lerp } = Reel;
+// ★ 改光色改这里：着色器里的 LIGHT_COL（搜 LIGHT_COL）。它乘在聚光灯（石面受光、反弹、石头透光、光柱里的浮尘）上。
+//   vec3(1.) = 原样（和成片一模一样）；偏冷例如 vec3(.85, .93, 1.1)；开灯时钨丝由黄变白的动画在 JS 的 uLc，冷色补光和结尾扫光是别的灯。只想换物体/纸/颜料的颜色是“配色”，不是光，见 SKILL 的对照表。
+const stage = Reel.makeStage('#050404');
+Reel.ownJitter = true;
+
+const DBG = +(Reel.Q.get('dbg') || 0);
+
+const PW = 3.2, PH = 1.8;                 // panel size (world units)
+const BX0 = -1.5, BX1 = 1.5, BY0 = -0.81, BY1 = -0.585;   // inscription band
+const TW = 4096, TH = 2304;               // baked height texture
+const TXW = 3840, TXH = Math.round((BY1 - BY0) * 1280);    // text distance texture (1280 px / unit)
+
+const rm = Reel.RM(stage, {
+  bloom: 0.32, th: 0.9, expo: 1.0, vig: 0.42, grain: 0.03, ca: 0.45, contrast: 1.06, sat: 0.96, bands: 8,
+  lift: [0.003, 0.003, 0.004], gain: [0.99, 1.0, 1.015],
+  uniforms: `
+uniform sampler2D uH, uA, uT;
+uniform vec3 uRo, uTa; uniform float uF, uRoll;
+uniform vec3 uLp; uniform vec4 uSpot; uniform float uLI, uFill, uDbg, uFocus, uTm;
+uniform vec3 uLp2; uniform vec4 uSpot2; uniform float uLI2, uPearl;
+uniform vec3 uLc;`,
+  scene: `
+const vec3 LIGHT_COL = vec3(1.);   // light colour, vec3(1.) = as delivered (see the Chinese note at the top of the script)
+const float PW = ${PW.toFixed(3)}, PH = ${PH.toFixed(3)};
+const float ZT = .13, ZW = -.09;
+const float BX0 = ${BX0.toFixed(3)}, BX1 = ${BX1.toFixed(3)}, BY0 = ${BY0.toFixed(3)}, BY1 = ${BY1.toFixed(3)};
+bool inPanel(vec2 p){ return abs(p.x) < PW*.5 && abs(p.y) < PH*.5; }
+// cubic B-spline sampling from 4 bilinear taps: removes the creases a bilinear height field shows on steep walls
+vec4 cubicW(float v){ vec4 n = vec4(1., 2., 3., 4.) - v; vec4 s = n*n*n; float x = s.x, y = s.y - 4.*s.x, z = s.z - 4.*s.y + 6.*s.x; return vec4(x, y, z, 6. - x - y - z)/6.; }
+vec4 texBicubic(sampler2D t, vec2 uv){
+  vec2 ts = vec2(textureSize(t, 0)); vec2 its = 1./ts;
+  uv = uv*ts - .5; vec2 f = fract(uv); uv -= f;
+  vec4 wx4 = cubicW(f.x), wy4 = cubicW(f.y);
+  vec4 c = uv.xxyy + vec2(-.5, 1.5).xyxy;
+  vec4 s = vec4(wx4.xz + wx4.yw, wy4.xz + wy4.yw);
+  vec4 o = (c + vec4(wx4.yw, wy4.yw)/s)*its.xxyy;
+  vec4 s0 = texture(t, o.xz), s1 = texture(t, o.yz), s2 = texture(t, o.xw), s3 = texture(t, o.yw);
+  float sx = s.x/(s.x + s.y), sy = s.z/(s.z + s.w);
+  return mix(mix(s3, s2, sx), mix(s1, s0, sx), sy);
+}
+vec2 puv(vec2 p){ return p / vec2(PW, PH) + .5; }
+float txt(vec2 p){                                  // incised V-groove depth of the inscription
+  if (p.x < BX0 || p.x > BX1 || p.y < BY0 || p.y > BY1) return 0.;
+  float d = texture(uT, vec2((p.x - BX0)/(BX1 - BX0), (BY1 - p.y)/(BY1 - BY0))).r;
+  return min(d*1.7, .0095);
+}
+float hgt(vec2 p){
+  if (!inPanel(p)) return ZW;
+  return texBicubic(uH, puv(p)).r - txt(p);
+}
+float fbm3(vec3 p){ float a=.5, s=0.; for(int i=0;i<5;i++){ s+=a*vnoise(p); p=p*2.07+vec3(1.7,9.2,3.1); a*=.5; } return s; }
+vec3 marble(vec3 p){
+  vec3 q = p*1.6;
+  float w1 = fbm3(q*.9 + vec3(3.1,.7,1.9));
+  float w2 = fbm3(q*2.1 + vec3(w1*2.2, 1.3, 5.1));
+  // broad cloudy drifts stretched along the bedding direction
+  vec3 r = vec3(p.x*.8 + p.y*1.3, p.y*.6 - p.x*.5, p.z);
+  float cloud = fbm3(r*vec3(1.1, 3.6, 2.) + w1*1.9);
+  // feathered veins: a warped band with soft, ragged edges, plus a faint dark thread
+  float v = sin((p.x*1.1 - p.y*1.7 + p.z*.7)*2.4 + w1*6.5 + w2*2.4);
+  float feather = fbm3(q*11. + 3.);
+  float vein = 1. - smoothstep(.0, .18 + feather*.35, abs(v));
+  float thread = 1. - smoothstep(.0, .045, abs(v + .2*sin(w2*9.)));
+  float v2 = abs(sin((p.x*.6 + p.y*1.5)*3.3 + w2*5. + 1.7));
+  float vein2 = 1. - smoothstep(.0, .12 + feather*.25, v2);
+  float cl = fbm3(q*3.5 + 7.);
+  vec3 base = vec3(.935, .895, .82)*(.965 + .05*cl);
+  base = mix(base, vec3(.80, .76, .69), smoothstep(.42, .76, cloud)*.62);
+  base = mix(base, vec3(.64, .59, .52), vein*.55*smoothstep(.25, .55, w1));
+  base = mix(base, vec3(.70, .62, .50), vein2*.36*smoothstep(.38, .68, w2));
+  base = mix(base, vec3(.48, .44, .40), thread*.4*smoothstep(.32, .58, w1));
+  return base;
+}
+float spotMask(vec2 p){
+  vec2 d = (p - uSpot.xy)/uSpot.zw;
+  return exp(-pow(dot(d,d), 1.6)*1.6);
+}
+float gJit = 0.;
+float shadowT(vec3 p, vec3 L, float k){
+  float res = 1., t = .0006 + .0012*gJit;
+  for (int i=0;i<560;i++){
+    vec3 q = p + L*t;
+    if (q.z > ZT || t > 3.) break;
+    float d = q.z - hgt(q.xy);
+    res = min(res, k*d/t);
+    if (res < -.05) break;
+    t += clamp(d*.3, .0002, .008)*(.8 + .4*gJit);
+  }
+  res = clamp(res, 0., 1.);
+  return res*res*(3. - 2.*res);
+}
+vec3 render(vec2 fc){
+  vec2 uv = (fc - .5*uRes)/uRes.y*2.;
+  mat3 cm = camMat(uRo, uTa, uRoll);
+  vec3 rd = normalize(cm*vec3(uv, uF));
+  vec3 ro = uRo;
+  // enter the carving slab
+  float t = rd.z < -1e-4 ? max((ro.z - ZT)/(-rd.z), 0.) : 0.;
+  float tEnd = rd.z < -1e-4 ? (ro.z - ZW)/(-rd.z) : 40.;
+  float slope = abs(rd.z) + 3.2*length(rd.xy);
+  bool hit = false; float tp = t;
+  for (int i=0;i<520;i++){
+    vec3 p = ro + rd*t;
+    float d = p.z - hgt(p.xy);
+    if (d < 0.) { hit = true; break; }
+    if (t > tEnd) break;
+    tp = t;
+    t += max(d/slope, 6e-5 + t*1.2e-4);
+  }
+  // dust motes drifting through the beam (lit only inside the pool, defocused by distance)
+  vec3 dust = vec3(0.);
+  mat3 ct = transpose(cm);
+  for (int i=0;i<34;i++){
+    float fi = float(i);
+    vec3 p0 = vec3(hash11(fi*1.7)*3.4 - 1.7, hash11(fi*3.1 + 2.)*2. - 1., .12 + hash11(fi*5.3 + 7.)*.85);
+    vec3 pp = p0 + vec3(.03*sin(uTm*.35 + fi), .012*uTm + .02*sin(uTm*.5 + fi*2.), .02*sin(uTm*.27 + fi*.7));
+    vec3 lc = ct*(pp - ro);
+    if (lc.z < .08) continue;
+    vec2 su = lc.xy/lc.z*uF;
+    float coc = .011 + abs(1./max(uFocus, .1) - 1./lc.z)*.012;     // never a hard point: soft, out-of-focus motes
+    float d = length(uv - su);
+    if (d > coc*1.4) continue;
+    float lit = spotMask(pp.xy)*uLI*smoothstep(.9, .15, pp.z);
+    dust += LIGHT_COL*vec3(1., .9, .78)*lit*(1. - smoothstep(coc*.2, coc, d))*(.006/(coc*coc*900. + .008));
+  }
+  if (!hit) { gDepth = 40.; return vec3(.004,.0035,.003) + dust; }
+  float a = tp, b = t;
+  for (int i=0;i<10;i++){ float m = .5*(a+b); vec3 p = ro + rd*m; if (p.z - hgt(p.xy) < 0.) b = m; else a = m; }
+  t = b; vec3 P = ro + rd*t;
+  gDepth = t;
+  // ---- surface classification + normal ----
+  vec3 n; float mat; float ao = 1., cav = 0.;
+  bool wall = !inPanel(P.xy) || P.z < ZW + .002;
+  if (wall) {
+    n = vec3(0,0,1); mat = 3.;
+  } else {
+    vec2 q = puv(P.xy);
+    vec4 h4 = texBicubic(uH, q);
+    vec4 a4 = texture(uA, q);
+    ao = a4.r; cav = a4.g;
+    mat = h4.a;
+    // side faces of the slab
+    float ex = PW*.5 - abs(P.xy.x), ey = PH*.5 - abs(P.xy.y);
+    if (min(ex, ey) < .0012 && P.z < h4.r - .004) {
+      n = ex < ey ? vec3(sign(P.x),0,0) : vec3(0,sign(P.y),0); mat = 2.;
+    } else {
+      vec2 g = h4.gb;
+      // inscription normal (finite differences of the groove)
+      float e = .0006;
+      float tx0 = txt(P.xy);
+      if (tx0 > 0. || (P.y < BY1 + .01 && P.y > BY0 - .01)) {
+        g.x -= (txt(P.xy + vec2(e,0)) - txt(P.xy - vec2(e,0)))/(2.*e);
+        g.y -= (txt(P.xy + vec2(0,e)) - txt(P.xy - vec2(0,e)))/(2.*e);
+        cav = max(cav, smoothstep(0., .0022, tx0)*.85);
+      }
+      n = normalize(vec3(-g, 1.));
+    }
+  }
+  if (uDbg > .5) {
+    if (uDbg < 1.5) return vec3(texture(uH, puv(P.xy)).r*8.);
+    if (uDbg < 2.5) return n*.5+.5;
+    return vec3(ao);
+  }
+  // ---- micro surface: point-chisel stipple on the ground, fine rasp on the carving, polish on frame/band ----
+  vec3 albedo = marble(P);
+  float rough = .32;
+  if (mat < .5) {                    // stippled ground
+    vec2 s = P.xy*420.;
+    float st = vnoise2(s) - .5 + (vnoise2(s*2.3 + 7.) - .5)*.5;
+    vec2 gs = vec2(vnoise2(s + vec2(.3,0.)) - vnoise2(s - vec2(.3,0.)), vnoise2(s + vec2(0.,.3)) - vnoise2(s - vec2(0.,.3)));
+    n = normalize(n + vec3(-gs*.08, 0.));
+    albedo *= .97 + .03*smoothstep(-.3,.3,st);
+    rough = .62;
+  } else if (mat < 1.5) {            // carved forms: rasped, soft sheen
+    vec2 s = P.xy*vec2(900., 140.);
+    float r1 = vnoise2(s) - .5;
+    n = normalize(n + vec3(r1*.02, (vnoise2(s.yx*.7)-.5)*.016, 0.));
+    rough = mix(.4, .24, smoothstep(.02, .07, P.z));            // high points carry a soft polish, hollows stay honed
+    rough = mix(rough, .34, smoothstep(.07, .1, P.z));         // the pearl: honed, same stone, soft highlight
+  } else if (mat < 2.5) {            // polished frame / band
+    rough = .16;
+  } else {                           // dark gallery wall
+    albedo = vec3(.05,.047,.045) * (.85 + .3*vnoise2(P.xy*9.));
+    rough = .9;
+  }
+  albedo *= 1. - cav*.3;            // a little grime in the cuts
+  // ---- lighting ----
+  vec3 Lv = uLp - P; float dl = length(Lv); vec3 L = Lv/dl;
+  float spot = spotMask(P.xy) * uLI;
+  vec3 V = -rd;
+  float ndl = dot(n, L);
+  gJit = hash12(fc*1.37 + fract(uTm*7.31)*913.);
+  float kGraze = mix(11., 19., smoothstep(.08, .3, L.z));            // grazing light: longer, softer penumbra
+  float sh = spot > .002 ? shadowT(P + n*.004 + vec3(0., 0., .0015), L, kGraze) : 0.;
+  float shSoft = spot > .002 ? shadowT(P + n*.004 + vec3(0., 0., .0015), L, 7.) : 0.;
+  float diff = clamp((ndl + .12)/1.12, 0., 1.)*sh;  // marble scatters: soft terminator
+  // sub-surface: light wraps past the terminator and bleeds warm into the soft edge of the shadow
+  float wrap = clamp((ndl + .45)/1.45, 0., 1.);
+  vec3 sss = vec3(1., .80, .64) * wrap*wrap * shSoft * .40;
+  vec3 H = normalize(L + V);
+  float ndh = max(dot(n, H), 0.), ndv = max(dot(n, V), 1e-3);
+  float a2 = pow(rough, 4.);
+  float D = a2/(PI*pow(ndh*ndh*(a2 - 1.) + 1., 2.));
+  float F = schlick(max(dot(H, V), 0.), .04);
+  float spec = D*F*.25/max(ndv*max(ndl,1e-3), .05) * diff;
+  float atten = 9./(dl*dl + 1.);
+  vec3 Lc = LIGHT_COL * uLc * spot * atten;
+  vec3 col = albedo*Lc*(diff*.74 + sss) + Lc*spec*(mat > 2.5 ? .1 : mat < .5 ? .45 : 1.6);
+  // dim cool fill + bounce
+  vec3 fillDir = normalize(vec3(.6, .3, .75));
+  col += albedo*vec3(.55,.62,.75)*uFill*(.35 + .65*max(dot(n, fillDir), 0.))*ao;
+  col += albedo*LIGHT_COL*uLc*uLI*.018*ao*(.5 + .5*n.z);
+  // translucent glow of the stone in the lit pool
+  col += LIGHT_COL*vec3(1., .86, .74)*albedo*spot*atten*.03*ao*(1. - mat*.25);
+  // translucency: light scattering through thin carved edges and the pearl glows a little warm where the spot hits
+  if (mat > .5 && mat < 1.5 && !wall) {
+    vec2 gq = texBicubic(uH, puv(P.xy)).gb;
+    float thin = smoothstep(.8, 4., length(gq))*smoothstep(.0, .015, P.z)*(1. - smoothstep(.06, .1, P.z));
+    float pearlG = smoothstep(.06, .12, P.z)*smoothstep(.2, -.2, ndl - .2);
+    float back = .45 + .55*(1. - clamp(ndl, 0., 1.));                // light that went in on the lit side comes out on the far side
+    col += albedo*vec3(1., .72, .5)*Lc*shSoft*(thin*.3*back + pearlG*.12);
+  }
+  if (uLI2 > .001 && !wall) {
+    vec3 Lv2 = uLp2 - P; float dl2 = length(Lv2); vec3 L2 = Lv2/dl2;
+    vec2 d2 = (P.xy - uSpot2.xy)/uSpot2.zw;
+    float sp2 = exp(-dot(d2, d2)*2.)*uLI2;
+    if (sp2 > .003) {
+      float s2 = shadowT(P + n*.004 + vec3(0., 0., .0015), L2, 16.);
+      float nl2 = clamp((dot(n, L2) + .1)/1.1, 0., 1.);
+      vec3 H2 = normalize(L2 + V); float D2 = a2/(PI*pow(pow(max(dot(n, H2), 0.), 2.)*(a2 - 1.) + 1., 2.));
+      col += (albedo*nl2*.9 + D2*.04*nl2)*vec3(1., .93, .84)*sp2*s2*1.6;
+    }
+  }
+  col *= 1. + uPearl*smoothstep(.07, .11, P.z)*.5;                  // the pearl lifts on the bell
+  return col + dust;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+const G2 = Reel.GL(rm.canvas);
+
+/* ---------- bake the carving: height + gradient + material, then AO / cavity ---------- */
+const HD = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+`;
+const BAKE = HD + Reel.RM_COMMON + `
+const float PW = ${PW.toFixed(3)}, PH = ${PH.toFixed(3)};
+const float BX0 = ${BX0.toFixed(3)}, BX1 = ${BX1.toFixed(3)}, BY0 = ${BY0.toFixed(3)}, BY1 = ${BY1.toFixed(3)};
+uniform vec2 uTex;
+float dot2(vec2 v){ return dot(v,v); }
+vec2 bez(vec2 pos, vec2 A, vec2 B, vec2 C){        // distance + parameter to a quadratic bezier (iq)
+  vec2 a = B - A, b = A - 2.*B + C, c = a*2., d = A - pos;
+  float kk = 1./dot(b,b), kx = kk*dot(a,b), ky = kk*(2.*dot(a,a) + dot(d,b))/3., kz = kk*dot(d,a);
+  float p = ky - kx*kx, p3 = p*p*p, q = kx*(2.*kx*kx - 3.*ky) + kz, h = q*q + 4.*p3;
+  float res, tt;
+  if (h >= 0.) { h = sqrt(h); vec2 x = (vec2(h,-h) - q)/2.; vec2 uv2 = sign(x)*pow(abs(x), vec2(1./3.));
+    tt = clamp(uv2.x + uv2.y - kx, 0., 1.); res = dot2(d + (c + b*tt)*tt); }
+  else { float z = sqrt(-p), v = acos(q/(p*z*2.))/3., m = cos(v), n = sin(v)*1.732050808;
+    vec3 t3 = clamp(vec3(m+m, -n-m, n-m)*z - kx, 0., 1.);
+    float r1 = dot2(d + (c + b*t3.x)*t3.x), r2 = dot2(d + (c + b*t3.y)*t3.y);
+    if (r1 < r2) { res = r1; tt = t3.x; } else { res = r2; tt = t3.y; } }
+  return vec2(sqrt(res), tt);
+}
+float pil(float din, float R){ float u = clamp(din/R, 0., 1.); return sqrt(1. - (1.-u)*(1.-u)); }   // quarter-round edge
+float vg(float d, float w){ return max(0., 1. - abs(d)/w); }                                      // V groove profile
+// spiral groove inside a lobe (q in lobe units, r=1 rim); dir = turning direction
+float spiralD(vec2 q, float dir){
+  float r = length(q); float th = atan(q.y, q.x*dir); if (th < 0.) th += 6.2831853;
+  float best = 9.;
+  for (int k=0;k<3;k++){
+    float ph = th + 6.2831853*float(k);
+    if (ph > 6.2831853*1.7) break;
+    float rs = .16 + ph*(.68/(6.2831853*1.7));
+    best = min(best, abs(r - rs));
+  }
+  return r < .16 ? abs(r - .16) : best;
+}
+// a ruyi cloud: three curled lobes over a base, trailing a tapered tail. q local (head radius = 1).
+// returns height in local units*0.06 world (scaled by caller)
+float cloud(vec2 q, float tailBend){
+  float h = 0.;
+  // tail
+  vec2 bt = bez(q, vec2(.9,-.6), vec2(2.7, -1.25 + tailBend), vec2(4.8, -.45 + tailBend*.4));
+  float rt = mix(.46, .05, pow(bt.y, .8));
+  float dt = bt.x - rt;
+  if (dt < 0.) {
+    float th = .55*pil(-dt, .32) + .05;
+    // two flowing grooves along the tail
+    float side = bt.x/rt;
+    th -= .09*vg(side - .42, .14)*smoothstep(.95, .5, bt.y) + .09*vg(side - .82, .1)*smoothstep(.85, .3, bt.y);
+    h = max(h, th);
+  }
+  // base band under the lobes
+  vec2 pa = q - vec2(-1.25, -.78), ba = vec2(2.45, .1);
+  float hb = clamp(dot(pa,ba)/dot(ba,ba), 0., 1.);
+  float db = length(pa - ba*hb) - .36;
+  if (db < 0.) h = max(h, .62*pil(-db, .3) + .06 - .08*vg(-db - .17, .07));
+  // side lobes then main lobe (front-most last)
+  vec3 L[3] = vec3[3](vec3(-1.28, -.40, .64), vec3(1.22, -.36, .68), vec3(0., 0., 1.));
+  float base[3] = float[3](.1, .12, .2);
+  float dirs[3] = float[3](-1., 1., 1.);
+  for (int i=0;i<3;i++){
+    vec2 lq = (q - L[i].xy)/L[i].z;
+    float dl = length(lq) - 1.;
+    if (dl < 0.) {
+      float hl = base[i] + .62*pil(-dl*L[i].z, .38);
+      hl += .08*(1. - length(lq));                       // gentle dome
+      hl -= .13*vg(spiralD(lq, dirs[i]), .09/L[i].z*.9)*smoothstep(1., .75, length(lq));
+      hl -= .07*vg(-dl - .16, .07);                      // inner contour line
+      h = max(h, hl);
+    }
+  }
+  return h;
+}
+// fish-scale sea (海水): rows of nested half-discs with concentric grooves; lower rows sit in front
+float sea(vec2 p){
+  if (p.y < -.585 || p.y > -.17) return 0.;
+  const float rowH = .046, cw = .118, R = .074;
+  for (int j=0;j<10;j++){
+    float yj = -.62 + float(j)*rowH;
+    float off = (j % 2 == 0) ? 0. : cw*.5;
+    float cx = floor((p.x - off)/cw + .5)*cw + off;
+    for (int k=-1;k<=1;k++){
+      vec2 c = vec2(cx + float(k)*cw, yj);
+      vec2 d = p - c; float r = length(d);
+      if (d.y >= -.002 && r < R) {
+        float u = r/R;
+        float h = .022 + .010*smoothstep(1., .6, u);
+        h -= .0065*vg(fract(u*3.0 + .02) - .5, .22);     // concentric ridges
+        h *= pil(R - r, .010);                            // rounded outer rim
+        return (h + .004*float(9 - j)/9.)*(1. - .6*smoothstep(-.31, -.19, p.y));   // the sea flattens toward its crest line
+      }
+    }
+  }
+  return 0.;
+}
+// curling crests along the top of the sea
+float crests(vec2 p){
+  float h = 0.;
+  for (int i=0;i<8;i++){
+    float fi = float(i);
+    float cx = -1.32 + fi*.38 + (i>3 ? .06 : 0.);
+    if (abs(cx) < .3) continue;
+    vec2 c = vec2(cx, -.205 + .02*sin(fi*2.1));
+    float s = .07 + .012*sin(fi*1.7);
+    float dir = mod(fi, 2.) < .5 ? 1. : -1.;
+    vec2 q = (p - c)/s;
+    float dl = length(q) - 1.;
+    if (dl < .0) {
+      float hl = .55 + .55*pil(-dl, .35) - .25*vg(spiralD(q, dir), .1);
+      h = max(h, hl*.035);
+    }
+    // the trailing sweep of the crest
+    vec2 bt = bez(p, c + vec2(-dir*.02, -.06), c + vec2(dir*.10, -.02), c + vec2(dir*.19, -.07));
+    float rr = mix(.03, .006, bt.y);
+    if (bt.x < rr) h = max(h, .03*(.5 + .5*pil(rr - bt.x, .012)));
+  }
+  return h;
+}
+// a cliff (江崖): angular, layered pillar rising from the sea
+float sdPoly(vec2 p, vec2 v[8]){
+  float d = dot(p - v[0], p - v[0]), s = 1.;
+  for (int i=0, j=7; i<8; j=i, i++){
+    vec2 e = v[j] - v[i], w = p - v[i];
+    vec2 b = w - e*clamp(dot(w,e)/dot(e,e), 0., 1.);
+    d = min(d, dot(b,b));
+    bvec3 cond = bvec3(p.y >= v[i].y, p.y < v[j].y, e.x*w.y > e.y*w.x);
+    if (all(cond) || all(not(cond))) s *= -1.;
+  }
+  return s*sqrt(d);
+}
+float cliff(vec2 p, vec2 c, float sc, float lean, float hh){
+  vec2 q = (p - c)/sc; q.x -= q.y*lean;
+  vec2 v[8] = vec2[8](vec2(-.95,-1.3), vec2(-.72,.05), vec2(-.42,.5), vec2(-.12,1.05), vec2(.12,.6), vec2(.38,.82), vec2(.72,.12), vec2(.95,-1.3));
+  float d = sdPoly(q, v);
+  if (d > 0.) return 0.;
+  // rounded, carved rock (jade-carving style): pillowed mass with incised contour lines and a few texture strokes
+  float h = .12 + .78*pil(-d, .42) + .1*smoothstep(0., 1.2, -d);
+  h -= .16*vg(-d - .16, .045) + .12*vg(-d - .36, .04)*step(-d, .5);
+  float cs = q.x*1.7 - q.y*1.1 + .3*sin(q.y*4.);
+  h -= .10*vg(fract(cs) - .5, .06)*smoothstep(-.2, -.45, d)*step(.45, fract(floor(cs)*.618 + .1));
+  h *= smoothstep(-1.28, -.78, q.y);                  // sinks behind the front waves
+  return max(h, 0.)*hh;
+}
+// a flame tongue: S-curved body (two quadratic arcs) ending in a hooked curl, tapering to a point, centre groove
+float tongue(vec2 p, vec2 P0, vec2 C1, vec2 M, vec2 C2, vec2 P1, vec2 C3, vec2 P2, float w0){
+  vec2 b1 = bez(p, P0, C1, M), b2 = bez(p, M, C2, P1), b3 = bez(p, P1, C3, P2);
+  float d = b1.x, s = b1.y/3.;
+  if (b2.x < d) { d = b2.x; s = (1. + b2.y)/3.; }
+  if (b3.x < d) { d = b3.x; s = (2. + b3.y)/3.; }
+  float r = w0*pow(1. - s, 1.2) + .002;
+  if (d > r) return 0.;
+  float h = .024*pil(r - d, .011) + .007*(1. - d/r) + .005;          // flat, crowned blade, not a round tube
+  h -= .006*vg(d/r - .5, .2)*step(s, .9);                              // two incised flame lines
+  return h;
+}
+// flaming pearl (火焰珠): the flames stream off to one side in curling tails, as if the pearl were flying
+float pearl(vec2 p){
+  vec2 c = vec2(0., .27); float R = .118;
+  vec2 d = p - c; float r = length(d);
+  float h = 0.;
+  vec2 q = p - c;
+  if (length(q - vec2(-.12, .06)) < .36) {
+    h = max(h, tongue(q, vec2(.059, .102), vec2(.02, .19), vec2(-.08, .18), vec2(-.18, .17), vec2(-.24, .24), vec2(-.28, .29), vec2(-.22, .31), .062));
+    h = max(h, tongue(q, vec2(-.059, .102), vec2(-.12, .15), vec2(-.19, .11), vec2(-.26, .07), vec2(-.32, .11), vec2(-.37, .15), vec2(-.33, .18), .058));
+    h = max(h, tongue(q, vec2(-.099, .017), vec2(-.16, .01), vec2(-.21, -.01), vec2(-.26, -.03), vec2(-.30, .01), vec2(-.34, .05), vec2(-.30, .07), .052));
+    h = max(h, tongue(q, vec2(-.082, -.057), vec2(-.12, -.10), vec2(-.17, -.11), vec2(-.22, -.12), vec2(-.23, -.16), vec2(-.24, -.20), vec2(-.19, -.19), .044));
+    h = max(h, tongue(q, vec2(.094, .034), vec2(.15, .06), vec2(.16, .11), vec2(.17, .16), vec2(.13, .19), vec2(.10, .21), vec2(.09, .17), .036));
+  }
+  if (r < R) h = max(h, .012 + sqrt(R*R - r*r)*.92);
+  return h;
+}
+// moulded frame + inscription band
+float frameH(vec2 p, out float m){
+  float ex = PW*.5 - abs(p.x), ey = PH*.5 - abs(p.y), e = min(ex, ey);
+  m = 2.;
+  if (e < .095) {
+    float h;
+    if (e < .014) h = .045 + .015*pil(e, .014);                         // rounded outer arris
+    else if (e < .04) { float u = (e - .027)/.013; h = .06 + .016*sqrt(max(0., 1. - u*u)); }   // bead
+    else if (e < .072) { float u = (e - .04)/.032; h = .06 - .022*sin(u*3.14159); }          // cove
+    else { float u = (e - .072)/.023; h = .06*(1. - smoothstep(0., 1., u)) ; h = max(h, .0); }  // sloped fillet down to ground
+    return h;
+  }
+  // band (plinth for the inscription)
+  if (p.y < BY1 + .012) {
+    float eb = BY1 + .012 - p.y;
+    return .034*pil(eb, .01);
+  }
+  m = 0.;
+  return 0.;
+}
+vec2 H(vec2 p){                       // (height, material)
+  float m; float h = frameH(p, m);
+  if (m > 1.5 && h > 0.) return vec2(h, 2.);
+  float r = 0.;
+  r = max(r, sea(p));
+  r = max(r, crests(p));
+  // clouds: (centre, scale, mirror, tail bend)
+  vec4 CL[9] = vec4[9](vec4(-1.16, .52, .118, 1.), vec4(-.52, .64, .085, -1.), vec4(-.62, .14, .102, 1.), vec4(.58, .62, .098, 1.),
+                       vec4(1.14, .40, .118, -1.), vec4(.66, .12, .105, -1.), vec4(-1.2, -.04, .08, -1.), vec4(1.22, -.06, .078, 1.), vec4(.02, .64, .07, 1.));
+  for (int i=0;i<9;i++){
+    vec4 cl = CL[i];
+    vec2 q = (p - cl.xy)/cl.z; q.x *= cl.w;
+    if (q.x < -2.3 || q.x > 5.2 || abs(q.y + .2) > 2.) continue;
+    float hc = cloud(q, .25*sin(float(i)*1.9));
+    r = max(r, hc*.085*(.8 + cl.z*2.));
+  }
+  r = max(r, pearl(p));
+  r = max(r, cliff(p, vec2(0., -.30), .3, .06, .095));
+  r = max(r, cliff(p, vec2(-.86, -.38), .19, -.1, .07));
+  r = max(r, cliff(p, vec2(.88, -.39), .18, .12, .07));
+  return vec2(max(r, h), r > .0005 ? 1. : 0.);
+}
+void main(){
+  vec2 p = (uv - .5)*vec2(PW, PH);
+  float e = .5*PW/uTex.x;
+  vec2 h0 = H(p);
+  float hx = (H(p + vec2(e,0)).x - H(p - vec2(e,0)).x)/(2.*e);
+  float hy = (H(p + vec2(0,e)).x - H(p - vec2(0,e)).x)/(2.*e);
+  o = vec4(h0.x, hx, hy, h0.y);
+}`;
+const AOP = HD + `
+uniform sampler2D uH; uniform vec2 uTex;
+const float PW = ${PW.toFixed(3)};
+void main(){
+  float h = texture(uH, uv).r;
+  float occ = 0., cav = 0.;
+  float rs[4] = float[4](.004, .011, .026, .06);
+  for (int k=0;k<4;k++){
+    for (int i=0;i<10;i++){
+      float a = float(i)*.6283 + float(k)*.31;
+      vec2 o2 = vec2(cos(a), sin(a))*rs[k]/vec2(PW, PW*1080./1920.);
+      float dh = texture(uH, uv + o2).r - h;
+      occ += clamp(dh/rs[k], 0., 1.)*(k==0 ? .5 : 1.);
+      if (k == 0) cav += max(dh, 0.);
+    }
+  }
+  float ao = 1. - occ/36.*.95;
+  o = vec4(clamp(ao, 0., 1.), clamp(cav*60., 0., 1.), 0., 1.);
+}`;
+
+/* ---------- inscription: text mask -> inside distance (Felzenszwalb EDT) ---------- */
+function edt(mask, w, h) {
+  const INF = 1e20, f = new Float64Array(Math.max(w, h)), d = new Float64Array(Math.max(w, h)), v = new Int32Array(Math.max(w, h)), z = new Float64Array(Math.max(w, h) + 1);
+  const out = new Float64Array(w * h);
+  for (let i = 0; i < w * h; i++) out[i] = mask[i] ? INF : 0;
+  const pass = (n, get, set) => {
+    for (let q = 0; q < n; q++) f[q] = get(q);
+    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
+    for (let q = 1; q < n; q++) {
+      let s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
+      while (s <= z[k]) { k--; s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+      k++; v[k] = q; z[k] = s; z[k + 1] = INF;
+    }
+    k = 0;
+    for (let q = 0; q < n; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + f[v[k]]; }
+    for (let q = 0; q < n; q++) set(q, d[q]);
+  };
+  for (let x = 0; x < w; x++) pass(h, (y) => out[y * w + x], (y, val) => { out[y * w + x] = val; });
+  for (let y = 0; y < h; y++) pass(w, (x) => out[y * w + x], (x, val) => { out[y * w + x] = val; });
+  return out;
+}
+function buildText() {
+  const cv = document.createElement('canvas'); cv.width = TXW; cv.height = TXH;
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, TXW, TXH); g.fillStyle = '#fff';
+  const U = 1280, X = (x) => (x - BX0) * U, Y = (y) => (BY1 - y) * U;
+  // incised 回纹: a running row of square spirals on a baseline, broken in the centre by a round cloud medallion
+  const gU = 0.033;                                   // grid unit (world)
+  const yb = -0.772, yt = yb + 4 * gU;                // baseline and top of the motif
+  g.strokeStyle = '#fff'; g.lineWidth = 0.42 * gU * U; g.lineCap = 'square'; g.lineJoin = 'miter';
+  const L = (pts) => { g.beginPath(); pts.forEach(([x, y], i) => (i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y)))); g.stroke(); };
+  const unit = (x0, dir) => {                         // one square spiral, x0 = its left edge; dir mirrors it
+    const P = [[1, 0], [1, 4], [4, 4], [4, 1], [2, 1], [2, 3], [3, 3], [3, 2]];
+    L(P.map(([u, v]) => [x0 + (dir > 0 ? u : 5 - u) * gU, yb + v * gU]));
+  };
+  const half = 0.15;                                  // half width of the medallion gap
+  const nU = Math.floor((1.43 - half) / (5 * gU));
+  for (let k = 0; k < nU; k++) {
+    unit(half + k * 5 * gU, 1);
+    unit(-half - (k + 1) * 5 * gU, -1);
+  }
+  L([[half, yb], [half + nU * 5 * gU, yb]]); L([[-half, yb], [-half - nU * 5 * gU, yb]]);
+  L([[half, yt + 0.9 * gU], [half + nU * 5 * gU, yt + 0.9 * gU]]); L([[-half, yt + 0.9 * gU], [-half - nU * 5 * gU, yt + 0.9 * gU]]);
+  // medallion: a ring with a two-headed ruyi scroll inside
+  const cx = 0, cy = yb + 2.45 * gU, R0 = 0.112;
+  g.lineWidth = 0.42 * gU * U; g.lineCap = 'round';
+  g.beginPath(); g.arc(X(cx), Y(cy), R0 * U, 0, 7); g.stroke();
+  const spiral = (sx, sy, r, dir) => { g.beginPath(); for (let i = 0; i <= 60; i++) { const a = dir * i / 60 * Math.PI * 2.6, rr = r * (1 - i / 75); const x = sx + Math.cos(a) * rr, y = sy + Math.sin(a) * rr; i ? g.lineTo(X(x), Y(y)) : g.moveTo(X(x), Y(y)); } g.stroke(); };
+  spiral(cx - 0.033, cy + 0.006, 0.034, 1); spiral(cx + 0.033, cy - 0.006, 0.034, -1);
+  g.beginPath(); g.moveTo(X(cx - 0.067), Y(cy + 0.006)); g.bezierCurveTo(X(cx - 0.06), Y(cy - 0.06), X(cx + 0.06), Y(cy + 0.06), X(cx + 0.067), Y(cy - 0.006)); g.stroke();
+  const id = g.getImageData(0, 0, TXW, TXH).data;
+  const mask = new Uint8Array(TXW * TXH);
+  for (let i = 0; i < TXW * TXH; i++) mask[i] = id[i * 4] > 127 ? 1 : 0;
+  const d2 = edt(mask, TXW, TXH);
+  const data = new Float32Array(TXW * TXH);
+  for (let i = 0; i < TXW * TXH; i++) data[i] = mask[i] ? Math.max(0, Math.sqrt(d2[i]) - 0.5) / U : 0;
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, TXW, TXH, 0, gl.RED, gl.FLOAT, data);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+let tH, tA, tT;
+function bake() {
+  tH = G2.target(TW, TH, { float: true });
+  tA = G2.target(TW / 2, TH / 2, { float: true });
+  const pb = G2.program(BAKE), pa = G2.program(AOP);
+  gl.enable(gl.SCISSOR_TEST);
+  for (let b = 0; b < 16; b++) {
+    gl.scissor(0, b * TH / 16, TW, TH / 16);
+    pb.use().set('uTex', [TW, TH]).draw(tH); gl.finish();
+  }
+  gl.disable(gl.SCISSOR_TEST);
+  pa.use().set('uH', { tex: tH.tex, unit: 0 }).set('uTex', [TW, TH]).draw(tA); gl.finish();
+}
+
+/* ---------- camera + light choreography ---------- */
+const cr1 = (p0, p1, p2, p3, u) => { const u2 = u * u, u3 = u2 * u; return 0.5 * ((2 * p1) + (-p0 + p2) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u2 + (-p0 + 3 * p1 - 3 * p2 + p3) * u3); };
+function keyed(K, t, fields, ease = E.inOutSine) {
+  let i = 0; while (i < K.length - 2 && t > K[i + 1].t) i++;
+  const k0 = K[Math.max(0, i - 1)], k1 = K[i], k2 = K[i + 1], k3 = K[Math.min(K.length - 1, i + 2)];
+  const u = (k2.e || ease)(clamp((t - k1.t) / (k2.t - k1.t)));
+  const o = {};
+  for (const f of fields) {
+    if (Array.isArray(k1[f])) o[f] = k1[f].map((_, j) => cr1(k0[f][j], k1[f][j], k2[f][j], k3[f][j], u));
+    else o[f] = cr1(k0[f], k1[f], k2[f], k3[f], u);
+  }
+  return o;
+}
+// camera: one continuous move (no stop at the keys); the pull-back starts while the light is still settling
+const CK = [
+  { t: 0.0, p: [-1.42, 0.70, 1.02], a: [-0.80, 0.44, 0.02], f: 2.5, ap: 9 },
+  { t: 1.8, p: [-0.95, 0.60, 0.98], a: [-0.40, 0.36, 0.03], f: 2.5, ap: 9 },
+  { t: 3.5, p: [-0.05, 0.50, 0.92], a: [0.22, 0.22, 0.04], f: 2.5, ap: 9 },
+  { t: 4.3, p: [0.95, -0.12, 1.30], a: [0.16, -0.04, 0.0], f: 2.6, ap: 5 },
+  { t: 5.9, p: [-0.80, -0.14, 1.36], a: [-0.12, -0.05, 0.0], f: 2.6, ap: 5 },
+  { t: 7.6, p: [0.0, -0.10, 3.34], a: [0.0, -0.06, 0.0], f: 3.0, ap: 1.2 },
+  { t: 10.0, p: [0.0, -0.10, 3.18], a: [0.0, -0.07, 0.0], f: 3.0, ap: 1.2 },
+];
+const camT = Track(CK.map((k) => ({ t: k.t, v: [...k.p, ...k.a, k.f, k.ap] })));
+// light: always over the top. right-upper -> straight above (grazing) -> left-upper -> museum key; one sweep 4.0-6.0
+const LK = [
+  { t: 0.0, lp: [-3.3, 1.1, 0.95], s: [-1.1, 0.5], r: [0.58, 0.44] },
+  { t: 2.0, lp: [-3.0, 0.95, 0.97], s: [-0.5, 0.42], r: [0.7, 0.5] },
+  { t: 3.6, lp: [-2.4, 1.6, 1.0], s: [0.3, 0.28], r: [0.85, 0.56] },
+  { t: 4.5, lp: [2.7, 1.1, 0.45], s: [0.08, 0.0], r: [1.7, 0.95] },
+  { t: 5.25, lp: [0.0, 2.9, 0.42], s: [0.0, 0.05], r: [1.75, 0.95] },
+  { t: 6.0, lp: [-2.7, 1.2, 0.5], s: [-0.06, 0.0], r: [1.75, 0.95] },
+  { t: 7.4, lp: [-3.2, 2.0, 1.85], s: [-0.06, 0.02], r: [1.95, 1.05] },
+  { t: 10.0, lp: [-3.3, 1.8, 1.75], s: [-0.02, -0.08], r: [2.15, 1.25] },
+];
+const litT = Track(LK.map((k) => ({ t: k.t, v: [...k.lp, ...k.s, ...k.r] })));
+// the lens focuses where the centre of frame meets the carving
+const focusOf = (t, cam) => {
+  const d = [cam.a[0] - cam.p[0], cam.a[1] - cam.p[1], cam.a[2] - cam.p[2]];
+  const l = Math.hypot(...d);
+  return Math.min(8, (cam.p[2] - 0.05) / Math.max(0.05, -d[2] / l));
+};
+
+const DUR = 10;
+Reel.scene({
+  duration: DUR, fps: 30,
+  cues: [
+    { t: 0.5, sfx: 'spot_on', gain: 0.85 },
+    { t: 1.5, sfx: 'stone_hum', gain: 0.45 },
+    { t: 3.5, sfx: 'whoosh', gain: 0.3 },
+    { t: 4.5, sfx: 'stone_boom', gain: 0.9 },
+    { t: 5.25, sfx: 'stone_hum', gain: 0.35 },
+    { t: 6.0, sfx: 'whoosh', gain: 0.2 },
+    { t: 8.0, sfx: 'stone_bell', gain: 0.8 },
+    { t: 8.0, sfx: 'rake_sweep', gain: 0.5 },
+  ],
+  async setup() {
+    tT = buildText();
+    bake();
+  },
+  render(t) {
+    const cv = camT(t), cam = { p: cv.slice(0, 3), a: cv.slice(3, 6), f: cv[6], ap: cv[7] };
+    const lv = litT(t), L = { lp: lv.slice(0, 3), s: lv.slice(3, 5), r: lv.slice(5, 7) };
+    // 4.5 boom: the lamp flares and the camera takes the hit
+    const hit = t >= 4.5 ? Math.exp(-(t - 4.5) * 12) : 0;
+    const shake = t >= 4.5 ? 0.0028 * Math.exp(-(t - 4.5) * 14) * Math.sin((t - 4.5) * 95) : 0;
+    const ro = [cam.p[0] + 0.004 * Math.sin(t * 0.9), cam.p[1] + 0.003 * Math.sin(t * 1.3 + 1) + shake, cam.p[2]];
+    const ta = [cam.a[0], cam.a[1] + shake, cam.a[2]];
+    // from the dark: the lamp strikes on the beat at 0.5 s, filament-warm, a couple of flickers, then white
+    const u = t - 0.5;
+    const strike = u < 0 ? 0.03 : Math.max(0.03, clamp(u / 0.08) * (1 - 0.45 * (u > 0.1 && u < 0.14 ? 1 : 0) - 0.3 * (u > 0.22 && u < 0.25 ? 1 : 0)));
+    const warmth = clamp(u / 0.25);
+    const Lc = [1.0, lerp(0.62, 0.95, warmth), lerp(0.32, 0.88, warmth)];
+    const inten = (t < 4.0 ? 1.0 : lerp(1.0, 1.35, E.inOutSine(clamp((t - 4.0) / 0.5))) * (1 - 0.15 * E.inOutSine(clamp((t - 6.2) / 1.2)))) + 0.5 * hit;
+    // closing sweep: a narrow raking lamp low on the left runs along the band, 8.0 -> 8.5
+    const sw = clamp((t - 8.0) / 0.6);
+    const sx = lerp(-1.6, 1.75, sw);
+    const I2 = t >= 8.0 && t < 8.65 ? clamp((t - 8.0) / 0.034) * (1 - E.inCubic(clamp((t - 8.35) / 0.3))) * 1.7 : 0;
+    const pearl = t >= 8.0 ? Math.exp(-(t - 8.0) * 4) * clamp((t - 8.0) / 0.034) : 0;
+    gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tH.tex);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, tA.tex);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, tT);
+    gl.activeTexture(gl.TEXTURE0);
+    rm.set('uH', { __ints: 1, v: 4 }).set('uA', { __ints: 1, v: 5 }).set('uT', { __ints: 1, v: 6 })
+      .set('uRo', ro).set('uTa', ta).set('uF', cam.f).set('uRoll', 0)
+      .set('uLp', L.lp).set('uSpot', [L.s[0], L.s[1], L.r[0], L.r[1]]).set('uLI', inten * strike).set('uFill', 0.02 + 0.03 * E.inOutSine(inv(6.5, 8, t)))
+      .set('uLp2', [sx - 0.75, -0.42, 0.16]).set('uSpot2', [sx, -0.7, 0.2, 0.13]).set('uLI2', I2).set('uPearl', pearl)
+      .set('uLc', Lc).set('uDbg', DBG).set('uTm', t).set('uFocus', focusOf(t, cam));
+    const fd = focusOf(t, cam);
+    rm.render(t, { focus: fd, aperture: cam.ap, maxCoc: 12, expo: 1.3 });
+  },
+});
+</script></body></html>

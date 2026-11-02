@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>37 凸版烫金 · Letterpress &amp; Foil</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 37 凸版烫金 · Letterpress & Foil =====
+   Real world: thick cotton paper (tooth, fibres, a deckled edge) on a walnut press bed, side-lit, macro lens.
+   A sheet of gold hot-stamping foil lies on the paper; the heated brass die comes down hard (1.0s), dwells and lifts —
+   the film is now pressed into a ginkgo sprig. At 3.5s the film is peeled back: the sprig stays behind as mirror gold,
+   deep in the paper; a raking light sweeps across it on 4.5, the camera circles it low, a second sweep on 6.5,
+   the crane up lands on 8.0 and a last narrow glint crosses the leaves. A double hairline frame was blind-debossed
+   in an earlier pass; the leaf veins are fine blind lines pressed into the gold. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#050403');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+/* paper space: x in [-1.3, 1.3], z in [-0.8, 0.8]  ->  mask canvas */
+const PX0 = -1.3, PX1 = 1.3, PZ0 = -0.8, PZ1 = 0.8;
+const MW = 4096, MH = Math.round(MW * (PZ1 - PZ0) / (PX1 - PX0));
+const KX = MW / (PX1 - PX0);
+const mx = (x) => (x - PX0) * KX, mz = (z) => (z - PZ0) * KX;
+const mask = Object.assign(document.createElement('canvas'), { width: MW, height: MH });
+function buildMask() {
+  const g = mask.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, MW, MH);
+  g.globalCompositeOperation = 'lighter';
+  const P = ([x, z]) => [mx(x), mz(z)];
+  const RG = Reel.rng(37);
+  // a ginkgo leaf: fan from the petiole tip B pointing along angle a (0 = toward -z), radius Rr, a notch in the rim
+  function leaf(B, a, Rr, spread, notch, seed) {
+    const r = Reel.rng(seed), pts = [];
+    const dir = (t) => [Math.sin(a + t), -Math.cos(a + t)];
+    const N = 90;
+    // left edge: slightly concave from B to the rim
+    for (let i = 0; i <= 12; i++) { const k = i / 12, t = -spread; const d = dir(t); const sag = Math.sin(Math.PI * k) * 0.06 * Rr; const nx = -d[1], nz = d[0];
+      pts.push([B[0] + d[0] * Rr * k * (0.15 + 0.85 * k) - nx * sag, B[1] + d[1] * Rr * k * (0.15 + 0.85 * k) - nz * sag]); }
+    // the rim: wavy, small irregular nicks, a notch in the middle
+    for (let i = 0; i <= N; i++) {
+      const k = i / N, t = -spread + 2 * spread * k;
+      let rr = Rr * (1 - 0.04 * Math.cos(k * Math.PI * 2) + 0.018 * Math.sin(k * 41 + seed) + 0.012 * Math.sin(k * 97 + seed * 2));
+      rr *= 1 - notch * Math.exp(-Math.pow((k - 0.5 - 0.02 * Math.sin(seed)) / 0.035, 2));
+      if (r() < 0.04) rr *= 0.975;
+      const d = dir(t); pts.push([B[0] + d[0] * rr, B[1] + d[1] * rr]);
+    }
+    for (let i = 12; i >= 0; i--) { const k = i / 12, t = spread; const d = dir(t); const sag = Math.sin(Math.PI * k) * 0.06 * Rr; const nx = -d[1], nz = d[0];
+      pts.push([B[0] + d[0] * Rr * k * (0.15 + 0.85 * k) + nx * sag, B[1] + d[1] * Rr * k * (0.15 + 0.85 * k) + nz * sag]); }
+    g.fillStyle = '#ff0000'; g.beginPath(); pts.forEach((q, i) => { const [X, Z] = P(q); i ? g.lineTo(X, Z) : g.moveTo(X, Z); }); g.closePath(); g.fill();
+    // veins: fine blind lines fanning out (green), stopping short of the rim
+    g.strokeStyle = '#00ff00'; g.lineCap = 'round';
+    const nv = Math.round(12 + Rr * 22);
+    for (let i = 0; i < nv; i++) {
+      const t = -spread * 0.93 + 2 * spread * 0.93 * (i + 0.5) / nv + (RG() - 0.5) * 0.02;
+      const d = dir(t), r0 = Rr * (0.18 + 0.1 * RG()), r1 = Rr * (0.86 + 0.06 * RG());
+      g.lineWidth = 0.0024 * KX;
+      g.beginPath(); g.moveTo(...P([B[0] + d[0] * r0, B[1] + d[1] * r0])); g.lineTo(...P([B[0] + d[0] * r1, B[1] + d[1] * r1])); g.stroke();
+    }
+  }
+  // petiole / twig: a tapered gold stroke
+  function stem(pts, w0, w1) {
+    g.fillStyle = '#ff0000';
+    for (let i = 0; i < pts.length - 1; i++) {
+      const k = i / (pts.length - 1), w = lerp(w0, w1, k);
+      const [x0, z0] = pts[i], [x1, z1] = pts[i + 1], L = Math.hypot(x1 - x0, z1 - z0), nx = -(z1 - z0) / L * w, nz = (x1 - x0) / L * w;
+      g.beginPath(); g.moveTo(...P([x0 + nx, z0 + nz])); g.lineTo(...P([x1 + nx, z1 + nz])); g.lineTo(...P([x1 - nx, z1 - nz])); g.lineTo(...P([x0 - nx, z0 - nz])); g.fill();
+      g.beginPath(); g.arc(...P([x1, z1]), w * KX, 0, 7); g.fill();
+    }
+  }
+  const curve = (a, c, b, n = 24) => Array.from({ length: n + 1 }, (_, i) => { const u = i / n, v = 1 - u; return [v * v * a[0] + 2 * v * u * c[0] + u * u * b[0], v * v * a[1] + 2 * v * u * c[1] + u * u * b[1]]; });
+  stem(curve([0.2, 0.36], [0.14, 0.2], [0.03, 0.06]), 0.011, 0.007);          // the twig
+  stem(curve([0.03, 0.06], [0.0, 0.0], [-0.02, -0.06]), 0.006, 0.0045);       // petioles
+  stem(curve([0.06, 0.12], [0.13, 0.06], [0.2, 0.0]), 0.006, 0.0045);
+  stem(curve([0.1, 0.22], [0.0, 0.2], [-0.13, 0.12]), 0.006, 0.0045);
+  leaf([-0.02, -0.06], -0.12, 0.33, 1.0, 0.16, 1);
+  leaf([0.2, 0.0], 0.95, 0.22, 0.92, 0.1, 2);
+  leaf([-0.13, 0.12], -1.05, 0.2, 0.88, 0.05, 3);
+  // a double hairline frame, blind, about 8% in from the deckle, with a small fret in each corner
+  g.strokeStyle = '#00ff00'; g.lineWidth = 0.0055 * KX; g.lineJoin = 'miter';
+  const fx = 1.22 - 0.2, fz = 0.74 - 0.13;
+  for (const inset of [0, 0.024]) { g.strokeRect(mx(-fx + inset), mz(-fz + inset), (2 * (fx - inset)) * KX, (2 * (fz - inset)) * KX); }
+  for (const [sx, sz] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+    const cx = sx * (fx - 0.06), cz = sz * (fz - 0.06), u = 0.016;
+    const fret = [[0, 0], [2, 0], [2, 2], [1, 2], [1, 1]].map(([a2, b2]) => [cx - sx * u * a2 + sx * u, cz - sz * u * b2 + sz * u]);
+    g.beginPath(); fret.forEach((q, i) => { const [X, Z] = P(q); i ? g.lineTo(X, Z) : g.moveTo(X, Z); }); g.stroke();
+  }
+}
+
+/* ---------------- renderer ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.4, th: 1.2, expo: 1.05, vig: 0.42, grain: 0.03, ca: 0.22, contrast: 1.05, sat: 1.0, bands: 4,
+  uniforms: `
+uniform sampler2D uMask;
+uniform vec3 uRo, uTa; uniform float uFL;
+uniform vec4 uPress;   // die height above paper, impression depth (title), film present (0/1), peel fold x
+uniform vec4 uLight;   // key azimuth, key elevation, sweep position, sweep strength
+uniform float uT;`,
+  scene: `
+const vec4 PB = vec4(${PX0}, ${PZ0}, ${PX1 - PX0}, ${PZ1 - PZ0});
+vec2 muv(vec2 xz){ vec2 u = (xz - PB.xy) / PB.zw; return vec2(u.x, 1. - u.y); }
+const float DEP = .0075;
+// deckled sheet outline
+float sheetD(vec2 xz){ vec2 q = abs(xz - vec2(0., 0.)) - vec2(1.22, .74); float dk = (vnoise2(xz.yx * 60.) - .5) * .012 + (vnoise2(xz * 200.) - .5) * .004; return max(q.x, q.y) + dk; }
+float tooth(vec2 xz){ return (fbm2(xz * 90.) - .5) * .0009 + (vnoise2(xz * vec2(500., 140.)) - .5) * .00035; }
+// paper height: tooth - impressions (+ the squeezed pillow around the walls)
+float paperH(vec2 xz, float lod){
+  vec2 uv = muv(xz);
+  vec3 m0 = textureLod(uMask, uv, lod + 1.2).rgb;
+  vec3 m1 = textureLod(uMask, uv, lod + 4.).rgb;
+  float title = smoothstep(.15, .85, m0.r) * uPress.y;
+  float blind = smoothstep(.15, .85, m0.g) * .55;
+  float ink = smoothstep(.15, .85, m0.b) * .25;
+  float pillow = max(m1.r * uPress.y - m0.r * uPress.y, 0.) * .22 + max(m1.g - m0.g, 0.) * .14;
+  float h = tooth(xz) - DEP * (title + blind + ink) + DEP * pillow;
+  float sd = sheetD(xz);
+  h -= smoothstep(-.004, .003, sd) * .02;          // beyond the deckle: the bed below
+  return h;
+}
+// the foil film: lies over the paper (bridging the un-pressed impressions), wrinkled, pressed in where the die hit
+float filmH(vec2 xz){
+  vec2 uv = muv(xz);
+  float tm = smoothstep(.15, .85, textureLod(uMask, uv, 1.5).r) * uPress.y;
+  float wr = (fbm2(xz * vec2(7., 3.) + 3.) - .5) * .0016 + (vnoise2(xz * 40.) - .5) * .0003;
+  return .0012 + wr - DEP * tm + tooth(xz) * .3;
+}
+bool filmHere(vec2 xz){ return uPress.z > .5 && xz.x > uPress.w && sheetD(xz) < .015; }
+// studio: a long softbox raking from the key azimuth, a moving strip for the sweep, faint fill
+vec3 env(vec3 r){
+  vec3 c = vec3(.012, .011, .010) * (.4 + .6 * max(r.y, 0.));
+  float az = uLight.x, el = uLight.y;
+  vec3 kd = normalize(vec3(cos(az) * cos(el), sin(el), sin(az) * cos(el)));
+  float cz = dot(r, kd);
+  if (cz > 0.) { vec3 u = normalize(cross(vec3(0., 1., 0.), kd)), v = cross(kd, u); vec2 q = vec2(dot(r, u), dot(r, v)) / cz;
+    vec2 e = smoothstep(vec2(.9, .22) + .1, vec2(.9, .22) - .1, abs(q)); c += vec3(1., .95, .88) * 7. * e.x * e.y; }
+  // a big overhead-back softbox (what makes foil read as gold) and a soft warm card in front for the brass
+  { vec3 bd = normalize(vec3(-.36, .73, -.58)); float cb = dot(r, bd);
+    if (cb > 0.) { vec3 u = normalize(cross(vec3(0., 1., 0.), bd)), v = cross(bd, u); vec2 q = vec2(dot(r, u), dot(r, v)) / cb;
+      vec2 e = smoothstep(vec2(.42, .3) + .09, vec2(.42, .3) - .09, abs(q)); c += vec3(1., .93, .82) * 4.2 * e.x * e.y * (.25 + .75 * smoothstep(.42, -.3, q.x)) * (.8 + .2 * smoothstep(-.3, .3, q.y)); } }
+  { vec3 sd2 = normalize(vec3(.5, .62, -.6)); float c2 = dot(r, sd2);
+    if (c2 > 0.) { vec3 u = normalize(cross(vec3(0., 1., 0.), sd2)), v = cross(sd2, u); vec2 q = vec2(dot(r, u), dot(r, v)) / c2;
+      c += vec3(1., .96, .9) * 3.4 * smoothstep(.1, .06, abs(q.x)) * smoothstep(.9, .7, abs(q.y)); } }
+  // the dark room, with a faint warm wall behind (so mirrored darkness is brown, not black)
+  c += vec3(.05, .035, .02) * smoothstep(-.1, .5, r.y) * smoothstep(.2, -.6, r.z);
+  { vec3 fd = normalize(vec3(.2, .25, .95)); float cf = dot(r, fd);
+    if (cf > 0.) { vec3 u = normalize(cross(vec3(0., 1., 0.), fd)), v = cross(fd, u); vec2 q = vec2(dot(r, u), dot(r, v)) / cf;
+      vec2 e = smoothstep(vec2(.9, .5) + .3, vec2(.9, .5) - .3, abs(q)); c += vec3(1., .9, .78) * .55 * e.x * e.y; } }
+  // the sweep: a narrow bright strip moving across the top of the scene
+  vec3 sd = normalize(vec3(uLight.z, .75, -.55)); float cs = dot(r, sd);
+  if (cs > 0. && uLight.w > 0.) { vec3 u = normalize(cross(vec3(0., 0., 1.), sd)), v = cross(sd, u); vec2 q = vec2(dot(r, u), dot(r, v)) / cs;
+    c += vec3(1., .97, .9) * 16. * uLight.w * smoothstep(.07, .02, abs(q.x)) * smoothstep(1.2, .9, abs(q.y)); }
+  return c;
+}
+vec3 keyDir(){ float az = uLight.x, el = uLight.y; return normalize(vec3(cos(az) * cos(el), sin(el), sin(az) * cos(el))); }
+float shadowH(vec3 p, vec3 L){
+  float s = 1., t = .0015;
+  for (int i = 0; i < 28; i++) { vec3 q = p + L * t; float h = paperH(q.xz, 0.); s = min(s, clamp(18. * (q.y - h) / t + .5, 0., 1.)); t += .0012 + t * .08; if (t > .08) break; }
+  return s;
+}
+// gold foil micro-structure: hairline cracks where the foil broke over the paper tooth
+float cracks(vec2 xz){
+  vec2 p = xz * 260.; vec2 i = floor(p), f = fract(p); float d1 = 8., d2 = 8.;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) { vec2 g = vec2(float(x), float(y)); vec2 o = vec2(hash12(i + g), hash12(i + g + 17.3)); float d = length(g + o - f); if (d < d1) { d2 = d1; d1 = d; } else if (d < d2) d2 = d; }
+  return smoothstep(.02, .06, d2 - d1);
+}
+// brass die block above the title
+vec2 dieBox(vec3 ro, vec3 rd){
+  vec3 mn = vec3(-.6, uPress.x, -.48), mx = vec3(.6, uPress.x + .28, .4);
+  vec3 iv = 1. / rd, t0 = (mn - ro) * iv, t1 = (mx - ro) * iv; vec3 a = min(t0, t1), b = max(t0, t1);
+  return vec2(max(max(a.x, a.y), a.z), min(min(b.x, b.y), b.z));
+}
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 ro = uRo, rd = camMat(ro, uTa, 0.) * normalize(vec3(uv, uFL));
+  vec3 L = keyDir();
+  // the die
+  if (uPress.x < 2.) {
+    vec2 db = dieBox(ro, rd);
+    if (db.x > 0. && db.x < db.y) {
+      vec3 P = ro + rd * db.x; gDepth = db.x;
+      vec3 c = (mn_dummy(P));
+      return c;
+    }
+  }
+  // the peel: a roll of film at the fold line (x = uPress.w) and the flap lifted over to the right,
+  // whose underside shows letter-shaped holes where the gold stayed on the paper
+  float tFl = 1e9; vec3 flapCol = vec3(0.);
+  if (uPress.z > .5 && uPress.w > -1.29) {
+    float rr = .011, th = .14;   // a 180-degree peel: the film folds back flat over itself, gold side up
+    vec3 O = vec3(uPress.w, 2. * rr, 0.), U = vec3(cos(th), sin(th), 0.), N = vec3(-sin(th), cos(th), 0.);
+    float dn = dot(rd, N);
+    if (abs(dn) > 1e-4) {
+      float tt = dot(O - ro, N) / dn; vec3 q = ro + rd * tt; float sU = dot(q - O, U);
+      float Lp = uPress.w + 1.3;
+      if (tt > 0. && sU > 0. && sU < Lp && abs(q.z) < .74) {
+        vec2 orig = vec2(uPress.w - sU, q.z);
+        float hole = smoothstep(.45, .55, textureLod(uMask, muv(orig), 0.).r) * step(.5, uPress.y);
+        if (hole < .5) {
+          tFl = tt;
+          vec3 nn = (dot(N, rd) < 0. ? N : -N);
+          nn = normalize(nn + vec3(0., 0., (fbm2(orig * vec2(4., 9.)) - .5) * .25));
+          vec3 r = reflect(rd, nn);
+          vec3 gold = vec3(.95, .7, .32);
+          float F = .5 + .5 * pow(1. - max(dot(nn, -rd), 0.), 5.);
+          flapCol = gold * 1.6 * (1. - exp(-env(r) * F * .8)) + gold * .02;
+          float edgeK = smoothstep(.0, .01, Lp - sU);
+          flapCol *= .6 + .4 * edgeK;
+        }
+      }
+    }
+    // the roll: a thin cylinder along z
+    vec2 o2 = ro.xy - vec2(uPress.w, rr); vec2 d2 = rd.xy; float a = dot(d2, d2), b = dot(o2, d2), c = dot(o2, o2) - rr * rr, h = b * b - a * c;
+    if (h > 0.) { float tt = (-b - sqrt(h)) / a; vec3 q = ro + rd * tt; if (tt > 0. && tt < tFl && abs(q.z) < .74) {
+      tFl = tt; vec3 nn = normalize(vec3(q.x - uPress.w, q.y - rr, 0.)); vec3 r = reflect(rd, nn);
+      flapCol = vec3(1., .76, .36) * 1.6 * (1. - exp(-env(r) * .8)) + vec3(.03, .02, .008); } }
+  }
+  // the paper surface (height-field march from just above the highest point)
+  float y0 = .004;
+  if (rd.y >= 0.) { gDepth = 50.; return env(rd) * .1; }
+  float t = (y0 - ro.y) / rd.y; if (t < 0.) t = 0.;
+  vec3 P = ro + rd * t;
+  bool onFilm = false;
+  float dt = .0006 / max(-rd.y, .05);
+  for (int i = 0; i < 90; i++) {
+    float hp = paperH(P.xz, 0.);
+    float hf = filmHere(P.xz) ? filmH(P.xz) : -1.;
+    if (hf > hp && P.y <= hf) { onFilm = true; break; }
+    if (P.y <= hp) {
+      // refine the crossing between the last two samples
+      float a = t - dt, b = t;
+      for (int k = 0; k < 6; k++) { float m = .5 * (a + b); vec3 Q = ro + rd * m; if (Q.y <= paperH(Q.xz, 0.)) b = m; else a = m; }
+      t = b; P = ro + rd * t; break;
+    }
+    P += rd * dt; t += dt;
+  }
+  if (tFl < t) { gDepth = tFl; return flapCol; }
+  gDepth = t;
+  vec2 xz = P.xz;
+  vec2 e = vec2(.0012, 0.);
+  vec3 col;
+  if (onFilm) {
+    float h0 = filmH(xz);
+    vec3 n = normalize(vec3(-(filmH(xz + e.xy) - h0) / e.x, 1., -(filmH(xz + e.yx) - h0) / e.x));
+    vec3 nw = normalize(n + vec3(fbm2(xz * 9.) - .5, 0., fbm2(xz * 9. + 4.) - .5) * .06);
+    vec3 r = reflect(rd, nw);
+    vec3 gold = vec3(1., .77, .34);
+    float F = .7 + .3 * pow(1. - max(dot(nw, -rd), 0.), 5.);
+    col = gold * 1.5 * (1. - exp(-env(r) * F * 1.1)) + gold * .012;
+    // the die's reflection as it hovers over the film
+    if (uPress.x < 1.) { vec2 db = dieBox(P + n * .001, r); if (db.x > 0. && db.x < db.y) col = mix(col, vec3(.5, .36, .16) * .25 + env(reflect(r, vec3(0., -1., 0.))) * .3 * gold, .85); }
+    // contact shadow under the die
+    float sh = smoothstep(.05, .0, uPress.x) * step(abs(xz.x), 1.0) * step(-.4, xz.y) * step(xz.y, .14);
+    col *= 1. - .5 * smoothstep(.25, 0., uPress.x) * (1. - smoothstep(.0, .02, uPress.x)) * 0.;
+    return col;
+  }
+  float h0 = paperH(xz, 0.);
+  vec3 n = normalize(vec3(-(paperH(xz + e.xy, 0.) - h0) / e.x, 1., -(paperH(xz + e.yx, 0.) - h0) / e.x));
+  vec3 m = textureLod(uMask, muv(xz), 0.).rgb;
+  float sd = sheetD(xz);
+  if (sd > .002) {
+    // walnut press bed
+    float gr = fbm2(vec2(xz.x * 2., xz.y * 30.)) * .7 + fbm2(xz * 8.) * .3;
+    vec3 alb = mix(vec3(.05, .026, .013), vec3(.13, .07, .035), gr);
+    float sh = shadowH(P + vec3(0., .0005, 0.), L);
+    col = alb * (.05 + 1.1 * max(dot(n, L), 0.) * sh);
+    col += min(env(reflect(rd, n)), vec3(1.2)) * .035;
+    return col;
+  }
+  float fib = fbm2(xz * vec2(30., 7.)) * .5 + fbm2(xz * 120.) * .3 + vnoise2(xz * 600.) * .2;
+  vec3 paper = vec3(.86, .83, .76) * (.93 + .1 * fib);
+  float sh = shadowH(P + n * .0004, L);
+  float dif = max(dot(n, L), 0.);
+  float foil = smoothstep(.45, .55, m.r) * step(.5, uPress.y) * (uPress.z > .5 ? step(xz.x, uPress.w) : 1.);
+  float ink = smoothstep(.4, .6, m.b);
+  if (foil > .5) {
+    // hot foil is ironed flat by the die: a uniform mirror; hairline breaks only where it bent over the wall
+    float wallK = clamp((1. - textureLod(uMask, muv(xz), 1.2).r) * 2.5, 0., 1.);
+    float cr = mix(1., cracks(xz), wallK * .35);
+    vec2 wob = vec2(fbm2(xz * 12.) - .5, fbm2(xz * 12. + 9.) - .5) * .04 + vec2(vnoise2(xz * 700.) - .5, vnoise2(xz * 700. + 7.) - .5) * .006;
+    vec3 nf = normalize(n + vec3(wob.x, 0., wob.y));
+    vec3 r = reflect(rd, nf);
+    vec3 gold = vec3(1., .77, .34);
+    float F = .72 + .28 * pow(1. - max(dot(nf, -rd), 0.), 5.);
+    vec3 g = gold * 1.45 * (1. - exp(-env(r) * F * 1.1)) + gold * .02 * dif * sh;   // highlights stay gold, never white
+    g *= .72 + .28 * sh;
+    col = mix(paper * (.12 + .95 * dif * sh), g, cr);
+    return col;
+  }
+  vec3 alb = mix(paper, vec3(.075, .072, .07), ink * .92);
+  vec2 uvm = muv(xz);
+  vec3 mA = textureLod(uMask, uvm, 1.).rgb, mB = textureLod(uMask, uvm, 3.3).rgb;
+  float inD = smoothstep(.3, .7, mA.g) + smoothstep(.3, .7, mA.r) * uPress.y;
+  float ao = clamp((mA.g - mB.g) * 1.5, 0., 1.) * smoothstep(.3, .7, mA.g) + clamp((mA.r - mB.r) * 2.4, 0., 1.) * smoothstep(.3, .7, mA.r) * uPress.y;
+  // and just outside the wall, the pillow throws a soft line of shade onto itself on the far side
+  alb *= 1. - .55 * clamp(ao, 0., 1.) - .03 * clamp(inD, 0., 1.);
+  col = alb * (.1 + 1.02 * dif * sh) * vec3(1., .97, .92);
+  // soft sheen on the inked parts and the polished impression floors
+  col += env(reflect(rd, n)) * (.008 + ink * .04);
+  return col;
+}`.replace('vec3 c = (mn_dummy(P));', `
+      vec3 iv = 1. / rd; vec3 mn = vec3(-.6, uPress.x, -.48), mx = vec3(.6, uPress.x + .28, .4);
+      vec3 t0 = (mn - ro) * iv, t1 = (mx - ro) * iv; vec3 a = min(t0, t1);
+      vec3 n = a.x > a.y && a.x > a.z ? vec3(-sign(rd.x), 0., 0.) : a.y > a.z ? vec3(0., -sign(rd.y), 0.) : vec3(0., 0., -sign(rd.z));
+      vec3 r = reflect(rd, n);
+      float brush = vnoise2(vec2(P.x * 3., P.y * 900.)) * .5 + .5;
+      vec3 brass = vec3(.78, .56, .26);
+      vec3 rr = normalize(r + vec3(0., (brush - .5) * .08, 0.));
+      vec3 c = env(rr) * brass * (.7 + .3 * brush) + brass * .03;
+      if (n.y < -.5) { float mk = smoothstep(.3, .7, textureLod(uMask, muv(P.xz), 1.).r);
+        c = mix(brass * .06 + env(rr) * brass * .12, env(rr) * brass * 1.1 + brass * .08, mk); }
+      // the mount above the brass plate: dark steel
+      if (P.y > uPress.x + .06) c = env(rr) * vec3(.22, .22, .23) + vec3(.03, .03, .033) * (.5 + .5 * max(dot(n, keyDir()), 0.));
+      // chamfered edges catch the light
+      float edge = min(P.y - uPress.x, abs(P.y - uPress.x - .06));
+      if (abs(n.y) < .5) c += vec3(1., .8, .5) * .9 * smoothstep(.004, .0, edge);`),
+});
+const gl = rm.canvas.getContext('webgl2');
+let texMask;
+
+/* ---------------- timeline ---------------- */
+function press(t) {
+  // the die drops from 0.25, hits on beat 1.0, dwells a beat, lifts away by 2.3
+  let y;
+  if (t < 0.25) y = 0.75;
+  else if (t < 1.0) y = lerp(0.75, 0.0, E.inCubic(inv(0.25, 1.0, t)));
+  else if (t < 1.5) y = 0.0;
+  else y = lerp(0.0, 2.5, E.inCubic(inv(1.5, 2.3, t)));
+  const depth = t < 1.0 ? 0 : clamp((t - 1.0) / 0.06);
+  const peel = lerp(-1.31, 1.32, E.inOutSine(inv(3.25, 4.25, t)));     // the film comes off 3.25 -> 4.25, unhurried
+  return [y, depth, t < 4.3 ? 1 : 0, peel];
+}
+function light(t) {
+  // key from the left, low; sweeps cross the sprig on 4.5, 6.5 and a last narrow glint on 8.25
+  const az = Math.PI + lerp(0.35, -0.25, Track.easeRange(t, 0, 10));
+  const el = lerp(0.2, 0.32, Track.easeRange(t, 6, 10));
+  const sweeps = [[4.0, 5.0, 1.0], [6.0, 7.0, -0.8], [8.0, 8.5, 1.35]];
+  let sw = -9, st = 0;
+  for (const [a0, a1, k] of sweeps) { const u = inv(a0, a1, t); if (u > 0 && u < 1) { sw = (k > 0 ? 1 : -1) * lerp(-2.0, 2.0, u); st = Math.abs(k) * Math.sin(Math.PI * u); } }
+  return [az, el, sw, st];
+}
+const CAMT = Track([
+  { t: 0.0, v: [-0.8, 0.38, 1.2, -0.04, 0.3, -0.05, 2.4] },
+  { t: 1.0, v: [-0.74, 0.66, 1.25, -0.03, 0.04, -0.05, 2.4] },
+  { t: 2.3, v: [-0.48, 0.32, 0.86, -0.04, 0.0, -0.06, 2.55] },
+  { t: 3.5, v: [-0.36, 0.25, 0.72, -0.06, 0.0, -0.06, 2.6] },
+  { t: 4.5, v: [-0.18, 0.21, 0.66, -0.02, 0.0, -0.06, 2.65] },
+  { t: 5.5, v: [0.16, 0.2, 0.66, 0.02, 0.0, -0.06, 2.7] },
+  { t: 6.5, v: [0.46, 0.24, 0.52, 0.04, 0.0, -0.04, 2.7] },
+  { t: 7.25, v: [0.3, 0.62, 0.86, 0.02, 0.0, 0.0, 2.5] },
+  { t: 8.0, v: [0.0, 1.34, 1.24, 0.0, 0.0, 0.04, 2.35], stop: true },
+  { t: 10.0, v: [0.0, 1.325, 1.225, 0.0, 0.0, 0.04, 2.35] },
+]);
+function cam(t) {
+  const v = CAMT(t);
+  const p = v.slice(0, 3), a = v.slice(3, 6);
+  // the hit: a short, heavy shake (vertical and a little lateral)
+  if (t > 1.0) { const k = Math.exp(-(t - 1.0) * 12); p[1] += k * Math.sin((t - 1.0) * 80) * 0.012; p[0] += k * Math.sin((t - 1.0) * 63 + 1) * 0.004; }
+  return { p, a, fl: v[6] };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {
+    buildMask();
+    texMask = gl.createTexture(); gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texMask);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, mask); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.activeTexture(gl.TEXTURE0);
+  },
+  cues: [
+    { t: 0.25, sfx: 'press_down', gain: 0.6 }, { t: 1.0, sfx: 'press_hit', gain: 1.0 }, { t: 1.5, sfx: 'press_lift', gain: 0.55 },
+    { t: 3.25, sfx: 'foil_peel', gain: 0.9 }, { t: 4.5, sfx: 'gold_glint', gain: 0.7 }, { t: 6.0, sfx: 'light_sweep', gain: 0.5 }, { t: 8.25, sfx: 'final_glint', gain: 0.6 },
+  ],
+  render(t) {
+    const c = cam(t), pr = press(t), li = light(t);
+    rm.set('uMask', { __ints: 1, v: 5 }).set('uRo', c.p).set('uTa', c.a).set('uFL', c.fl).set('uPress', pr).set('uLight', li).set('uT', t);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texMask); gl.activeTexture(gl.TEXTURE0);
+    // focus: the sprig; during the peel it rides the lifting film at the fold
+    const fp = [0, 0, -0.05];
+    const kp = Math.sin(Math.PI * inv(3.2, 4.35, t));
+    const fx = lerp(fp[0], pr[3] + 0.08, kp), fy = lerp(0, 0.06, kp);
+    const focus = Math.hypot(c.p[0] - fx, c.p[1] - fy, c.p[2] - fp[2]);
+    rm.render(t, { focus, aperture: lerp(34, 18, Track.easeRange(t, 7.0, 8.0)), maxCoc: 14 });
+  },
+});
+</script></body></html>

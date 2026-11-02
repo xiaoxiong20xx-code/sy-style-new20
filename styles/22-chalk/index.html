@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>22 粉笔黑板 · Chalkboard</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 22 粉笔黑板 · CHALKBOARD (stop-motion chalk animation, 12 drawings per second) =====
+   A green slate board with years of erased lessons in its haze, an oak chalk tray with worn sticks and a felt eraser.
+   Chalk is simulated physically: every stroke writes "pressure" into a map, and chalk only deposits where the board's
+   tooth pokes above it, so lines are grainy and broken; broad strokes made with the side of the chalk are streaky.
+   Like a real chalk animation, the whale is erased and redrawn for every drawing, so each pose leaves a grey ghost.
+   0.25 tap · the whale is drawn with labels · 4.45 it breaches through the chalk waterline · it dives away leaving a
+   trail of ghosts · the eraser wipes a band and the title is chalked into the haze. */
+const { E, clamp, lerp, inv } = Reel;
+const stage = Reel.makeStage('#18241f');
+const C = Reel.cfg({ label: '座头鲸', meas: '15 m' });
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+Reel.ownJitter = true;
+const SANS = '"Noto Sans CJK SC"';
+const FPS = 12, q12 = (t) => Math.floor(t * FPS + 1e-6) / FPS;
+const R = Reel.rng(2222), rr = (a, b) => a + (b - a) * R();
+const hsh = (a, b = 0) => { const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return s - Math.floor(s); };
+const TRAY = 928;                    // board bottom edge (board px)
+const WHITE = [0.93, 0.93, 0.9], YEL = [0.98, 0.86, 0.42], BLUE = [0.56, 0.75, 0.96], PINK = [0.97, 0.62, 0.68];
+
+// ================= stroke sets =================
+// kind 0 = point of the chalk, 1 = side of the chalk (broad, streaky), 2 = ghost (erased residue)
+// p1 = tEnd (stroke is erased at this time and turns into a ghost; 0 = never), p2 = pressure jitter seed
+const ST1 = new SG.Strokes();      // drawn before the wipe (whale stills, labels, waterline, splashes)
+const ST2 = new SG.Strokes();      // drawn after the wipe (title, signature)
+const STE = new SG.Strokes();      // the eraser's swept path
+const DYN = new SG.Strokes();      // per-frame: swimming whale + ghosts of every previous drawing
+let seedN = 1;
+const chalk = (S, pts, o) => S.add(pts, Object.assign({ w: 7, colA: WHITE, thick: 1, kind: 0, t0: 0, t1: 0.2, seed: (seedN++ * 7.13) % 91, p1: 0, ds: 3 }, o));
+const TIPS = [];                   // [t0, t1, polyline] for chalk dust spawning
+
+// ---------- single-stroke capitals / digits for hand lettering ----------
+const arc = (cx, cy, rx, ry, a0, a1, n = 18) => Array.from({ length: n + 1 }, (_, i) => { const a = lerp(a0, a1, i / n); return [cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]; });
+const GLY = {
+  A: [[[0, 1], [0.48, 0], [0.96, 1]], [[0.22, 0.62], [0.74, 0.62]]],
+  B: [[[0, 1], [0, 0], [0.55, 0], [0.8, 0.1], [0.82, 0.3], [0.58, 0.47], [0, 0.47]], [[0.58, 0.47], [0.88, 0.6], [0.88, 0.86], [0.62, 1], [0, 1]]],
+  C: [arc(0.52, 0.5, 0.5, 0.5, -0.75, -5.55)],
+  D: [[[0, 0], [0, 1], [0.45, 1], [0.82, 0.82], [0.92, 0.5], [0.82, 0.18], [0.45, 0], [0, 0]]],
+  G: [arc(0.52, 0.5, 0.5, 0.5, -0.75, -5.9).concat([[0.98, 0.56], [0.58, 0.56]])],
+  H: [[[0, 0], [0, 1]], [[0.86, 0], [0.86, 1]], [[0, 0.5], [0.86, 0.5]]],
+  I: [[[0.1, 0], [0.1, 1]]],
+  K: [[[0, 0], [0, 1]], [[0.85, 0], [0, 0.62]], [[0.28, 0.42], [0.9, 1]]],
+  L: [[[0, 0], [0, 1], [0.78, 1]]],
+  M: [[[0, 1], [0.04, 0], [0.5, 0.68], [0.96, 0], [1, 1]]],
+  N: [[[0, 1], [0, 0], [0.86, 1], [0.86, 0]]],
+  O: [arc(0.5, 0.5, 0.5, 0.5, -1.7, -1.7 + 6.4, 26)],
+  P: [[[0, 1], [0, 0], [0.6, 0], [0.86, 0.14], [0.86, 0.36], [0.6, 0.5], [0, 0.5]]],
+  R: [[[0, 1], [0, 0], [0.6, 0], [0.86, 0.14], [0.86, 0.36], [0.6, 0.5], [0, 0.5]], [[0.42, 0.5], [0.92, 1]]],
+  U: [[[0, 0], [0, 0.68], [0.16, 0.94], [0.45, 1], [0.74, 0.94], [0.88, 0.68], [0.88, 0]]],
+  X: [[[0, 0], [0.9, 1]], [[0.9, 0], [0, 1]]],
+  '1': [[[0.05, 0.22], [0.35, 0], [0.35, 1]]],
+  '5': [[[0.78, 0], [0.12, 0], [0.06, 0.46], [0.45, 0.38], [0.78, 0.55], [0.8, 0.84], [0.45, 1], [0.04, 0.9]]],
+  '0': [arc(0.4, 0.5, 0.4, 0.5, -1.6, 4.75, 20)],
+  '3': [[[0.05, 0.12], [0.3, 0], [0.62, 0.02], [0.78, 0.18], [0.7, 0.38], [0.4, 0.48], [0.75, 0.6], [0.82, 0.82], [0.6, 0.98], [0.3, 1], [0.04, 0.88]]],
+  '.': [[[0.1, 0.96], [0.14, 1]]],
+  m: [[[0, 0.42], [0, 1]], [[0, 0.58], [0.2, 0.42], [0.4, 0.5], [0.42, 1]], [[0.42, 0.58], [0.62, 0.42], [0.82, 0.5], [0.84, 1]]],
+  '/': [[[0.6, -0.05], [0.05, 1.05]]],
+};
+const ADV = { '.': 0.35, '0': 0.85, I: 0.42, '1': 0.6, ' ': 0.45, m: 1.05, '/': 0.75, M: 1.18, O: 1.06, C: 1.0, G: 1.05 };
+// write text with chalk: returns end time
+function letter(S, str, x, y, h, t0, dur, o = {}) {
+  const chars = [...str]; const per = dur / Math.max(1, chars.filter((c) => c !== ' ').length);
+  let cx = x, t = t0, k = 0;
+  const sl = o.slant ?? 0.08;
+  for (const ch of chars) {
+    const g = GLY[ch];
+    if (g) {
+      const jx = rr(-0.03, 0.03) * h, jy = rr(-0.04, 0.04) * h, rot = rr(-0.05, 0.05), sc = 1 + rr(-0.05, 0.05);
+      const strokes = g.map((pl) => pl.map(([u, v]) => { const px = u * h * 0.78 * sc, py = (v - 1) * h * sc; const rx = px * Math.cos(rot) - py * Math.sin(rot), ry = px * Math.sin(rot) + py * Math.cos(rot); return [cx + rx - ry * sl + jx, y + ry + jy]; }));
+      const n = strokes.length;
+      strokes.forEach((pl, i) => { const a = t + per * i / n, b = t + per * (i + 0.85) / n; chalk(S, pl, Object.assign({ w: h * 0.085 + 2.5, t0: a, t1: b, lin: true, colA: o.col || WHITE, thick: o.p ?? 1, p1: o.tEnd ?? 0 }, o.extra)); TIPS.push([a, b, pl]); });
+      t += per; k++;
+    }
+    cx += (ADV[ch] ?? 0.92) * h * 0.78 + (o.sp ?? 0.12) * h;
+  }
+  return t;
+}
+const textW = (str, h, sp = 0.12) => [...str].reduce((a, ch) => a + (ADV[ch] ?? 0.92) * h * 0.78 + sp * h, 0) - sp * h;
+
+// ---------- the whale: strokes in body space (u along the body 0 snout → 1 fluke tip, v px, + = dorsal) ----------
+const WH = [];   // [pts(u,v), w, col, pressure, kind, drawOrder]
+(function whale() {
+  const top = [[0.004, 2], [0.012, 20], [0.035, 44], [0.08, 68], [0.15, 88], [0.24, 104], [0.33, 113], [0.43, 113], [0.52, 105], [0.6, 96], [0.63, 101], [0.652, 112], [0.668, 116], [0.678, 98], [0.72, 82], [0.8, 56], [0.87, 34], [0.915, 22]];
+  const bot = [[0.004, 2], [0.006, -14], [0.03, -40], [0.08, -70], [0.15, -96], [0.24, -114], [0.34, -120], [0.44, -112], [0.54, -94], [0.64, -70], [0.74, -45], [0.84, -26], [0.915, -16]];
+  const fluke = [[0.915, 22], [0.98, 38], [1.05, 56], [1.12, 70], [1.165, 76], [1.15, 62], [1.125, 50], [1.1, 34], [1.075, 16], [1.058, 4], [1.08, -10], [1.11, -26], [1.14, -40], [1.17, -50], [1.15, -60], [1.09, -50], [1.02, -36], [0.96, -24], [0.915, -16]];
+  const fin = [[0.2, -60], [0.235, -96], [0.28, -150], [0.335, -205], [0.39, -246], [0.425, -262], [0.44, -254], [0.418, -230], [0.38, -196], [0.335, -152], [0.295, -110], [0.265, -78]];
+  WH.push([top, 7.5, WHITE, 1.05, 0, 0], [bot, 7.5, WHITE, 1.05, 0, 1], [fluke, 7, WHITE, 1.0, 0, 2], [fin, 7, WHITE, 1.0, 0, 3]);
+  // knobs on the fin's leading edge, eye, mouth, throat grooves
+  for (let k = 0; k < 5; k++) { const u = 0.236 + k * 0.038, v = -94 - k * 36; WH.push([[[u, v], [u + 0.01, v - 8], [u + 0.019, v + 2]], 4.5, WHITE, 0.85, 0, 4]); }
+  WH.push([arc(0.14, -4, 0.009, 7.5, 0, 6.6, 12), 4.5, WHITE, 0.95, 0, 5], [[[0.138, -4], [0.142, -4]], 6.5, WHITE, 1.2, 0, 5]);
+  WH.push([[[0.008, -6], [0.05, -14], [0.1, -20], [0.16, -24], [0.19, -21]], 5, PINK, 0.95, 0, 5]);
+  for (let i = 0; i < 7; i++) WH.push([[[0.02 + i * 0.011, -26 - i * 10], [0.1 + i * 0.012, -46 - i * 9.5], [0.24 + i * 0.008, -70 - i * 6.2], [0.42 - i * 0.014, -84 - i * 3.3]], 4.4, WHITE, 0.95, 0, 6]);
+  for (let i = 0; i < 9; i++) { const u = 0.015 + i * 0.016, v = 18 + i * 6.2 + (i % 2) * 7; WH.push([[[u, v], [u + 0.003, v + 1]], 7, WHITE, 1.0, 0, 7]); }
+  for (let i = 0; i < 4; i++) { const u = 0.02 + i * 0.03; WH.push([[[u, -32 - i * 7], [u + 0.002, -33 - i * 7]], 6, WHITE, 0.9, 0, 7]); }
+  // side-of-chalk shading: blue under the belly and fin, white along the back
+  for (let i = 0; i < 4; i++) WH.push([[[0.06 + i * 0.03, -66 - i * 8], [0.3, -100 - i * 4], [0.55, -78 - i * 4], [0.82, -30 - i * 2]], 28, BLUE, 0.4, 1, 8]);
+  WH.push([[[0.255, -100], [0.33, -170], [0.41, -240]], 24, BLUE, 0.36, 1, 8]);
+  WH.push([[[0.1, 58], [0.3, 88], [0.5, 88], [0.7, 60]], 24, WHITE, 0.3, 1, 9], [[[0.18, 76], [0.45, 96], [0.6, 82]], 18, WHITE, 0.28, 1, 9]);
+})();
+// draw-on schedule for the still whale (drawOrder → [t0, t1])
+const WSCHED = [[0.72, 1.28], [1.22, 1.72], [1.68, 2.02], [1.98, 2.3], [2.28, 2.4], [2.38, 2.52], [2.5, 2.78], [2.76, 2.86], [2.84, 3.12], [3.1, 3.28]];
+
+// ---------- the head's path: rest pose, then the breach and the dive ----------
+const LB = 860;
+const PATH_CTRL = [[-1400, 600], [200, 600], [1060, 600], [1260, 585], [1420, 470], [1520, 300], [1615, 150], [1745, 88], [1875, 140], [1955, 300], [2010, 500], [2200, 650], [2900, 700]];
+const PP = SG.crSample(PATH_CTRL, 4), PCL = [0];
+for (let i = 1; i < PP.length; i++) PCL.push(PCL[i - 1] + Math.hypot(PP[i][0] - PP[i - 1][0], PP[i][1] - PP[i - 1][1]));
+const S_REST = (() => { let best = 0, bd = 1e9; PP.forEach((p, i) => { const d = Math.hypot(p[0] - 1060, p[1] - 600); if (d < bd) { bd = d; best = PCL[i]; } }); return best; })();
+function pathAt(s) {
+  let lo = 0, hi = PCL.length - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (PCL[m] < s) lo = m; else hi = m; }
+  const k = clamp((s - PCL[lo]) / (PCL[hi] - PCL[lo] || 1));
+  const p = [lerp(PP[lo][0], PP[hi][0], k), lerp(PP[lo][1], PP[hi][1], k)];
+  const dx = PP[hi][0] - PP[lo][0], dy = PP[hi][1] - PP[lo][1], l = Math.hypot(dx, dy) || 1;
+  return { p, t: [dx / l, dy / l] };
+}
+// head advance along the path (px) vs time: burst through the waterline on 4.5 (beat), hang at the apex, re-enter on 6.0
+const SC = (() => { let s1 = null, s2 = null, apex = false;
+  for (let s = S_REST; s < S_REST + 3000; s += 2) { const y = pathAt(s).p[1]; if (s1 === null && y < 330) s1 = s; if (s1 !== null && y < 120) apex = true; if (apex && s2 === null && y > 330) s2 = s; }
+  return [s1 - S_REST + 6, s2 - S_REST + 6]; })();
+const SWK = [[4.0, 0], [4.5, SC[0]], [4.95, lerp(SC[0], SC[1], 0.42)], [5.4, lerp(SC[0], SC[1], 0.66)], [6.0, SC[1]], [6.4, SC[1] + 420], [6.95, SC[1] + 1250]];
+const swimS = (t) => { if (t <= SWK[0][0]) return 0; for (let i = 0; i < SWK.length - 1; i++) { const [a, sa] = SWK[i], [b, sb] = SWK[i + 1]; if (t <= b) return lerp(sa, sb, E.inOutSine((t - a) / (b - a)) * 0.35 + (t - a) / (b - a) * 0.65); } return SWK[SWK.length - 1][1] + (t - SWK[SWK.length - 1][0]) * 1800; };
+function poseStrokes(S, f, ghost, tag) {
+  // f = drawing index (12 fps); returns nothing, pushes strokes into S
+  const t = f / FPS;
+  const sh = S_REST + swimS(t);
+  const swim = clamp((t - 3.95) * 4);
+  const phase = t * 2.2;
+  const jit = (i, j, a) => (hsh(f * 13.1 + i * 3.7, j) - 0.5) * a;
+  WH.forEach(([pts, w, col, pr, kind], si) => {
+    const P = pts.map(([u, v], j) => {
+      const s = sh - u * LB;
+      const { p, t: tg } = pathAt(s);
+      const vv = v * (1 + 0.03 * Math.sin(u * 9 + phase * 3) * swim) + swim * (5 + 30 * u * u) * Math.sin(6.283 * (u * 0.85 - phase)) * (1 - 0.6 * clamp((t - 4.4) / 0.6) * clamp((5.6 - t) / 0.4));
+      const n = [tg[1], -tg[0]];
+      const jj = ghost ? 0 : 1;
+      return [p[0] + n[0] * vv + jit(si, j * 2, 3.2) * jj, p[1] + n[1] * vv + jit(si, j * 2 + 1, 3.2) * jj];
+    });
+    if (ghost) S.add(P, { w: w * (kind === 1 ? 1.4 : 3.2), colA: col, thick: pr * (kind === 1 ? 0.05 : 0.085), kind: 2, t0: -10, t1: -9, seed: (si * 3.3 + f * 1.7) % 89, ds: 8 });
+    else S.add(P, { w, colA: col, thick: pr, kind, t0: -10, t1: -9, seed: (si * 3.3 + f * 1.7) % 89, ds: 3, p2: f });
+  });
+}
+// still whale (frames before 4.0) drawn on with the schedule; erased at 4.0 → ghost
+(function stillWhale() {
+  const f = Math.round(3.9 * FPS);
+  const tmp = new SG.Strokes(); poseStrokes(tmp, f, false);
+  tmp.list.forEach((L, si) => {
+    const ord = WH[si][5], [a, b] = WSCHED[ord];
+    const sameOrd = WH.map((x, k) => [x, k]).filter(([x]) => x[5] === ord).map(([, k]) => k);
+    const idx = sameOrd.indexOf(si), n = sameOrd.length;
+    const t0 = q12(a + (b - a) * idx / n), t1 = a + (b - a) * (idx + 1) / n;
+    chalk(ST1, L.pts, Object.assign({}, L.o, { t0, t1: Math.max(t1, t0 + 0.04), p1: 4.0, ds: 3, lin: false }));
+    TIPS.push([t0, t1, L.pts]);
+  });
+})();
+// waterline (blue), opening tap
+const WATER = Array.from({ length: 23 }, (_, i) => [70 + i * 80, 330 + Math.sin(i * 1.3) * 9 + (i % 2) * 6]);
+chalk(ST1, [[72, 331], [74, 332]], { w: 9, colA: BLUE, thick: 1.3, t0: 0.25, t1: 0.27, ds: 2 });
+chalk(ST1, WATER, { w: 7, colA: BLUE, thick: 1.0, t0: 0.3, t1: 0.7 }); TIPS.push([0.3, 0.7, WATER]);
+for (let k = 0; k < 3; k++) { const x0 = 300 + k * 520, pts = Array.from({ length: 5 }, (_, i) => [x0 + i * 45, 372 + Math.sin(i * 1.7 + k) * 6]); chalk(ST1, pts, { w: 4.5, colA: BLUE, thick: 0.7, t0: 0.62 + k * 0.03, t1: 0.7 + k * 0.03 }); }
+letter(ST1, '10.30', 92, 112, 40, -1, 0.5, { col: WHITE, sp: 0.1, p: 0.9 });
+chalk(ST1, [[86, 128], [250, 125]], { w: 4, colA: WHITE, thick: 0.75, t0: -1, t1: -0.9 });
+// annotations (yellow): measurement over the back, label + leader bottom-left
+chalk(ST1, [[202, 448], [1058, 442]], { w: 4.5, colA: YEL, thick: 0.95, t0: 3.2, t1: 3.42, lin: true }); TIPS.push([3.2, 3.42, [[202, 448], [1058, 442]]]);
+for (const [x, y, s] of [[202, 448, 1], [1058, 442, -1]]) { chalk(ST1, [[x + s * 22, y - 13], [x, y], [x + s * 22, y + 12]], { w: 4.5, colA: YEL, thick: 0.95, t0: 3.4, t1: 3.46, lin: true }); chalk(ST1, [[x, y - 22], [x, y + 22]], { w: 4, colA: YEL, thick: 0.9, t0: 3.42, t1: 3.47, lin: true }); }
+letter(ST1, C.meas, 630 - textW(C.meas, 38) / 2, 428, 38, 3.46, 0.24, { col: YEL });
+chalk(ST1, [[470, 772], [380, 832], [300, 840]], { w: 4.2, colA: YEL, thick: 0.9, t0: 3.62, t1: 3.74 }); TIPS.push([3.62, 3.74, [[470, 772], [380, 832], [300, 840]]]);
+chalk(ST1, [[454, 770], [472, 772], [468, 790]], { w: 4.2, colA: YEL, thick: 0.9, t0: 3.6, t1: 3.64, lin: true });
+// ---------- splashes where the whale breaks the waterline ----------
+const crossT = (() => { const out = []; let prevY = null; for (let f = 48; f < 84; f++) { const s = S_REST + swimS(f / FPS); const y = pathAt(s).p[1]; if (prevY !== null && (prevY - 330) * (y - 330) <= 0) out.push([f / FPS, pathAt(s).p[0]]); prevY = y; } return out; })();
+const SPLASH = crossT.map(([t, x], k) => ({ t: q12(t), x: x + (k ? -10 : -40) }));
+if (Reel.Q.get('dbg')) console.error('SPLASH', JSON.stringify(SPLASH), 'SC', JSON.stringify(SC));
+SPLASH.forEach(({ t, x }, k) => {
+  for (let i = 0; i < 9; i++) {
+    const a = -Math.PI / 2 + (i - 4) * 0.3 + rr(-0.08, 0.08), L = rr(110, 230) * (1 - Math.abs(i - 4) * 0.07);
+    const pts = [[x + Math.cos(a) * 20, 330 + Math.sin(a) * 12], [x + Math.cos(a) * L * 0.6 + Math.sign(i - 4) * 10, 330 + Math.sin(a) * L * 0.7], [x + Math.cos(a) * L + Math.sign(i - 4) * 28, 330 + Math.sin(a) * L * 0.75 + L * 0.25]];
+    chalk(ST1, pts, { w: 5.5, colA: i % 3 ? WHITE : BLUE, thick: 0.9, t0: t - 0.083, t1: t - 0.001, p1: t + 0.5, ds: 3 }); TIPS.push([t, t + 0.08, pts]);
+  }
+  for (let i = 0; i < 22; i++) { const a = -Math.PI / 2 + rr(-1.4, 1.4), d = rr(90, 290); const p = [x + Math.cos(a) * d * 1.2, 330 + Math.sin(a) * d * 0.9 + 20]; chalk(ST1, [p, [p[0] + 1.5, p[1] + 1]], { w: rr(5, 9), colA: WHITE, thick: 1, t0: t + (i % 2) / 12 - 0.001, t1: t + (i % 2) / 12 + 0.01, p1: t + 0.58, ds: 2 }); }
+  for (let i = 0; i < 2; i++) chalk(ST1, arc(x, 338, 110 + i * 60, 16 + i * 8, 0.1, Math.PI - 0.1, 14), { w: 4.5, colA: BLUE, thick: 0.8, t0: t + 0.08, t1: t + 0.16, p1: t + 0.75, ds: 3 });
+});
+// ---------- the eraser sweeps a band (long side vertical), cleaning only where it has passed ----------
+const ER_T0 = 6.75, ER_T1 = 7.5;
+const ERP = [[195, 400], [900, 392], [1725, 384], [1720, 470], [1700, 612], [900, 620], [230, 628], [205, 812], [580, 820]];
+chalk(STE, ERP, { w: 250, colA: [1, 1, 1], thick: 1, t0: ER_T0, t1: ER_T1, kind: 3, ds: 6, lin: true });
+// ---------- ending: three chalk strokes — a waterline, a diving whale's flukes, a splash (lands on 8.0) ----------
+const END_W = Array.from({ length: 13 }, (_, i) => [520 + i * 74, 612 + Math.sin(i * 1.4) * 7 + (i % 2) * 5]);
+chalk(ST2, END_W, { w: 9, colA: BLUE, thick: 1.05, t0: 7.5, t1: 7.7 }); TIPS.push([7.5, 7.7, END_W]);
+const END_F = [[928, 606], [932, 548], [924, 500], [900, 468], [858, 446], [806, 428], [762, 404], [742, 378], [774, 372], [830, 380], [884, 398], [928, 424], [958, 446],
+  [990, 424], [1036, 398], [1092, 380], [1150, 372], [1184, 380], [1164, 406], [1116, 430], [1064, 448], [1020, 472], [998, 504], [990, 552], [994, 606]];
+const FS = (p) => [961 + (p[0] - 961) * 1.32, 606 + (p[1] - 606) * 1.32];
+END_F.forEach((p, i) => (END_F[i] = FS(p)));
+chalk(ST2, END_F, { w: 10, colA: WHITE, thick: 1.08, t0: 7.75, t1: 7.97, ds: 3 }); TIPS.push([7.75, 7.97, END_F]);
+for (let i = 0; i < 3; i++) chalk(ST2, [FS([812 + i * 30, 412 + i * 8]), FS([930 - i * 4, 442 + i * 12])], { w: 22, colA: BLUE, thick: 0.34, kind: 1, t0: 7.97, t1: 8.0 });
+const END_S = [];
+for (let i = 0; i < 8; i++) {                            // splash: water flicked up and outwards from both sides of the stalk
+  const sx = i < 4 ? -1 : 1, k = i % 4, a = -Math.PI / 2 + sx * (0.42 + k * 0.3), L = 120 - k * 18 + rr(-8, 8);
+  const b0 = [961 + sx * (66 + k * 12), 606];
+  const pts = [b0, [b0[0] + Math.cos(a) * L * 0.55, b0[1] + Math.sin(a) * L * 0.62], [b0[0] + Math.cos(a) * L * 0.9 + sx * 22, b0[1] + Math.sin(a) * L * 0.72 + 6], [b0[0] + Math.cos(a) * L + sx * 40, b0[1] + Math.sin(a) * L * 0.55 + 24]];
+  END_S.push(pts); chalk(ST2, pts, { w: 6.5, colA: k === 3 ? BLUE : WHITE, thick: 0.95, t0: 7.92, t1: 7.999 });
+}
+TIPS.push([7.96, 8.0, END_S[5]]);
+for (let i = 0; i < 12; i++) { const a = -Math.PI / 2 + rr(-1.25, 1.25), d = rr(70, 170); const p = [960 + Math.cos(a) * d * 1.3, 586 + Math.sin(a) * d * 0.7]; chalk(ST2, [p, [p[0] + 1.5, p[1] + 1]], { w: rr(5, 8), colA: WHITE, thick: 1, t0: 7.999, t1: 8.01, ds: 2 }); }
+for (const [x, y] of [[752, 392], [770, 420], [1176, 394], [1160, 424], [1168, 452]].map(FS)) chalk(ST2, [[x, y], [x + 1, y + 1.5]], { w: 7, colA: WHITE, thick: 1, t0: 7.999, t1: 8.01, ds: 2 });
+const LABEL_T = 3.72;
+// ---------- the chalk stick: moves with the drawing tip (stop-motion, 12 fps), enters / leaves the frame ----------
+const SEGS = [[0.25, 0.27, [[72, 331], [74, 332]], BLUE]].concat(
+  TIPS.filter(([a]) => a < 4.0 || a >= 7.4).map(([a, b, pl]) => [a, b, pl, a >= 7.5 && a < 7.75 ? BLUE : a >= 3.2 && a < 4.0 ? YEL : a < 0.75 ? BLUE : WHITE]),
+  [...C.label].map((_, i) => [LABEL_T + i * 0.08, LABEL_T + i * 0.08 + 0.07, [[150 + i * 47, 828], [166 + i * 47, 846], [150 + i * 47, 858], [172 + i * 47, 852]], YEL]),
+).sort((p, q) => p[0] - q[0]);
+const OFF_IN = [-140, 820], AWAY = [520, 900];          // the hand pulls the chalk away along its own axis
+function chalkAt(t) {
+  const first = SEGS[0], k = (pl, u) => { const x = clamp(u) * (pl.length - 1), i = Math.min(pl.length - 2, Math.floor(x)), f = x - i; return [lerp(pl[i][0], pl[i + 1][0], f), lerp(pl[i][1], pl[i + 1][1], f)]; };
+  if (t < first[0]) { const u = E.outCubic(clamp(t / first[0])); const p = first[2][0]; return { x: lerp(OFF_IN[0], p[0], u), y: lerp(OFF_IN[1], p[1], u), lift: 1 - u, col: first[3], on: 1 }; }
+  for (let i = 0; i < SEGS.length; i++) {
+    const [a, b, pl, col] = SEGS[i];
+    if (t >= a && t <= b) { const p = k(pl, (t - a) / Math.max(b - a, 1e-3)); return { x: p[0], y: p[1], lift: 0, col, on: 1 }; }
+    const nx = SEGS[i + 1];
+    if (t > b && (!nx || t < nx[0])) {
+      const end = pl[pl.length - 1];
+      if (!nx || nx[0] - b > 1.2) {                          // long gap: leave the frame and come back
+        const out = clamp((t - b) / 0.3), back = nx ? clamp((t - (nx[0] - 0.3)) / 0.3) : 0;
+        if (back > 0) { const s = nx[2][0], u = E.outCubic(back); return { x: s[0] + AWAY[0] * (1 - u), y: s[1] + AWAY[1] * (1 - u), lift: 1 - u, col: nx[3], on: 1 }; }
+        const u = E.inCubic(out); return { x: end[0] + AWAY[0] * u, y: end[1] + AWAY[1] * u, lift: u, col, on: out < 1 ? 1 : 0 };
+      }
+      const s = nx[2][0], u = (t - b) / (nx[0] - b);
+      return { x: lerp(end[0], s[0], E.inOutSine(u)), y: lerp(end[1], s[1], E.inOutSine(u)), lift: Math.sin(Math.PI * u) * Math.min(1, (nx[0] - b) * 3), col, on: 1 };
+    }
+  }
+  return { x: 0, y: 0, lift: 1, col: WHITE, on: 0 };
+}
+
+// ================= GL =================
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const ov = document.createElement('canvas'); ov.width = W; ov.height = H;     // chalk dust overlay
+ov.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(ov);
+const og = ov.getContext('2d');
+const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('EXT_float_blend');
+const NOISE = SG.GLSL_NOISE, HD = '#version 300 es\nprecision highp float;\n';
+// board maps live in board space (1920x1080 px), the camera only zooms in
+const MX = 120, MY = 90, BPW = 1920 + 2 * MX, BPH = 1080 + MY;          // board map covers x -120..2040, y -90..1080
+const BWt = Math.round(BPW * RS * 1.2), BHt = Math.round(BPH * RS * 1.2);
+const pChalk = SG.prog(gl, SG.VS_STROKE, HD + `
+in vec4 v0; flat in vec4 v1; flat in vec4 v2; flat in vec4 v3; flat in vec4 v4;
+uniform float T, MODE;   // MODE 0: chalk  1: ghosts of erased strokes  2: eraser sweep
+out vec4 o;
+${NOISE}
+void main(){
+  float s = v0.z, v = v0.w, L = v1.x, w = v1.y, t0 = v1.z, t1 = v1.w;
+  float kind = v3.w, seed = v4.x, tEnd = v4.y;
+  float pres = v2.w;
+  if (MODE < .5) { if (T < t0) discard; if (tEnd > 0. && T >= tEnd) discard; }
+  else if (MODE < 1.5) { if (kind < 1.9 && !(tEnd > 0. && T >= tEnd)) discard; }
+  float pr = clamp((T - t0)/max(t1 - t0, 1e-3), 0., 1.);
+  float head = kind > 1.5 ? L : L*pr;
+  if (MODE > .5 && MODE < 1.5) head = L;
+  if (MODE > 1.5) {                                // the eraser has only cleaned what it has passed over (same easing as eraserAt)
+    if (T < t0) discard;
+    float u = pr; head = L*((.5 - .5*cos(3.14159265*u))*.3 + u*.7);
+  }
+  float hw = w*.5;
+  float uL = clamp(s/max(L, 1.), 0., 1.);
+  float wv = 1. + .25*(2.*vn(vec2(s*.011, seed*1.3)) - 1.);       // pressure changes the width ±25 %
+  if (kind < .5 && MODE < .5) wv *= mix(1., .62, smoothstep(.82, 1., uL));
+  float ds = s < 0. ? -s : (s > head ? s - head : 0.);
+  float r = length(vec2(ds/hw, v/(MODE < .5 && kind < .5 ? wv : 1.)));
+  float P;
+  if (MODE > 1.5) {                                // eraser swept area: felt pad, ragged, soft leading edge
+    float lead = s > head ? smoothstep(55., 15., s - head) : 1.;
+    float e = smoothstep(1.02, .88, length(vec2(min(ds, 0.)/hw, v)) + .12*(vn(vec2(s*.02, v*3.)) - .5))*lead;
+    if (s > head + 55.) discard;
+    o = vec4(e, 0., 0., e); return;
+  }
+  if (MODE > .5 || kind > 1.5) {                   // ghost: wide soft smear
+    P = pres*smoothstep(1., .1, r)*(.6 + .8*vn(vec2(s*.01 + seed, v*1.5)));
+  } else if (kind > .5) {                          // side of the chalk: streaky band
+    P = pres*smoothstep(1., .25, r)*(.25 + 1.1*vn(vec2(v*6.5 + seed, s*.01))*vn(vec2(v*15. + seed*2., s*.04)))*(.7 + .5*vn(vec2(s*.006, seed)));
+  } else {                                         // point: firm core, pressure wobbles along the line
+    P = pres*smoothstep(1., .45, r)*(.78 + .3*vn(vec2(s*.035, seed)) - .12*vn(vec2(s*.21, seed*3.)));
+    float brk = smoothstep(.2, .4, vn(vec2(s*.016 + seed*7.3, seed)));   // the stick skips on the slate here and there
+    P *= mix(w < 6. ? .8 : .5, 1., brk);
+    P *= mix(1., .55, smoothstep(.85, 1., uL));
+  }
+  if (P < .002) discard;
+  o = vec4(v2.rgb*P, P);
+}`);
+const pText = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D TXT; uniform float T, LO, HI;
+${NOISE}
+void main(){
+  vec2 bq = vec2(uv.x*${BPW}. - ${MX}., (1. - uv.y)*${BPH}. - ${MY}.);
+  vec4 m = texture(TXT, vec2(bq.x/1920., 1. - bq.y/1080.));
+  if (bq.x < 0. || bq.x > 1920. || bq.y < 0. || bq.y > 1080.) discard;
+  float tr = m.g*10.;
+  if (m.r < .02 || tr < LO || tr >= HI) discard;
+  float rv = step(tr, T);
+  float P = m.r*rv*(.85 + .3*vn(bq*.55));
+  if (P < .002) discard;
+  vec3 col = m.b > .5 ? vec3(.98, .86, .42) : vec3(.93, .93, .9);
+  o = vec4(col*P, P);
+}`);
+const pShade = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o;
+uniform sampler2D CH1, CH2, HZ, ER, OLD;
+uniform vec2 res, jit; uniform vec3 cam;          // cam = (centre x, centre y, zoom) in board px
+uniform float T, frame;
+uniform vec4 eraser;                               // x, y, angle, mode (0 hidden, 1 on the tray, 2 on the board)
+uniform vec4 ER2;                                  // eraser size (w, h)
+uniform vec4 CK; uniform vec3 CKC;                 // chalk stick: tip x, y, lift, visible · colour
+${NOISE}
+float tooth(vec2 b){ return vn(b*.62)*.5 + vn(b*1.37 + 7.)*.32 + vn(b*.21 + 3.)*.18; }
+vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
+float rbox(vec2 p, vec2 b, float r){ vec2 q = abs(p) - b + r; return length(max(q, 0.)) + min(max(q.x, q.y), 0.) - r; }
+vec3 wood(vec2 b, vec3 base, float scale){
+  float g = fbm3(vec2(b.x*.004*scale, b.y*.09*scale)) ;
+  float ring = .5 + .5*sin(b.y*.35*scale + g*14. + b.x*.002);
+  return base*(.82 + .22*ring + .1*(vn(vec2(b.x*.05, b.y*.6)) - .5));
+}
+void main(){
+  vec2 fc = gl_FragCoord.xy + jit;
+  vec2 sc = vec2(fc.x, res.y - fc.y)/res*vec2(1920., 1080.);     // design px, y down
+  vec2 b = (sc - vec2(960., 540.))/cam.z + cam.xy;                 // board px
+  vec2 q = vec2((b.x + ${MX}.)/${BPW}., 1. - (b.y + ${MY}.)/${BPH}.);
+  float px = 1./cam.z;
+  vec3 col;
+  // classroom light: soft from the upper left, a broad window sheen across the slate
+  float light = .9 + .2*(1. - b.x/1920.)*.6 + .1*(1. - b.y/1080.) - .12*smoothstep(500., 1100., length(b - vec2(700., 300.)))*.6;
+  if (b.y < ${TRAY}.) {
+    float th = tooth(b);
+    vec3 slate = vec3(.165, .262, .215)*(.9 + .14*fbm3(b*.004) + .05*(vn(b*.08) - .5));
+    // old lessons + the haze of a thousand erasings
+    vec4 old = texture(OLD, vec2(b.x/1920., 1. - b.y/1080.));
+    float haze = old.r*.8 + old.g*.45;
+    vec4 hz = texture(HZ, q);
+    haze += 1. - exp(-hz.a*1.6);
+    vec4 e = texture(ER, q);
+    float er = clamp(e.a, 0., 1.);
+    vec4 c1 = texture(CH1, q), c2 = texture(CH2, q);
+    vec4 c1m = textureLod(CH1, q, 3.5);
+    // what the eraser leaves behind: a smeared haze with felt streaks
+    float streak = .55 + .45*vn(vec2(b.x*.004, b.y*.09));
+    haze = mix(haze, haze*.22 + (c1m.a*.7 + .1)*streak, er);
+    float P1 = c1.a*(1. - er), P2 = c2.a;
+    vec3 k1 = c1.a > 1e-4 ? c1.rgb/c1.a : vec3(.93), k2 = c2.a > 1e-4 ? c2.rgb/c2.a : vec3(.93);
+    float d1 = clamp((P1*1.18 - (1. - th)*.92)*2.4, 0., 1.);
+    float d2 = clamp((P2*1.18 - (1. - th)*.92)*2.4, 0., 1.);
+    vec4 c2m = textureLod(CH2, q, 2.5);
+    float dust = clamp((P1 + P2)*.06 + (c1m.a*(1. - er) + c2m.a)*.05, 0., .16);   // fine powder beside / below the lines
+    vec3 base = lin(slate);
+    base = mix(base, lin(vec3(.52, .56, .54)), clamp(haze*.22 + dust, 0., .6)*(.7 + .3*th));
+    // window sheen on the slate (not on the chalk)
+    float sheen = smoothstep(.35, 0., abs(dot(b - vec2(400., 0.), normalize(vec2(1., .55)))/900. - .55))*.05*(.6 + .4*th);
+    base += vec3(.75, .82, .85)*sheen*.25;
+    vec3 ch = lin(k1)*d1;
+    float d = max(d1, d2);
+    vec3 chc = d2 > 0. ? mix(lin(k1), lin(k2), d2/max(d, 1e-3)) : lin(k1);
+    col = mix(base, chc*(.92 + .08*th), d);
+    col *= light;
+    // eraser pressed on the board (seen from behind: beech back, felt rim) + its shadow
+    if (eraser.w > 1.5) {
+      vec2 lp = b - eraser.xy; float ca = cos(eraser.z), sa = sin(eraser.z); lp = mat2(ca, sa, -sa, ca)*lp;
+      float sh = rbox(lp - vec2(-10., -16.), ER2.xy*.5, 16.);
+      col *= 1. - .45*(1. - smoothstep(-6., 26., sh));
+      float dd = rbox(lp, ER2.xy*.5, 14.);
+      if (dd < 0.) {
+        float rim = smoothstep(-9., -7., dd);
+        vec3 wd = lin(wood(lp*vec2(1., 3.) + 40., vec3(.72, .52, .3), 1.));
+        float bev = smoothstep(-22., -9., dd);
+        vec3 ec = wd*(1.05 - .35*bev*(lp.x/ER2.x + .5)) + vec3(.06)*bev*smoothstep(0., -1., lp.y/ER2.y + .3);
+        ec = mix(ec, lin(vec3(.2, .2, .22))*(.8 + .3*vn(lp*.4)), rim);
+        col = ec*light;
+      }
+    }
+  } else {
+    // oak chalk tray: top face, front lip, frame rail
+    float y = b.y;
+    vec3 wd;
+    if (y < 966.) { wd = lin(wood(b, vec3(.66, .48, .3), 1.))*(.85 + .25*(y - ${TRAY}.)/38.); }
+    else if (y < 1004.) { wd = lin(wood(b + 17., vec3(.52, .36, .22), 1.))*(.75 - .2*(y - 966.)/38.); wd += vec3(.08, .06, .04)*smoothstep(970., 966., y); }
+    else { wd = lin(wood(b + 91., vec3(.4, .27, .16), .8))*.55*(1. - .3*smoothstep(1004., 1080., y)); }
+    // chalk dust collected in the tray
+    float dp = smoothstep(.55, .8, fbm3(b*.03))*smoothstep(966., 950., y)*step(${TRAY}., y);
+    wd = mix(wd, lin(vec3(.82, .82, .8)), dp*.5);
+    col = wd;
+    // contact shadow under the board edge
+    col *= mix(.55, 1., smoothstep(${TRAY}., ${TRAY + 9}., y));
+    // chalk sticks lying in the tray: [x0, x1, colour]
+    for (int i = 0; i < 5; i++) {
+      vec3 cc; vec2 xr;
+      if (i == 0) { xr = vec2(1290., 1372.); cc = vec3(.93, .93, .9); }
+      else if (i == 1) { xr = vec2(1482., 1540.); cc = vec3(.98, .86, .45); }
+      else if (i == 2) { xr = vec2(1584., 1626.); cc = vec3(.97, .62, .68); }
+      else if (i == 3) { xr = vec2(1668., 1736.); cc = vec3(.56, .75, .96); }
+      else { xr = vec2(1380., 1428.); cc = vec3(.93, .93, .9); }
+      float cy = 946., rad = 9.;
+      vec2 cp = vec2(clamp(b.x, xr.x + rad, xr.y - rad), cy);
+      float dd = length(b - cp) - rad;
+      // worn: one end ground to a slant
+      float sl = dot(b - vec2(xr.y - rad*.3, cy), normalize(vec2(1., -.7 + .5*float(i % 2))));
+      dd = max(dd, sl);
+      float shd = length((b - vec2(0., 7.)) - cp) - rad;
+      col *= 1. - .35*(1. - smoothstep(-2., 8., shd))*step(dd, -0.);
+      col *= 1. - .3*(1. - smoothstep(0., 9., shd));
+      if (dd < 0.) {
+        float ny = (b.y - cy)/rad;
+        float sh = .55 + .5*sqrt(max(1. - ny*ny, 0.))*(1. - .4*ny) - .25*max(ny, 0.);
+        vec3 c = lin(cc)*sh*(.92 + .1*vn(b*.7));
+        col = c;
+      }
+    }
+  }
+  if (eraser.w > .5 && eraser.w < 1.5) {
+    vec2 lp = b - eraser.xy;                      // eraser.xy = centre of the block resting on the tray
+    float sh = rbox(lp - vec2(6., 10.), vec2(ER2.x*.5, 24.), 8.);
+    col *= 1. - .4*(1. - smoothstep(-4., 16., sh));
+    float dd = rbox(lp, vec2(ER2.x*.5, 24.), 7.);
+    if (dd < 0.) {
+      vec3 c;
+      if (lp.y > 10.) c = lin(vec3(.25, .25, .27))*(.8 + .3*vn(lp*.6))*(1. - .3*smoothstep(10., 24., lp.y));
+      else c = lin(wood(lp*vec2(1., 2.5) + 300., vec3(.76, .56, .34), 1.))*(1.02 - .3*smoothstep(-24., 10., lp.y)) + vec3(.05, .04, .03)*smoothstep(-20., -24., lp.y);
+      c *= .95 + .1*smoothstep(-ER2.x*.5, ER2.x*.5, -lp.x);
+      col = c;
+    }
+  }
+  // the chalk stick in the hand (seen against the board): tip on the board, body towards the lower right
+  if (CK.w > .5) {
+    vec2 dir = normalize(vec2(.5, .86)), a0 = CK.xy, a1 = CK.xy + dir*92.;
+    vec2 so = vec2(10., 9.)*(1. + CK.z*3.);
+    vec2 ps = b - so; float hs = clamp(dot(ps - a0, dir)/92., 0., 1.);
+    float dsh = length(ps - a0 - dir*92.*hs) - 8.;
+    col *= 1. - (.42 - .2*CK.z)*(1. - smoothstep(-2. - CK.z*6., 6. + CK.z*12., dsh));
+    float h = clamp(dot(b - a0, dir)/92., 0., 1.);
+    vec2 nrm = vec2(-dir.y, dir.x);
+    float across = dot(b - a0, nrm);
+    float rr = 8.*(.55 + .45*smoothstep(0., .1, h));                 // worn rounded tip
+    if (abs(across) < rr && dot(b - a0, dir) > -2. && dot(b - a0, dir) < 92.) {
+      float cy = across/rr;
+      float sh = .55 + .55*sqrt(max(1. - cy*cy, 0.)) - .25*cy;
+      vec3 cc = lin(CKC)*sh*(.9 + .14*vn(b*.9))*(.82 + .18*smoothstep(0., .25, h));
+      col = mix(col, cc*1.05, smoothstep(rr, rr - 1.2, abs(across)));
+    }
+  }
+  o = vec4(col, 1.);
+}`);
+const pComp = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float seed, flick;
+${NOISE}
+void main(){
+  vec2 d = uv - .5;
+  // a slightly soft lens: corners lose a touch of sharpness
+  float soft = smoothstep(.15, .55, dot(d, d))*1.2;
+  vec3 c = texture(S, uv).rgb;
+  if (soft > .02) { vec3 a = c; for (int i = 0; i < 6; i++){ float an = float(i)*1.047 + .5; a += texture(S, uv + vec2(cos(an), sin(an))*soft/res).rgb; } c = a/7.; }
+  c *= flick;
+  c = c/(1. + c*.15);
+  c = pow(c, vec3(1./2.2));
+  c *= 1. - .32*smoothstep(.3, 1.05, length(d*vec2(1.3, 1.)));
+  c += (hash12(uv*res + seed*71.3) - .5)*.035;
+  o = vec4(c, 1.);
+}`);
+const tCH1 = SG.tex(gl, BWt, BHt, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT, mips: true }), fCH1 = SG.fbo(gl, [tCH1]);
+const tCH2 = SG.tex(gl, BWt, BHt, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fCH2 = SG.fbo(gl, [tCH2]);
+const tHZ = SG.tex(gl, BWt >> 1, BHt >> 1, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fHZ = SG.fbo(gl, [tHZ]);
+const tER = SG.tex(gl, BWt >> 1, BHt >> 1, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fER = SG.fbo(gl, [tER]);
+const tSC = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fSC = SG.fbo(gl, [tSC]);
+const tOLD = SG.tex(gl, 960, 540, {}), tTXT = SG.tex(gl, 1920, 1080, {});
+const QUAD = SG.quad(gl);
+ST1.upload(gl); ST2.upload(gl); STE.upload(gl);
+
+// ================= setup textures: old lessons, text masks =================
+function buildOld() {
+  const c = document.createElement('canvas'); c.width = 960; c.height = 540; const g = c.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, 960, 540); g.scale(0.5, 0.5);
+  // R: ghosts of old writing
+  g.fillStyle = 'rgba(255,0,0,0.5)'; g.strokeStyle = 'rgba(255,0,0,0.45)';
+  const F = ['a² + b² = c²', 'E = mc²', 'sin²θ + cos²θ = 1', 'x = (−b ± √Δ) / 2a', 'v = s / t', 'H₂O', 'π ≈ 3.14159', 'F = ma', '∠A = 60°', '1/2 + 1/3 = 5/6'];
+  for (let i = 0; i < 16; i++) {
+    g.save(); g.translate(rr(0, 1800), rr(60, 900)); g.rotate(rr(-0.08, 0.08)); g.font = `400 ${rr(34, 70)}px ${SANS}`;
+    g.globalAlpha = rr(0.2, 0.55); g.filter = `blur(${rr(1.5, 4)}px)`; g.fillText(F[i % F.length], 0, 0); g.restore();
+  }
+  for (let i = 0; i < 6; i++) { g.save(); g.globalAlpha = rr(0.15, 0.35); g.filter = 'blur(3px)'; g.lineWidth = 5; g.beginPath(); g.arc(rr(0, 1900), rr(0, 900), rr(40, 130), 0, 6.3); g.stroke(); g.restore(); }
+  // G: big eraser swirls
+  g.filter = 'blur(18px)';
+  for (let i = 0; i < 26; i++) {
+    g.strokeStyle = `rgba(0,255,0,${rr(0.06, 0.16)})`; g.lineWidth = rr(80, 200); g.beginPath();
+    const x = rr(-100, 2000), y = rr(-50, 950), r = rr(150, 500), a0 = rr(0, 6.3);
+    g.arc(x, y, r, a0, a0 + rr(0.8, 2.4)); g.stroke();
+  }
+  g.filter = 'none';
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); SG.upload(gl, tOLD, c); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+}
+function buildText() {
+  const c = document.createElement('canvas'); c.width = 1920; c.height = 1080; const g = c.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, 1920, 1080);
+  // R = mask, G = reveal time / 10 s, B = yellow chalk flag
+  const put = (ch, font, x, y, t, yel, rot = 0) => {
+    const tmp = document.createElement('canvas'); tmp.width = 1920; tmp.height = 1080; const tg = tmp.getContext('2d', { willReadFrequently: true });
+    tg.translate(x, y); tg.rotate(rot); tg.font = font; tg.fillStyle = '#fff'; tg.textBaseline = 'alphabetic'; tg.fillText(ch, 0, 0);
+    const m = tg.getImageData(0, 0, 1920, 1080).data, out = g.getImageData(0, 0, 1920, 1080); const O = out.data;
+    for (let i = 0; i < O.length; i += 4) if (m[i + 3] > 8) { O[i] = Math.max(O[i], m[i + 3]); O[i + 1] = Math.round(t / 10 * 255); O[i + 2] = yel ? 255 : 0; O[i + 3] = 255; }
+    g.putImageData(out, 0, 0);
+  };
+  // label (yellow), drawn character by character
+  [...C.label].forEach((ch, i) => put(ch, `500 44px ${SANS}`, 168 + i * 47 - 30, 860 + rr(-3, 3), LABEL_T + i * 0.08, true, rr(-0.06, 0.06)));
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); SG.upload(gl, tTXT, c); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+}
+
+// ================= chalk dust particles (precomputed from the chalk tips) =================
+const DUST = [];
+function buildDust() {
+  const tipAt = (pl, k) => { const i = Math.min(pl.length - 1, Math.floor(k * (pl.length - 1))); return pl[i]; };
+  for (const [a, b, pl] of TIPS) {
+    const n = Math.max(2, Math.round((b - a) * 40));
+    for (let i = 0; i < n; i++) {
+      const k = (i + R()) / n, t0 = a + (b - a) * k, p = tipAt(pl, k);
+      DUST.push({ t0, x: p[0] + rr(-4, 4), y: p[1] + rr(-3, 3), vx: rr(-25, 25), vy: rr(10, 60), g: rr(260, 520), r: rr(0.6, 1.8), life: rr(0.7, 1.8), a: rr(0.35, 0.8), sd: R() * 100 });
+    }
+  }
+  // the opening tap: a little puff
+  for (let i = 0; i < 46; i++) DUST.push({ t0: 0.25 + rr(0, 0.05), x: 74 + rr(-6, 6), y: 332 + rr(-4, 4), vx: rr(-110, 110), vy: rr(-90, 40), g: rr(300, 600), r: rr(0.6, 2.2), life: rr(0.8, 1.9), a: rr(0.4, 0.9), sd: R() * 100 });
+  // the final splash taps a puff, too
+  for (let i = 0; i < 30; i++) DUST.push({ t0: 8.0 + rr(0, 0.1), x: 960 + rr(-120, 120), y: 600 + rr(-10, 10), vx: rr(-60, 60), vy: rr(-40, 30), g: rr(200, 420), r: rr(0.6, 2), life: rr(0.8, 1.6), a: rr(0.3, 0.7), sd: R() * 100 });
+  // the eraser sheds a cloud
+  for (let i = 0; i < 160; i++) { const t0 = rr(ER_T0, ER_T1 + 0.05), k = inv(ER_T0, ER_T1, t0); const p = erPathAt(E.inOutSine(k) * 0.3 + k * 0.7); DUST.push({ t0, x: p[0] + rr(-60, 60), y: p[1] + rr(-125, 125), vx: rr(-40, 40), vy: rr(-10, 50), g: rr(120, 300), r: rr(0.6, 2.4), life: rr(1, 2.2), a: rr(0.2, 0.5), sd: R() * 100 }); }
+}
+const ERL = (() => { const c = [0]; for (let i = 1; i < ERP.length; i++) c.push(c[i - 1] + Math.hypot(ERP[i][0] - ERP[i - 1][0], ERP[i][1] - ERP[i - 1][1])); return c; })();
+function erPathAt(k) { const s = k * ERL[ERL.length - 1]; let i = 1; while (i < ERL.length - 1 && ERL[i] < s) i++; const u = clamp((s - ERL[i - 1]) / (ERL[i] - ERL[i - 1])); return [lerp(ERP[i - 1][0], ERP[i][0], u), lerp(ERP[i - 1][1], ERP[i][1], u)]; }
+function eraserAt(t) {
+  // rests on the tray, hops onto the board, wipes the band, is put back (stop-motion steps)
+  const home = [640, 924], H0 = ER_T0 - 0.17, H1 = ER_T1 + 0.2;
+  if (t < H0 || t >= H1) return { x: home[0], y: home[1], a: 0, m: 1, w: 250, h: 120 };
+  if (t < ER_T0) { const k = E.inOutSine(inv(H0, ER_T0, t)); return { x: lerp(home[0], ERP[0][0], k), y: lerp(home[1] - 40, ERP[0][1], k), a: lerp(0, Math.PI / 2, k), m: 2, w: 250, h: 110 }; }
+  if (t < ER_T1) { const u = inv(ER_T0, ER_T1, t); const p = erPathAt(E.inOutSine(u) * 0.3 + u * 0.7); return { x: p[0], y: p[1], a: Math.PI / 2 + Math.sin(t * 9) * 0.06, m: 2, w: 250, h: 110 }; }
+  const k = E.inOutSine(inv(ER_T1, H1, t)); return { x: lerp(ERP[ERP.length - 1][0], home[0], k), y: lerp(ERP[ERP.length - 1][1], home[1] - 40, k), a: lerp(Math.PI / 2, 0, k), m: 2, w: 250, h: 110 };
+}
+// the camera runs at 30 fps (the drawings stay at 12): one continuous track, push in to the breach, back out, a slow settle
+const CAM = Track([
+  { t: 0.0, v: [948, 552, 1.025] }, { t: 4.0, v: [960, 540, 1.0] }, { t: 4.6, v: [1185, 405, 1.135] }, { t: 5.85, v: [1240, 395, 1.15] },
+  { t: 6.8, v: [960, 540, 1.0] }, { t: 8.0, v: [960, 548, 1.03] }, { t: 10.0, v: [960, 552, 1.045] },
+], { easeIn: false, easeOut: true });
+function camAt(t) { return CAM(t); }
+
+Reel.scene({
+  duration: 10, fps: 30,
+  fonts: [`400 156px ${SANS}`, `500 44px ${SANS}`, `500 27px ${SANS}`, `400 50px ${SANS}`],
+  async setup() { buildOld(); buildText(); buildDust(); },
+  cues: [
+    { t: 0.25, sfx: 'chalk_tap', gain: 0.9 }, { t: 0.3, sfx: 'chalk_line', gain: 0.6 },
+    { t: 0.72, sfx: 'chalk_long', gain: 0.6 }, { t: 1.68, sfx: 'chalk_line', gain: 0.55 }, { t: 1.98, sfx: 'chalk_line', gain: 0.5 },
+    { t: 2.28, sfx: 'chalk_tap', gain: 0.6 }, { t: 2.5, sfx: 'chalk_line', gain: 0.45 }, { t: 2.84, sfx: 'chalk_side', gain: 0.55 },
+    { t: 3.2, sfx: 'chalk_line', gain: 0.5 }, { t: 3.46, sfx: 'chalk_taps', gain: 0.6 }, { t: 3.72, sfx: 'chalk_taps', gain: 0.5 },
+    { t: 4.0, sfx: 'whoosh', gain: 0.35 }, { t: SPLASH[0] ? SPLASH[0].t : 4.5, sfx: 'splash', gain: 0.85 }, { t: (SPLASH[0] ? SPLASH[0].t : 4.5) + 0.05, sfx: 'whale', gain: 0.6 },
+    { t: SPLASH[1] ? SPLASH[1].t : 6.0, sfx: 'splash', gain: 0.7 },
+    { t: ER_T0 - 0.17, sfx: 'thud', gain: 0.35 }, { t: ER_T0, sfx: 'erase', gain: 0.75 },
+    { t: 7.5, sfx: 'chalk_line', gain: 0.6 }, { t: 7.75, sfx: 'chalk_long', gain: 0.55 },
+    { t: 8.0, sfx: 'chalk_taps', gain: 0.55 }, { t: 8.0, sfx: 'ding', gain: 0.4 },
+  ],
+  render(tRaw) {
+    const frame = Math.round(tRaw * 30);                       // drawings follow the frame, not the motion-blur sub-samples
+    const t = Math.floor(frame / 30 * FPS + 1e-6) / FPS, f = Math.round(t * FPS);
+    const jit = Reel.jit || [0, 0];
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    // ---- CH1: everything chalked before the wipe
+    SG.bind(gl, fCH1); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    pChalk.use().f('T', t).f('MODE', 0).f('PS', BPW, BPH).f('VIEW', -MX, -MY, 1); ST1.draw();
+    DYN.reset();
+    if (t >= 4.0 && t < 7.2) { poseStrokes(DYN, f, false); DYN.uploadDynamic(gl); pChalk.use().f('T', t).f('MODE', 0); DYN.draw(); }
+    pText.use().t('TXT', tTXT).f('T', t).f('LO', 0).f('HI', 6.5); QUAD.draw();
+    gl.bindTexture(gl.TEXTURE_2D, tCH1.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    // ---- CH2: title + signature
+    SG.bind(gl, fCH2); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (t >= 7.5) { pChalk.use().f('T', t).f('MODE', 0).f('PS', BPW, BPH).f('VIEW', -MX, -MY, 1); ST2.draw(); }
+    // ---- HZ: ghosts of every erased drawing
+    SG.bind(gl, fHZ); gl.clear(gl.COLOR_BUFFER_BIT);
+    pChalk.use().f('T', t).f('MODE', 1).f('PS', BPW, BPH).f('VIEW', -MX, -MY, 1); ST1.draw();
+    if (t >= 4.0) {
+      DYN.reset();
+      const last = Math.min(f - 1, Math.round(7.2 * FPS));
+      for (let g = Math.round(3.9 * FPS); g <= last; g += (g < 48 ? 1 : 1)) poseStrokes(DYN, g === Math.round(3.9 * FPS) ? g : g, true);
+      DYN.uploadDynamic(gl); pChalk.use().f('MODE', 1); DYN.draw();
+    }
+    // ---- ER: the eraser's swept band
+    SG.bind(gl, fER); gl.clear(gl.COLOR_BUFFER_BIT);
+    if (t >= ER_T0) { gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA); pChalk.use().f('T', t).f('MODE', 2).f('PS', BPW, BPH).f('VIEW', -MX, -MY, 1); STE.draw(); }
+    gl.disable(gl.BLEND);
+    // ---- shade
+    const cam = camAt(tRaw), er = eraserAt(t), ck = chalkAt(t);
+    SG.bind(gl, fSC);
+    pShade.use().t('CH1', tCH1).t('CH2', tCH2).t('HZ', tHZ).t('ER', tER).t('OLD', tOLD).f('res', W, H).f('jit', jit[0], -jit[1])
+      .f('cam', cam[0], cam[1], cam[2]).f('T', t).f('frame', f).f('eraser', er.x, er.y, er.a, er.m).f('ER2', er.w, er.h, 0, 0)
+      .f('CK', ck.x, ck.y, ck.lift, ck.on).v('CKC', ck.col);
+    QUAD.draw();
+    SG.bind(gl, null); gl.viewport(0, 0, W, H);
+    pComp.use().t('S', tSC).f('res', W, H).f('seed', f % 37).f('flick', 1 + (hsh(f * 1.31) - 0.5) * 0.03); QUAD.draw();
+    // ---- dust overlay (same camera)
+    og.setTransform(1, 0, 0, 1, 0, 0); og.clearRect(0, 0, W, H);
+    const k = RS * cam[2];
+    og.setTransform(k, 0, 0, k, (960 - cam[0] * cam[2]) * RS + jit[0], (540 - cam[1] * cam[2]) * RS + jit[1]);
+    for (const p of DUST) {                                   // powder: tiny irregular flakes, drifting at 30 fps
+      const age = tRaw - p.t0; if (age < 0 || age > p.life) continue;
+      const x = p.x + p.vx * age * (1 - age * 0.3), y = Math.min(p.y + p.vy * age + 0.5 * p.g * age * age * 0.35, 952);
+      const a = p.a * (1 - age / p.life) * (y >= 952 ? 0.5 : 1);
+      og.fillStyle = `rgba(236,238,232,${a.toFixed(3)})`; og.beginPath();
+      const rot = p.sd + age * 3;
+      for (let v = 0; v < 4; v++) { const an = rot + v * 1.571 + hsh(p.sd, v) * 0.9, rr2 = p.r * (0.5 + hsh(p.sd + 3, v)); og.lineTo(x + Math.cos(an) * rr2, y + Math.sin(an) * rr2); }
+      og.fill();
+    }
+    gl.finish();
+  },
+});
+</script></body></html>

@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>38 蜡笔童画 · Crayon Kids</title>
+<script src="../../lib/core.js"></script>
+<script src="../../lib/strokegl.js"></script>
+<script src="../../lib/track.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 38 蜡笔童画 · CRAYON KIDS (drawings at 12 per second, camera at 30) =====
+   A sheet of cold-press drawing paper on a birch table by a window, worn wax crayons lying around it.
+   Wax only catches on the paper's tooth: every stroke carries a pressure and the GPU deposits colour where the tooth
+   rises above it, so lines are broken and grainy; fills are a kid's back-and-forth zigzag that overshoots the outlines.
+   A crayon in the kid's hand draws every stroke (stop-motion, 12 drawings per second); the camera moves at 30 fps.
+   0.0 the sun is scribbled · house, grass, sky, then a dog, each landing on the beat · 4.25 the dog hops out of its
+   own drawing and gallops (4-drawing cycle, bob, stretch, lean on the brake), turns, sits · 7.0–7.75 four crayons draw a
+   rainbow, one arc per beat · 8.0 the dog barks and wags · hold. */
+const { E, clamp, lerp, inv } = Reel;
+// ★ 改光色改这里：着色器里的 LIGHT_COL（搜 LIGHT_COL）。它乘在窗光（纸、蜡笔画、桌子、蜡笔的漫反射和高光）上。
+//   vec3(1.) = 原样（和成片一模一样）；偏蓝例如 vec3(.88, .95, 1.12)；同一行的 Ac 是冷色天光（影子的颜色）。只想换物体/纸/颜料的颜色是“配色”，不是光，见 SKILL 的对照表。
+const stage = Reel.makeStage('#cdb48f');
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+Reel.ownJitter = true;
+const FPS = 12, q12 = (t) => Math.floor(t * FPS + 1e-6) / FPS;
+const R = Reel.rng(3838), rr = (a, b) => a + (b - a) * R();
+const hsh = (a, b = 0) => { const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return s - Math.floor(s); };
+const hex = (h) => [parseInt(h.slice(1, 3), 16) / 255, parseInt(h.slice(3, 5), 16) / 255, parseInt(h.slice(5, 7), 16) / 255];
+const COL = { yel: hex('#f6c51b'), ora: hex('#f08a1c'), red: hex('#d8312b'), pink: hex('#ef6f94'), pur: hex('#7a4fb0'), blu: hex('#2f7fd8'), sky: hex('#6fb6ec'),
+  grn: hex('#3aa047'), lgr: hex('#8ccf3c'), brn: hex('#8a5426'), blk: hex('#2a2626'), gry: hex('#8b8b8b') };
+const PAPER = { x0: 150, y0: 58, x1: 1772, y1: 1040, rot: -0.012 };
+
+// ================= strokes =================
+// p1 = tEnd (stroke leaves the paper at), p2 = pressure, p3 = 1 → leaves a faint wax ghost after tEnd
+const ST = new SG.Strokes(), DYN = new SG.Strokes();
+const SEGS = [];   // [t0, t1, pts, colour] — the crayon in the hand follows these
+let sid = 1;
+const crayon = (S, pts, col, t0, t1, o = {}) => {
+  if (S === ST && !o.noTool && t1 > t0) SEGS.push([t0, t1, pts, col]);
+  return S.add(pts, Object.assign({ w: 10, colA: col, thick: 1, kind: 0, t0, t1, seed: (sid++ * 5.17) % 93, p1: 0, p2: 0.9, p3: 0, ds: 3, lin: true }, o));
+};
+const wob = (pts, a, seed) => pts.map(([x, y], i) => [x + (hsh(seed + i * 1.7, 3.1) - 0.5) * a, y + (hsh(seed + i * 2.3, 7.7) - 0.5) * a]);
+const circ = (cx, cy, rx, ry, a0 = 0, a1 = 6.4, n = 24) => Array.from({ length: n + 1 }, (_, i) => { const a = lerp(a0, a1, i / n); return [cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]; });
+// kid scribble fill: one continuous back-and-forth zigzag across a polygon, overshooting the edges
+function scribble(poly, ang, step, over, seed) {
+  const c = Math.cos(ang), s = Math.sin(ang);
+  const rot = poly.map(([x, y]) => [x * c + y * s, -x * s + y * c]);
+  const ys = rot.map((p) => p[1]), y0 = Math.min(...ys), y1 = Math.max(...ys);
+  const out = []; let flip = false, k = 0;
+  for (let y = y0 + step * 0.4; y < y1; y += step * (0.75 + 0.5 * hsh(seed + k * 3.1)), k++) {
+    const xs = [];
+    for (let i = 0; i < rot.length; i++) { const [ax, ay] = rot[i], [bx, by] = rot[(i + 1) % rot.length]; if ((ay - y) * (by - y) < 0) xs.push(ax + (y - ay) / (by - ay) * (bx - ax)); }
+    if (xs.length < 2) continue;
+    let a = Math.min(...xs) - over * hsh(seed + k * 7.3), b = Math.max(...xs) + over * hsh(seed + k * 5.9);
+    if (flip) [a, b] = [b, a]; flip = !flip;
+    out.push([a, y + (hsh(seed + k) - 0.5) * step * 0.6], [b, y + step * 0.5 + (hsh(seed + k + 9) - 0.5) * step * 0.6]);
+  }
+  return out.map(([x, y]) => [x * c - y * s, x * s + y * c]);
+}
+const TIPS = [];   // [t, x, y, colourIndex] where wax crumbs fall
+
+// ---------- the drawing (before the dog jumps) ----------
+(function drawing() {
+  // sun: a lopsided circle scribbled full, rays of every length
+  const sunPoly = circ(330, 232, 92, 86, 0, 6.28, 20).map(([x, y], i) => [x + (hsh(i, 1) - 0.5) * 14, y + (hsh(i, 2) - 0.5) * 14]);
+  crayon(ST, wob([...sunPoly, sunPoly[0], sunPoly[1]], 4, 1), COL.ora, 0.0, 0.2, { w: 11 });
+  crayon(ST, scribble(sunPoly, 0.6, 15, 10, 3), COL.yel, 0.21, 0.62, { w: 14, p2: 0.85 });
+  for (let k = 0; k < 9; k++) {
+    const a = -0.35 + k * 0.71 + (hsh(k, 4) - 0.5) * 0.25, r0 = 108 + hsh(k, 5) * 10, r1 = 150 + hsh(k, 6) * 70;
+    crayon(ST, wob([[330 + Math.cos(a) * r0, 232 + Math.sin(a) * r0], [330 + Math.cos(a + 0.05) * r1, 232 + Math.sin(a + 0.05) * r1]], 6, 10 + k), COL.ora, 0.66 + k * 0.032, 0.69 + k * 0.032, { w: 10 });
+  }
+  TIPS.push([0.4, 250, 300, 0], [0.7, 420, 330, 2]);
+  // house: outline, then a heavy zigzag fill that overshoots
+  const walls = [[420, 488], [722, 482], [728, 762], [416, 768]];
+  crayon(ST, wob([...walls, walls[0]], 8, 20), COL.red, 1.0, 1.18, { w: 11 });
+  crayon(ST, scribble(walls, 0.35, 15, 20, 21), COL.red, 1.18, 1.48, { w: 13, p2: 0.8 });
+  const roof = [[388, 492], [572, 312], [760, 488]];
+  crayon(ST, wob([...roof, roof[0]], 8, 22), COL.pur, 1.5, 1.66, { w: 11 });
+  crayon(ST, scribble(roof, -0.4, 14, 16, 23), COL.pur, 1.66, 1.92, { w: 13, p2: 0.82 });
+  const door = [[540, 768], [538, 640], [608, 636], [612, 766]];
+  crayon(ST, wob(door, 6, 24), COL.brn, 1.95, 2.02, { w: 10 });
+  crayon(ST, scribble(door, 1.4, 12, 6, 25), COL.brn, 2.02, 2.12, { w: 11, p2: 0.85 });
+  crayon(ST, wob([[452, 530], [512, 528], [514, 590], [450, 592], [452, 530]], 5, 26), COL.blu, 2.12, 2.18, { w: 9 });
+  crayon(ST, [[482, 528], [482, 592]], COL.blu, 2.18, 2.2, { w: 9 }); crayon(ST, [[450, 560], [514, 560]], COL.blu, 2.2, 2.22, { w: 9 });
+  crayon(ST, wob([[650, 410], [652, 345], [690, 342], [692, 420]], 5, 27), COL.brn, 2.22, 2.26, { w: 10 });
+  [[676, 312, 16], [696, 268, 22], [726, 214, 29]].forEach(([x, y, r], k) => crayon(ST, wob(circ(x, y, r, r * 0.85, 2.2, 2.2 + 6.6, 16), 4, 70 + k), COL.gry, 2.26 + k * 0.05, 2.31 + k * 0.05, { w: 8, p2: 0.8 }));
+  TIPS.push([1.3, 760, 700, 1], [1.8, 360, 470, 4]);
+  // grass: a zigzag that gets sloppier as it goes
+  const g = []; let x = 170, k = 0;
+  while (x <= 1752) { const up = k % 2 === 0; g.push([x, up ? 905 - (70 + 55 * hsh(k, 8)) * (1 + 0.25 * Math.sin(k * 0.37)) : 905 + (hsh(k, 9) - 0.5) * 14]); x += 18 + 16 * hsh(k, 10) + (k % 9 === 8 ? 26 : 0); k++; }
+  crayon(ST, g, COL.grn, 2.5, 2.8, { w: 10, p2: 0.85 });
+  crayon(ST, scribble([[170, 905], [1752, 905], [1752, 828], [170, 828]], 0.02, 20, 0, 31), COL.lgr, 2.8, 2.98, { w: 12, p2: 0.6 });
+  for (const [x, c] of [[250, COL.pink], [1620, COL.red], [1700, COL.yel], [820, COL.pink]]) {
+    crayon(ST, [[x, 900], [x + 4, 820]], COL.grn, 2.95, 2.97, { w: 7, noTool: true });
+    crayon(ST, wob(circ(x + 4, 806, 16, 15, 0, 6.6, 12), 4, x), c, 2.97, 3.0, { w: 11, noTool: true });
+  }
+  // sky streaks + a cloud
+  for (let k = 0; k < 4; k++) { const y = 92 + k * 22; crayon(ST, wob([[480 + k * 30, y], [900, y + 6], [1350, y - 4], [1720 - k * 60, y + 4]], 8, 40 + k), COL.sky, 3.0 + k * 0.04, 3.1 + k * 0.04, { w: 14, p2: 0.78 }); }
+  const cloud = []; for (let i = 0; i <= 5; i++) { const cx = 1180 + i * 55; circ(cx, 210, 34, 30 + (i % 2) * 10, Math.PI, 2 * Math.PI, 8).forEach((p) => cloud.push(p)); }
+  crayon(ST, wob([...cloud, [1480, 222], [1170, 222], [1150, 210]], 5, 44), COL.blu, 3.2, 3.32, { w: 9 });
+  TIPS.push([2.7, 980, 930, 3]);
+})();
+
+// ---------- the dog (side view, facing right) ----------
+// 4-drawing gallop: reach · gather · push · flight  [front legs a1,a2 · back legs a3,a4 · bob · stretch · tail]
+const GAL = [
+  [0.62, 0.32, -0.55, -0.3, -2, 1.06, 0.5], [-0.2, -0.38, 0.5, 0.32, -9, 0.93, -0.1],
+  [-0.62, -0.42, 0.1, -0.15, -15, 1.0, -0.45], [0.3, 0.12, -0.32, -0.1, -20, 1.09, 0.2],
+];
+function dogStrokes(S, cx, cy, face, f, st, tSched, boil) {
+  // st = { mode: 'still' | 'run' | 'leap' | 'squash' | 'brake' | 'sit' | 'bark', pose, lean, sx, sy }
+  const mode = st.mode;
+  const G = mode === 'run' ? GAL[st.pose] : mode === 'leap' ? GAL[3] : mode === 'brake' ? [0.75, 0.6, 0.35, 0.2, 2, 0.97, 0.7] : null;
+  const bob = G ? G[4] : 0, str = (G ? G[5] : 1) * (st.sx || 1), sq = st.sy || 1, lean = st.lean || 0;
+  const cl = Math.cos(lean), sl = Math.sin(lean);
+  const P = (x, y) => { const X = x * str, Y = y * sq; return [cx + (X * cl - Y * sl) * face, cy + (X * sl + Y * cl) + bob]; };
+  const bw = boil ? 3.2 : 0, sd = f * 13.7;
+  const Wb = (pts, k) => (boil ? wob(pts, bw, sd + k * 9.1) : pts);
+  const parts = [];
+  const body = circ(0, 0, 88, 50, 0, 6.5, 26).map(([x, y]) => P(x, y));
+  const headDy = mode === 'bark' ? -8 : 0;
+  const head = circ(96, -60 + headDy, 48, 46, 0, 6.5, 22).map(([x, y]) => P(x, y));
+  const snout = circ(140, -44 + headDy, 22, 17, -1.6, 1.7, 10).map(([x, y]) => P(x, y));
+  const legs = [];
+  const leg = (x0, a, L) => [P(x0, 38), P(x0 + Math.sin(a) * L, 38 + Math.cos(a) * L)];
+  if (mode === 'sit' || mode === 'bark') { legs.push(leg(56, 0.05, 58), leg(36, -0.05, 58), [P(-62, 30), P(-30, 52), P(-6, 54)], [P(-50, 34), P(-20, 56)]); }
+  else if (G) { legs.push(leg(58, G[0], 56), leg(36, G[1], 56), leg(-40, G[2], 56), leg(-62, G[3], 56)); }
+  else { legs.push(leg(58, 0, 56), leg(36, 0, 56), leg(-40, 0, 56), leg(-62, 0, 56)); }
+  const wag = mode === 'bark' ? (f % 2 ? 0.75 : -0.55) : mode === 'sit' ? Math.sin(f * 1.9) * 0.35 : G ? G[6] : 0.2;
+  const tail = [P(-86, -12), P(-112 - Math.sin(wag) * 12, -48), P(-118 - Math.sin(wag) * 32, -86 + Math.cos(wag) * 6)];
+  const earL = G ? -16 * GAL[(st.pose + 3) % 4][6] : mode === 'bark' ? -10 : 0;     // ears lag a drawing behind the body
+  const ear = [P(78, -96 + headDy), P(58, -92 + earL * 0.5 + headDy), P(48, -52 + earL + headDy), P(60, -30 + earL + headDy), P(74, -50 + headDy), P(84, -88 + headDy)];
+  parts.push([Wb(body, 1), COL.brn, 10, 1], [Wb(head, 2), COL.brn, 10, 1], [Wb(snout, 3), COL.brn, 10, 1]);
+  legs.forEach((l, i) => parts.push([Wb(l, 4 + i), COL.brn, 10, 1]));
+  parts.push([Wb(tail, 9), COL.brn, 10, 1]);
+  const fsd = boil ? f * 3.3 : 77;
+  parts.push([Wb(scribble(body, 0.5 + (boil ? hsh(f) * 0.6 : 0), 15, 12, fsd), 10), COL.ora, 12, 0.72]);
+  parts.push([Wb(scribble(head.slice(0, 22), -0.6 + (boil ? hsh(f + 1) * 0.5 : 0), 14, 8, fsd + 1), 11), COL.ora, 12, 0.72]);
+  parts.push([Wb(ear, 12), COL.brn, 10, 1], [Wb(scribble(ear, 1.2, 11, 3, fsd + 2), 13), COL.brn, 10, 0.8]);
+  parts.push([Wb(circ(-30, -14, 20, 16, 0, 6.6, 10).map(([x, y]) => P(x, y)), 14), COL.brn, 12, 0.8], [Wb(circ(10, 16, 14, 11, 0, 6.6, 8).map(([x, y]) => P(x, y)), 15), COL.brn, 12, 0.8]);
+  parts.push([Wb([P(104, -74 + headDy), P(106, -72 + headDy)], 16), COL.blk, 13, 1.1], [Wb([P(160, -50 + headDy), P(163, -48 + headDy)], 17), COL.blk, 18, 1.1]);
+  if (mode === 'bark') {     // mouth wide open, tongue out
+    parts.push([Wb([P(150, -36 + headDy), P(128, -22), P(106, -20)], 18), COL.blk, 7, 1], [Wb([P(106, -20), P(126, -6), P(150, -6)], 19), COL.blk, 7, 1]);
+    parts.push([Wb([P(126, -16), P(132, 2), P(140, -12)], 20), COL.red, 11, 0.95]);
+    parts.push([wob([P(172, -70), P(196, -84)], 3, sd + 70), COL.gry, 6, 0.8], [wob([P(176, -48), P(204, -50)], 3, sd + 71), COL.gry, 6, 0.8], [wob([P(172, -26), P(196, -14)], 3, sd + 72), COL.gry, 6, 0.8]);
+  } else {
+    parts.push([Wb([P(124, -30), P(140, -24), P(156, -32)], 18), COL.blk, 7, 1]);
+    parts.push([Wb([P(136, -24), P(140, -6 + (G ? 6 : 0)), P(146, -22)], 19), COL.red, 10, 0.9]);
+  }
+  if (mode === 'run' || mode === 'brake') {
+    for (let k = 0; k < 3; k++) parts.push([wob([P(-130 - k * 6, -30 + k * 30), P(-190 - k * 14, -34 + k * 30)], 4, sd + 50 + k), COL.gry, 7, 0.75]);
+    if (st.pose % 2 === 0 || mode === 'brake') parts.push([wob(circ(mode === 'brake' ? 70 : -120, 92, 22, 14, 0, 6.6, 10).map(([x, y]) => P(x, y)), 6, sd + 60), COL.gry, 8, 0.6]);
+  }
+  parts.forEach(([pts, col, w, p], i) => {
+    let t0 = -10, t1 = -9;
+    if (tSched) { const [a, b] = tSched, n = parts.length; t0 = q12(a + (b - a) * i / n); t1 = Math.max(t0 + 0.05, a + (b - a) * (i + 1) / n); }
+    crayon(S, pts, col, t0, t1, { w, p2: p, p1: tSched ? 4.17 : 0, p3: tSched ? 1 : 0 });
+  });
+}
+const DOG0 = [1000, 732];
+dogStrokes(ST, DOG0[0], DOG0[1], 1, 0, { mode: 'still' }, [3.4, 4.1], false);
+TIPS.push([3.7, 900, 690, 2]);
+// the dog's motion after it jumps out (continuous in time; the drawings sample it at 12 fps)
+const V1 = 380 / (1.0 - 0.075), XB = 1150 + V1 * (1 - 0.075), XS = XB + V1 * 0.06, V2 = 406 / (1.33 - 0.075 - 0.15);
+function dogAt(t) {
+  if (t < 4.17) return null;
+  if (t < 4.25) return { x: DOG0[0], y: DOG0[1] + 6, face: 1, st: { mode: 'squash', sx: 1.08, sy: 0.86 } };
+  if (t < 4.5) { const u = (t - 4.25) / 0.25; return { x: lerp(DOG0[0], 1150, u), y: lerp(DOG0[1], 735, u) - Math.sin(Math.PI * u) * 150, face: 1, st: { mode: 'leap', sx: 1.0 + 0.1 * Math.sin(Math.PI * u), sy: 1.0 + 0.1 * Math.sin(Math.PI * u), lean: -0.25 + 0.5 * u } }; }
+  if (t < 5.5) { const u = t - 4.5; const x = 1150 + (u < 0.15 ? V1 * u * u / 0.3 : V1 * (u - 0.075)); return { x, y: 735, face: 1, st: { mode: 'run' } }; }
+  if (t < 5.62) { const s = t - 5.5; return { x: XB + V1 * (s - s * s / 0.24), y: 735, face: 1, st: { mode: 'brake', lean: -0.18 } }; }
+  if (t < 5.67) { const u = (t - 5.62) / 0.05; return { x: XS - 8 * E.inOutSine(u), y: 735, face: 1, st: { mode: 'brake', lean: -0.12 * (1 - u) } }; }
+  const X0 = XS - 8;
+  if (t < 7.0) {
+    const u = t - 5.67, T = 1.33;
+    let d;
+    if (u < 0.15) d = V2 * u * u / 0.3;
+    else if (u < T - 0.3) d = V2 * (u - 0.075);
+    else { const s = u - (T - 0.3); d = V2 * (T - 0.3 - 0.075) + V2 * (s - s * s / 0.6); }
+    return { x: X0 - d, y: 735, face: -1, st: { mode: u > T - 0.18 ? 'brake' : 'run', lean: u > T - 0.18 ? -0.1 : 0 } };
+  }
+  return { x: X0 - V2 * (1.33 - 0.3 - 0.075) - V2 * 0.15, y: 735, face: -1, st: { mode: t >= 7.99 && t < 8.34 ? 'bark' : 'sit' } };
+}
+// ---------- the ending: four crayons, four arcs, one per half-beat from 7.0, a rainbow over the yard ----------
+const RB = [[COL.red, 522], [COL.ora, 486], [COL.grn, 450], [COL.blu, 414]];
+RB.forEach(([c, r], k) => {
+  // each band: across and back again, the return pass a little inside (a kid colours it twice)
+  const arcPts = (rad, a0, a1) => Array.from({ length: 40 }, (_, i) => { const a = a0 + (a1 - a0) * i / 39; return [1240 + Math.cos(a) * rad * (1 + 0.02 * Math.sin(i * 0.5 + k)), 884 + Math.sin(a) * rad * 0.97]; });
+  const pts = arcPts(r, Math.PI + 0.13, 2 * Math.PI - 0.11).concat(arcPts(r - 13, 2 * Math.PI - 0.12, Math.PI + 0.16));
+  const t0 = 7.0 + k * 0.25;
+  crayon(ST, wob(pts, 7, 300 + k * 17), c, t0, t0 + 0.21, { w: 22, p2: 0.86 });
+  TIPS.push([t0 + 0.2, pts[39][0] - 10, pts[39][1] - 14, [1, 2, 3, 0][k]]);
+});
+
+// ================= GL =================
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { preserveDrawingBuffer: true, antialias: false, alpha: false, premultipliedAlpha: false });
+gl.getExtension('EXT_color_buffer_float');
+const HD = '#version 300 es\nprecision highp float;\n';
+const TOOTH = `
+float tooth(vec2 p){
+  float a = vn(p*.19)*.5 + vn(p*.47 + 7.)*.3 + vn(p*1.3 + 3.)*.2;
+  float b = vn(p*.055 + 11.)*.15;
+  return clamp(a*1.08 + b - .1, 0., 1.);
+}`;
+const MW = Math.round(1920 * RS * 1.3), MH = Math.round(1080 * RS * 1.3);
+const pWax = SG.prog(gl, SG.VS_STROKE, HD + `
+in vec4 v0; flat in vec4 v1; flat in vec4 v2; flat in vec4 v3; flat in vec4 v4;
+uniform float T; out vec4 o;
+${SG.GLSL_NOISE}${TOOTH}
+void main(){
+  float s = v0.z, v = v0.w, L = v1.x, w = v1.y, t0 = v1.z, t1 = v1.w;
+  float seed = v4.x, tEnd = v4.y, pres = v4.z, ghost = v4.w;
+  if (T < t0) discard;
+  if (tEnd > 0. && T >= tEnd) { if (ghost < .5) discard; pres *= .17; }   // the dog left its drawing: a faint wax imprint stays
+  float head = L*clamp((T - t0)/max(t1 - t0, 1e-3), 0., 1.);
+  float hw = w*.5;
+  float ds = s < 0. ? -s : (s > head ? s - head : 0.);
+  float ww = 1. + .18*(vn(vec2(s*.04, seed)) - .5);
+  float r = length(vec2(ds/hw, v/ww));
+  float P = pres*(.78 + .38*vn(vec2(s*.022, seed*1.7)) - .18*vn(vec2(s*.12, seed)))*smoothstep(1.05, .35, r);
+  P *= 1. - .22*v;                                   // the worn tip is angled: one edge heavier
+  float th = tooth(v0.xy);
+  float d = smoothstep(1. - P - .07, 1. - P + .07, th);
+  if (d < .01) discard;
+  o = vec4(v2.rgb, d*.93);
+}`);
+const NCR = 8, NCB = 26;
+const pShade = SG.prog(gl, SG.VS_QUAD, HD + `
+in vec2 uv; out vec4 o;
+uniform sampler2D WAX; uniform vec2 res, jit; uniform vec3 cam; uniform vec4 VIEWQ; uniform float frame;
+uniform vec4 CR[${NCR}]; uniform vec4 CC[${NCR}]; uniform vec4 CX[${NCR}];   // crayons: back→tip (x0, y0, x1, y1) · (r, g, b, radius) · (wrap start, wrap end, lift, cut)
+uniform vec4 CB[${NCB}];                       // wax crumbs: x, y, radius, colour index (+10 = a smear)
+${SG.GLSL_NOISE}${TOOTH}
+vec3 lin(vec3 c){ return pow(c, vec3(2.2)); }
+const vec3 LIGHT_COL = vec3(1.);   // light colour, vec3(1.) = as delivered (see the Chinese note at the top of the script)
+const vec3 L = normalize(vec3(-.55, -.62, .56));     // window light from the upper left (screen y down)
+const vec4 PAP = vec4(${PAPER.x0}., ${PAPER.y0}., ${PAPER.x1}., ${PAPER.y1}.);
+vec2 paperLocal(vec2 p){ float a = ${PAPER.rot}; vec2 c = (PAP.xy + PAP.zw)*.5; vec2 d = p - c; return c + vec2(cos(a)*d.x + sin(a)*d.y, -sin(a)*d.x + cos(a)*d.y); }
+vec3 crumbCol(float i){ return i < .5 ? vec3(.96, .77, .1) : i < 1.5 ? vec3(.85, .19, .17) : i < 2.5 ? vec3(.94, .54, .11) : i < 3.5 ? vec3(.23, .63, .28) : vec3(.48, .31, .69); }
+// crayon hit (top-down): returns height (0 = miss), normal, albedo, gloss
+float crayonHit(vec2 p, out vec3 n, out vec3 alb, out float gl){
+  float best = 0.;
+  for (int i = 0; i < ${NCR}; i++) {
+    vec4 s = CR[i]; vec4 cc = CC[i]; vec4 cx = CX[i]; if (cc.w < 1.) continue;
+    vec2 a = s.xy, b = s.zw, ab = b - a; float l = length(ab); vec2 t = ab/l, nn = vec2(-t.y, t.x);
+    float u = dot(p - a, t)/l, d = dot(p - a, nn);
+    float rad = cc.w;
+    float tipL = 2.0*rad/l;
+    float tu = clamp((u - (1. - tipL))/tipL, 0., 1.);
+    float rr = rad*(1. - .58*tu);                      // worn cone ...
+    if (u < -.004 || u > 1. || abs(d) > rr) continue;
+    if (cx.w > .5 && tu > .2 + .6*(d/rad*.5 + .5)) continue;   // ... ground to a slant on this one
+    float z = sqrt(max(rr*rr - d*d, 0.)) + rad + cx.z*(1. - u)*40.;
+    if (z <= best) continue;
+    best = z;
+    n = normalize(vec3(nn*(d/rr), sqrt(max(1. - d*d/(rr*rr), 0.))));
+    if (tu > 0.) { vec3 nt = normalize(vec3(t*1.3, .6)); n = normalize(mix(n, nt, .45)); }
+    if (cx.w > .5 && tu > .2 + .6*(d/rad*.5 + .5) - .08) n = normalize(vec3(t*.9, .5));
+    float tear = .04*sin(d*.45 + float(i)*3.) + .03*sin(d*1.7 + float(i));
+    bool wrap = u > cx.x && u < cx.y + tear;
+    vec3 wc = lin(cc.rgb);
+    if (wrap) {
+      vec3 pc = mix(vec3(1.), cc.rgb, .55);
+      float band = step(abs(u - cx.x - .06), .012) + step(abs(u - cx.y + .06), .012);
+      alb = lin(mix(pc, cc.rgb*.45, band))*(.93 + .07*vn(vec2(u*80., d)));
+      alb *= .92 + .08*smoothstep(.1, .5, vn(vec2(u*30., d*.3) + float(i)));   // creased, rubbed paper
+      gl = .1;
+    } else {
+      alb = wc*(.9 + .12*vn(vec2(u*200., d*2.)));
+      alb = mix(alb, lin(vec3(.55, .5, .45))*wc*1.4, smoothstep(.7, .9, vn(vec2(u*25., d*.5) + float(i)*5.))*.35);  // smudged with other colours
+      gl = .5;
+    }
+  }
+  return best;
+}
+float crayonShadow(vec2 p){
+  float sh = 1.;
+  for (int i = 0; i < ${NCR}; i++) {
+    vec4 s = CR[i]; vec4 cc = CC[i]; vec4 cx = CX[i]; if (cc.w < 1.) continue;
+    vec2 a = s.xy, b = s.zw, ab = b - a; float l = length(ab); vec2 t = ab/l;
+    // a lifted crayon (in the hand) casts a shadow that slides away with height
+    vec2 offA = -L.xy/L.z*(cc.w*1.4 + cx.z*40.), offB = -L.xy/L.z*cc.w*1.4;
+    float u = clamp(dot(p - a - offA, t)/l, 0., 1.);
+    vec2 q = a + ab*u + mix(offA, offB, u);
+    float d = length(p - q);
+    float soft = cc.w*(.6 + cx.z*(1. - u)*1.2);
+    sh = min(sh, mix(.55 + .25*cx.z*(1. - u), 1., smoothstep(soft, cc.w*1.9 + cx.z*(1. - u)*30., d)));
+  }
+  return sh;
+}
+void main(){
+  vec2 fc = gl_FragCoord.xy + jit;
+  vec2 sc = vec2(fc.x, res.y - fc.y)/res*vec2(1920., 1080.);
+  vec2 p = (sc - vec2(960., 540.))/cam.z + cam.xy;           // design px on the table
+  vec3 col;
+  vec3 n = vec3(0., 0., 1.), alb; float gl = 0., ao = 1.;
+  vec2 pl = paperLocal(p);
+  bool onPaper = pl.x > PAP.x && pl.y > PAP.y && pl.x < PAP.z && pl.y < PAP.w;
+  if (onPaper) {
+    float t0 = tooth(p), tx = tooth(p + vec2(1.2, 0.)), ty = tooth(p + vec2(0., 1.2));
+    vec4 wx = texture(WAX, vec2((p.x - VIEWQ.x)/VIEWQ.z, 1. - (p.y - VIEWQ.y)/VIEWQ.w));
+    float wa = clamp(wx.a, 0., 1.);
+    float hs = 2.2*(1. - .55*wa);
+    n = normalize(vec3(-(tx - t0)/1.2*hs, -(ty - t0)/1.2*hs, 1.));
+    vec3 paper = vec3(.95, .93, .88)*(.97 + .04*vn(p*vec2(.08, .5)) + .02*vn(p*.9));
+    alb = lin(paper)*(1. - wa) + lin(wx.rgb/max(wa, 1e-3))*wa;
+    gl = wa*.45;
+    ao = .82 + .18*t0;
+    // crumbs of wax pressed into the paper: irregular flakes, and a few smears rubbed along by a hand
+    for (int i = 0; i < ${NCB}; i++) {
+      vec4 c = CB[i]; if (c.z < .5) continue;
+      vec2 d = p - c.xy;
+      if (c.w > 9.5) {          // smear
+        float an = c.w - 10.; vec2 dir = vec2(cos(an*1.7 + 1.), sin(an*1.7 + 1.));
+        float along = dot(d, dir), acr = dot(d, vec2(-dir.y, dir.x));
+        float m = smoothstep(1., .2, length(vec2(along/(c.z*3.2), acr/c.z)))*(.5 + .5*vn(vec2(along*.3, acr*1.5)));
+        alb = mix(alb, lin(crumbCol(mod(an, 5.))), m*.42*smoothstep(.2, .7, t0 + .3));
+        continue;
+      }
+      float an = atan(d.y, d.x);
+      float rr = c.z*(1. + .45*(vn(vec2(an*1.6 + float(i)*3., float(i))) - .5)*2.)*(1. + .35*cos(2.*(an - float(i))));
+      float dd = length(d);
+      if (dd < rr) { float z = sqrt(max(1. - dd*dd/(rr*rr), 0.)); n = normalize(vec3(d/rr*.55, z*.6 + .45)); alb = lin(crumbCol(c.w))*(.88 + .22*vn(d*.8)); gl = .35; ao = 1.; }
+      else ao *= mix(.7, 1., smoothstep(rr*.6, rr*1.8, length(d + L.xy/L.z*rr*.6)));
+    }
+    float e = min(min(pl.x - PAP.x, PAP.z - pl.x), min(pl.y - PAP.y, PAP.w - pl.y));
+    ao *= mix(.86, 1., smoothstep(0., 6., e));
+  } else {
+    float g = fbm(vec2(p.x*.003, p.y*.03)); float ring = .5 + .5*sin(p.y*.09 + g*8. + p.x*.001);
+    alb = lin(mix(vec3(.78, .64, .45), vec3(.86, .74, .55), ring*.6 + .4*vn(p*vec2(.01, .2))));
+    vec2 sp = paperLocal(p + L.xy/L.z*4.);
+    float inside = step(PAP.x, sp.x)*step(sp.x, PAP.z)*step(PAP.y, sp.y)*step(sp.y, PAP.w);
+    ao = 1. - .35*inside;
+    gl = .2;
+  }
+  vec3 cn, ca; float cg;
+  float ch = crayonHit(p, cn, ca, cg);
+  if (ch > 0.) { n = cn; alb = ca; gl = cg; ao = 1.; }
+  else ao *= crayonShadow(p);
+  float ndl = max(dot(n, L), 0.);
+  float fall = 1.08 - .22*smoothstep(0., 1., length((p - vec2(200., 100.))/vec2(2300., 1500.)));
+  vec3 Lc = LIGHT_COL*vec3(1.0, .96, .9)*2.1*fall, Ac = vec3(.62, .66, .74)*.62;
+  vec3 V = vec3(0., 0., 1.), Hh = normalize(L + V);
+  float spec = pow(max(dot(n, Hh), 0.), 40.)*gl*1.3;
+  col = alb*(Lc*ndl + Ac*ao*(.6 + .4*n.z)) + Lc*spec;
+  col *= ao*.25 + .75;
+  o = vec4(col, 1.);
+}`);
+const pComp = SG.prog(gl, SG.VS_QUAD, HD + `in vec2 uv; out vec4 o; uniform sampler2D S; uniform vec2 res; uniform float seed, flick;
+${SG.GLSL_NOISE}
+void main(){ vec2 d = uv - .5; vec3 c = texture(S, uv).rgb*flick;
+  c = c/(1. + c*.2); c = pow(c, vec3(1./2.2));
+  c = mix(vec3(dot(c, vec3(.3, .59, .11))), c, 1.05);
+  c += vec3(.012, .004, -.01);
+  c *= 1. - .26*smoothstep(.35, 1.1, length(d*vec2(1.3, 1.)));
+  c += (hash12(uv*res + seed*31.7) - .5)*.026; o = vec4(clamp(c, 0., 1.), 1.); }`);
+const tWAX = SG.tex(gl, MW, MH, {}), fWAX = SG.fbo(gl, [tWAX]);
+const tSC = SG.tex(gl, W, H, { ifmt: gl.RGBA16F, type: gl.HALF_FLOAT }), fSC = SG.fbo(gl, [tSC]);
+const QUAD = SG.quad(gl);
+ST.upload(gl);
+const VQ = [-60, -40, 2040, 1160];
+
+// crayons lying on the table (back end → tip): worn, two broken, wrappers torn at different places
+const CRAY = [
+  [[34, 300], [112, 560], COL.yel, 19, 0.1, 0.62, 0], [[66, 690], [44, 880], COL.grn, 19, 0.0, 0.45, 1], [[1812, 120], [1862, 420], COL.blu, 19, 0.12, 0.7, 1],
+  [[1846, 560], [1806, 750], COL.red, 19, 0.05, 0.5, 0], [[1884, 830], [1820, 1050], COL.pur, 19, 0.14, 0.66, 1], [[1500, 1062], [1700, 1072], COL.ora, 19, 0.1, 0.6, 0],
+  [[262, 1062], [326, 1070], COL.red, 18, 0.0, 0.0, 1],
+];
+function crayonUniforms(tool) {
+  const A = new Float32Array(NCR * 4), Cc = new Float32Array(NCR * 4), X = new Float32Array(NCR * 4);
+  CRAY.forEach(([a, b, c, r, w0, w1, cut], i) => { A.set([a[0], a[1], b[0], b[1]], i * 4); Cc.set([c[0], c[1], c[2], r], i * 4); X.set([w0, w1, 0, cut], i * 4); });
+  if (tool) { const i = NCR - 1; A.set([tool.x + 135 * tool.lean, tool.y + 245, tool.x, tool.y], i * 4); Cc.set([tool.col[0], tool.col[1], tool.col[2], 19], i * 4); X.set([0.12, 0.7, 0.55 + 0.6 * tool.lift, 0], i * 4); }
+  return { A, Cc, X };
+}
+// the crayon in the kid's hand: follows the strokes (12 fps), leaves the frame for the long pauses
+const AWAY = [460, 820];
+SEGS.sort((p, q) => p[0] - q[0]);
+function toolAt(t) {
+  const segs = SEGS.filter((s) => s[0] < 4.2 || s[0] >= 6.8);
+  const first = segs[0], kp = (pl, u) => { const x = clamp(u) * (pl.length - 1), i = Math.min(pl.length - 2, Math.floor(x)), f = x - i; return [lerp(pl[i][0], pl[i + 1][0], f), lerp(pl[i][1], pl[i + 1][1], f)]; };
+  if (t < first[0]) return { x: first[2][0][0], y: first[2][0][1], lift: 0, col: first[3], lean: 1 };
+  for (let i = 0; i < segs.length; i++) {
+    const [a, b, pl, col] = segs[i], nx = segs[i + 1];
+    if (t >= a && t <= b) { const p = kp(pl, (t - a) / Math.max(b - a, 1e-3)); return { x: p[0], y: p[1], lift: 0, col, lean: 1 }; }
+    if (t > b && (!nx || t < nx[0])) {
+      const end = pl[pl.length - 1];
+      const recolour = nx && (nx[3] !== col);
+      if (!nx || nx[0] - b > 0.9) {
+        const out = clamp((t - b) / 0.25), back = nx ? clamp((t - (nx[0] - 0.25)) / 0.25) : 0;
+        if (back > 0) { const s = nx[2][0], u = E.outCubic(back); return { x: s[0] + AWAY[0] * (1 - u), y: s[1] + AWAY[1] * (1 - u), lift: 1 - u, col: nx[3], lean: 1 }; }
+        if (out >= 1) return null;
+        const u = E.inCubic(out); return { x: end[0] + AWAY[0] * u, y: end[1] + AWAY[1] * u, lift: u, col, lean: 1 };
+      }
+      const s = nx[2][0], u = (t - b) / (nx[0] - b);
+      return { x: lerp(end[0], s[0], E.inOutSine(u)), y: lerp(end[1], s[1], E.inOutSine(u)), lift: Math.sin(Math.PI * u) * Math.min(1, (nx[0] - b) * 4), col: recolour && u > 0.5 ? nx[3] : col, lean: 1 };
+    }
+  }
+  return null;
+}
+// wax crumbs (irregular flakes) + three smears
+const CRUMB = [];
+TIPS.forEach(([t, x, y, ci]) => { for (let j = 0; j < 2; j++) CRUMB.push([t + j * 0.05, x + rr(-40, 40), y + rr(-30, 30), rr(3.5, 6.5), ci]); });
+CRUMB.push([1.5, 790, 640, 7, 11], [2.6, 1330, 935, 6, 13], [7.3, 1500, 520, 6, 10]);
+function crumbsAt(t) { const A = new Float32Array(NCB * 4); CRUMB.filter((c) => c[0] <= t).slice(0, NCB).forEach((c, i) => A.set([c[1], c[2], c[3], c[4]], i * 4)); return A; }
+// camera (30 fps): follows a damped copy of the dog, push in for the run, back out, a slow settle
+function dogX(t) { const d = dogAt(t); return d ? d.x : DOG0[0]; }
+function followX(t) {        // spring-damped follow (lag ≈ 0.2 s, slight overshoot)
+  const w = 9, z = 0.55, wd = w * Math.sqrt(1 - z * z); let acc = 0, ws = 0;
+  for (let s = 0; s <= 1.2; s += 1 / 60) { const h = Math.exp(-z * w * s) * Math.sin(wd * s + 0.9); acc += h * dogX(t - s); ws += h; }
+  return acc / ws;
+}
+const ZOOM = Track([{ t: 0, v: [1.0, 0] }, { t: 4.05, v: [1.0, 0] }, { t: 4.75, v: [1.17, 1] }, { t: 6.75, v: [1.17, 1] }, { t: 8.2, v: [1.0, 0] }], {});
+function camAt(t) {
+  const [z, k] = ZOOM(t);
+  return [lerp(960, lerp(960, followX(t), 0.5), k), lerp(540, 615, k), z];
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() {},
+  cues: [
+    { t: 0.0, sfx: 'scrib', gain: 0.55 }, { t: 0.66, sfx: 'scrib_s', gain: 0.5 },
+    { t: 1.0, sfx: 'scrib_s', gain: 0.55 }, { t: 1.18, sfx: 'scrib', gain: 0.6 }, { t: 1.5, sfx: 'scrib_s', gain: 0.5 }, { t: 1.66, sfx: 'scrib', gain: 0.55 },
+    { t: 2.0, sfx: 'scrib_s', gain: 0.5 }, { t: 2.5, sfx: 'scrib', gain: 0.55 }, { t: 3.0, sfx: 'scrib', gain: 0.5 },
+    { t: 3.4, sfx: 'scrib', gain: 0.6 }, { t: 3.75, sfx: 'scrib_s', gain: 0.5 },
+    { t: 4.25, sfx: 'boing', gain: 0.6 }, { t: 4.5, sfx: 'bark', gain: 0.75 }, { t: 4.5, sfx: 'paws', gain: 0.6 }, { t: 5.5, sfx: 'skid', gain: 0.4 }, { t: 5.67, sfx: 'paws', gain: 0.55 },
+    { t: 7.0, sfx: 'scrib_s', gain: 0.55 }, { t: 7.25, sfx: 'scrib_s', gain: 0.5 }, { t: 7.5, sfx: 'scrib_s', gain: 0.55 }, { t: 7.75, sfx: 'scrib_s', gain: 0.5 },
+    { t: 8.0, sfx: 'bark', gain: 0.7 }, { t: 8.0, sfx: 'chime', gain: 0.35 },
+  ],
+  render(tRaw) {
+    const frame = Math.round(tRaw * 30);                    // drawings follow the frame, not the motion-blur sub-samples
+    const t = Math.floor(frame / 30 * FPS + 1e-6) / FPS, f = Math.round(t * FPS);
+    const jit = Reel.jit || [0, 0];
+    SG.bind(gl, fWAX); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND); gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    pWax.use().f('T', t).f('PS', VQ[2], VQ[3]).f('VIEW', VQ[0], VQ[1], 1); ST.draw();
+    const d = dogAt(t);
+    if (d) { DYN.reset(); dogStrokes(DYN, d.x, d.y, d.face, f, Object.assign({ pose: f % 4 }, d.st), null, true); DYN.uploadDynamic(gl); pWax.use().f('T', t); DYN.draw(); }
+    gl.disable(gl.BLEND);
+    const cam = camAt(tRaw);
+    const shake = [(hsh(f * 1.3) - 0.5) * 1.6, (hsh(f * 2.1) - 0.5) * 1.6];   // stop-motion registration stays at 12 fps
+    const cu = crayonUniforms(toolAt(t));
+    SG.bind(gl, fSC);
+    pShade.use().t('WAX', tWAX).f('res', W, H).f('jit', jit[0], -jit[1]).f('cam', cam[0] + shake[0], cam[1] + shake[1], cam[2]).f('VIEWQ', VQ[0], VQ[1], VQ[2], VQ[3]).f('frame', f)
+      .arr4('CR', cu.A).arr4('CC', cu.Cc).arr4('CX', cu.X).arr4('CB', crumbsAt(t));
+    QUAD.draw();
+    SG.bind(gl, null); gl.viewport(0, 0, W, H);
+    pComp.use().t('S', tSC).f('res', W, H).f('seed', f % 41).f('flick', 1 + (hsh(f * 0.77) - 0.5) * 0.03); QUAD.draw();
+    gl.finish();
+  },
+});
+</script></body></html>

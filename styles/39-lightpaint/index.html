@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>39 光绘长曝光 · Light Painting</title>
+<script src="../../lib/core.js"></script><script src="../../lib/gl.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 39 光绘长曝光 · LIGHT PAINTING =====
+   One long exposure on a tripod in a moonlit old street, wet stone underfoot. The frame IS the exposure:
+   everything that has ever glowed stays on the sensor. A light painter sweeps an LED tube into a pair of
+   phoenix wings, feather by feather on the beat; at the hook a burning steel-wool whisk spins at the heart of
+   the wings, flinging spiral sparks that bounce off the paving and light the whole street orange; then a cold
+   pen light draws the phoenix's neck, crested head and a long curling tail. On the downbeat the shutter closes:
+   the frame freezes into the finished photograph. Trails are rasterised into an HDR accumulation (energy = power × dwell time), mirrored
+   into the wet ground, bloomed and tone-mapped, so cores burn to white and only the halos keep their colour. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#020306');
+Reel.ownJitter = true;
+const TEND = 8.0;   // the shutter closes on the downbeat
+const RS = Reel.RS, W = Math.round(1920 * RS), H = Math.round(1080 * RS);
+const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+cv.style.cssText = 'position:absolute;left:0;top:0;width:1920px;height:1080px'; stage.appendChild(cv);
+const gl = cv.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true, alpha: false });
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('EXT_float_blend');
+const G = Reel.GL(cv);
+const R = Reel.rng(3909);
+const DBG = +(Reel.Q.get('dbg') || 0);
+
+/* ---------------- camera (tripod) ---------------- */
+const CAM = { p: [0.1, 1.25, 0.0], pitch: 6 * Math.PI / 180, fovy: 50 * Math.PI / 180 };
+const nrm = (a) => { const l = Math.hypot(...a) || 1; return a.map((v) => v / l); };
+const crs = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const camBasis = () => {
+  const f = [0, Math.sin(CAM.pitch), Math.cos(CAM.pitch)];
+  const r = nrm(crs(f, [0, 1, 0])); const u = crs(r, f);      // r = screen right (-x when looking +z)
+  return { f, r, u };
+};
+const CB = camBasis();
+const PAINT = [0, 0, 7.2];        // where the painter stands
+
+/* ---------------- background: moonlit street, raymarched once ---------------- */
+const BGF = `#version 300 es
+precision highp float; in vec2 uv; layout(location=0) out vec4 oMoon; layout(location=1) out vec4 oFire; layout(location=2) out vec4 oAux;
+uniform vec3 uCP, uCF, uCR, uCU; uniform float uTan, uAsp; uniform vec3 uFireP;
+#define PI 3.14159265
+float h11(float p){ p = fract(p*.1031); p *= p + 33.33; p *= p + p; return fract(p); }
+float h21(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+float vn(vec2 p){ vec2 i = floor(p), f = fract(p); f = f*f*(3. - 2.*f);
+  return mix(mix(h21(i), h21(i + vec2(1,0)), f.x), mix(h21(i + vec2(0,1)), h21(i + vec2(1,1)), f.x), f.y); }
+float fbm(vec2 p){ float a = .5, s = 0.; for (int i=0;i<5;i++){ s += a*vn(p); p = p*2.03 + 7.1; a *= .5; } return s; }
+float sdBox(vec3 p, vec3 b){ vec3 q = abs(p) - b; return length(max(q, 0.)) + min(max(q.x, max(q.y, q.z)), 0.); }
+// a row of old shop-houses across the street, facing the camera (bays along x); a corner house frames the left edge
+vec4 bay(float seg){
+  float h = h11(seg*1.37 + 4.1);
+  return vec4(11. + .35*h11(seg*3.1), 4.5 + 1.1*h, h11(seg*5.3 + 2.), h11(seg*8.9 + 1.));   // facade z, eave height, variant, rnd
+}
+// material ids: 1 ground, 2 plaster, 3 wood, 4 roof tile, 5 lantern, 6 eave underside, 7 dark interior, 8 lit window
+vec2 map(vec3 p){
+  vec2 res = vec2(p.y, 1.);                                   // ground
+  const float BW = 3.6;
+  float seg = floor(p.x/BW + .5);
+  float xl = p.x - seg*BW;                                    // -1.8..1.8 within the bay
+  vec4 B = bay(seg);
+  float fz = B.x, eh = B.y;
+  float zl = p.z - fz;
+  float d = 1e3, mat = 2.;
+  if (B.w < .86) {                                            // (one bay is an open alley)
+    float roofY = eh + .12 + (zl + 1.15)*.52;
+    float wall = max(-zl, p.y - roofY);
+    float shop = sdBox(vec3(xl, p.y - 1.15, zl - .22), vec3(1.42, 1.15, .26));
+    wall = max(wall, -shop);
+    float win = sdBox(vec3(xl - (B.z - .5)*.6, p.y - 3.25, zl - .12), vec3(.82, .55, .16));
+    wall = max(wall, -win);
+    d = wall; mat = 2.;
+    float post = sdBox(vec3(abs(xl) - 1.74, p.y - 1.25, zl + .06), vec3(.13, 1.25, .13));
+    float beam = sdBox(vec3(xl, p.y - 2.42, zl + .06), vec3(1.86, .11, .12));
+    float wood = min(post, beam);
+    float planks = sdBox(vec3(xl, p.y - 1.15, zl - .36), vec3(1.42, 1.15, .05));
+    wood = min(wood, planks);
+    float lat = sdBox(vec3(xl - (B.z - .5)*.6, p.y - 3.25, zl - .2), vec3(.82, .55, .03));
+    vec2 lg = abs(fract(vec2(xl*3.6, (p.y - 3.25)*3.6)) - .5);
+    lat = max(lat, -(min(.5 - lg.x, .5 - lg.y) - .08)*.27);
+    wood = min(wood, lat);
+    if (wood < d) { d = wood; mat = 3.; }
+    float glow = sdBox(vec3(xl - (B.z - .5)*.6, p.y - 3.25, zl - .26), vec3(.82, .55, .02));
+    if (glow < d) { d = glow; mat = 7. + step(.78, B.z); }
+    float eave = sdBox(vec3(xl, p.y - eh, zl + .58), vec3(1.86, .085, .64));
+    if (eave < d) { d = eave; mat = 6.; }
+    float tile = (p.y - roofY)*.86 - .045*abs(sin(xl*PI*4.6));
+    tile = max(tile, -(zl + 1.2)); tile = max(tile, -(p.y - eh + .04));
+    if (tile < d) { d = tile; mat = 4.; }
+    if (B.z > .3) {
+      vec3 lp = vec3(xl - .9*(B.z > .65 ? 1. : -1.), p.y - (eh - .72), zl + .66);
+      float ln = length(lp*vec3(1., .82, 1.)) - .2;
+      if (ln < d) { d = ln; mat = 5.; }
+    }
+  } else {
+    d = max(-(p.z - fz - 6.), p.y - 9.);                      // back of the alley: far wall in deep shadow
+    mat = 7.;
+  }
+  if (d < res.x) res = vec2(d, mat);
+  return res;
+}
+vec3 nrmAt(vec3 p){ vec2 e = vec2(.002, 0.); return normalize(vec3(map(p + e.xyy).x - map(p - e.xyy).x, map(p + e.yxy).x - map(p - e.yxy).x, map(p + e.yyx).x - map(p - e.yyx).x)); }
+float march(vec3 ro, vec3 rd, float tmax){
+  float t = .02;
+  for (int i=0;i<200;i++){ float d = map(ro + rd*t).x; if (d < .0006*t) return t; t += d*.8; if (t > tmax) break; }
+  return -1.;
+}
+float softShadow(vec3 ro, vec3 rd, float tmax, float k){
+  float res = 1., t = .03;
+  for (int i=0;i<80;i++){ float h = map(ro + rd*t).x; res = min(res, k*h/t); t += clamp(h, .02, .5); if (res < .002 || t > tmax) break; }
+  return clamp(res, 0., 1.);
+}
+float ao(vec3 p, vec3 n){ float o = 0., s = 1.; for (int i=1;i<=5;i++){ float h = .06*float(i); o += (h - map(p + n*h).x)*s; s *= .7; } return clamp(1. - o*2.2, 0., 1.); }
+vec3 skyCol(vec3 rd){
+  vec3 c = mix(vec3(.010, .016, .036), vec3(.004, .007, .02), clamp(rd.y*1.6, 0., 1.));
+  c += vec3(.03, .04, .07)*pow(max(dot(rd, normalize(vec3(.55, .5, .3))), 0.), 6.);      // moon glow (moon off frame, upper left)
+  vec2 sp = rd.xy/max(rd.z, .1)*300.;
+  vec2 id = floor(sp); float s = h21(id);
+  if (s > .985) { vec2 f = fract(sp) - .5 - (vec2(h21(id + 3.), h21(id + 7.)) - .5)*.6; c += vec3(.8, .85, 1.)*pow(h21(id + 11.), 6.)*exp(-dot(f, f)*60.)*2.5; }
+  return c;
+}
+void main(){
+  vec2 p = uv*2. - 1.;
+  vec3 rd = normalize(uCF + uCR*p.x*uTan*uAsp + uCU*p.y*uTan);
+  vec3 ro = uCP;
+  float t = march(ro, rd, 60.);
+  if (t < 0.) { oMoon = vec4(skyCol(rd), 1.); oFire = vec4(0.); oAux = vec4(0., 1e3, 1., 0.); return; }
+  vec3 P = ro + rd*t; vec2 m = map(P); vec3 n = nrmAt(P);
+  float mat = m.y;
+  vec3 alb; float wet = 0., rough = .8;
+  if (mat < 1.5) {                       // stone slabs, wet
+    vec2 g = P.xz*vec2(1.6, 1.1); g.x += floor(g.y)*.5;
+    vec2 f = abs(fract(g) - .5);
+    float joint = smoothstep(.47, .5, max(f.x, f.y));
+    float tone = .7 + .3*h21(floor(g));
+    alb = vec3(.20, .21, .23)*tone*(1. - joint*.6)*(.8 + .4*fbm(P.xz*3.));
+    float pud = smoothstep(.45, .62, fbm(P.xz*.45 + 3.)) ;
+    wet = mix(.35, .95, pud)*(1. - joint*.5);
+    alb *= 1. - wet*.45;
+  } else if (mat < 2.5) {                // lime plaster, weathered
+    vec2 wq = abs(n.x) > .5 ? P.zy : P.xy;
+    alb = vec3(.55, .54, .52)*(.6 + .4*fbm(wq*vec2(1.5, 2.)))*(1. - .35*smoothstep(.5, .9, fbm(wq*vec2(.8, 4.) + 9.)));
+    alb *= mix(.55, 1., smoothstep(0., .8, P.y));                 // splash grime at the foot
+  } else if (mat < 3.5) {                // old timber: vertical planks
+    float pq = abs(n.x) > .5 ? P.z : P.x;
+    float pl = abs(fract(pq*5.5) - .5);
+    alb = vec3(.17, .11, .07)*(.7 + .3*fbm(vec2(pq*30., P.y*1.2)))*(1. - .4*smoothstep(.44, .5, pl));
+  } else if (mat < 4.5) { alb = vec3(.09, .09, .1)*(.8 + .3*fbm(P.xz*6.)); rough = .6;
+  } else if (mat < 5.5) { alb = vec3(.35, .06, .04); rough = .5;
+  } else if (mat < 6.5) { alb = vec3(.08, .06, .05);
+  } else { alb = vec3(.08, .07, .06); }
+  vec3 Lm = normalize(vec3(.5, .7, -.45));                     // moonlight from upper left, behind the camera
+  float sh = softShadow(P + n*.01, Lm, 40., 10.);
+  float occ = ao(P, n);
+  vec3 moon = vec3(.22, .28, .46)*.42;
+  vec3 col = alb*(moon*max(dot(n, Lm), 0.)*sh + vec3(.03, .04, .07)*(.5 + .5*n.y)*occ + vec3(.025, .03, .05)*occ);
+  if (mat > 6.5 && mat < 7.5) col = vec3(.004, .005, .008);
+  if (mat > 7.5) col = vec3(1., .5, .2)*.22*(.6 + .4*vn(P.xy*8.));          // somebody is still up
+  // fire / wing response: irradiance from a unit point light where the painter works
+  vec3 Lf = uFireP - P; float df = length(Lf); Lf /= df;
+  float shf = softShadow(P + n*.01, Lf, df - .05, 14.);
+  vec3 fire = alb*max(dot(n, Lf), 0.)*shf/(df*df + .3)*occ;
+  if (mat < 1.5) fire += vec3(.05)*max(dot(n, Lf), 0.)*shf/(df*df + .3)*wet;      // a little sheen on wet stone
+  oMoon = vec4(col, 1.);
+  oFire = vec4(fire, 1.);
+  oAux = vec4(mat < 1.5 ? wet : 0., dot(P - ro, uCF), 0., mat);
+}`;
+
+/* ---------------- light sources → segments ----------------
+   ribbons (LED tube sweeps): quads between consecutive tube positions, energy spread over the swept area
+   lines (pen light, steel wool, sparks): segments drawn with a fixed screen width and a gaussian profile */
+const RIB = [];   // per vertex: pos(3) tau(1) col(3) e(1) v(1)  -> 9 floats, 6 verts per quad
+const LIN = [];   // per segment: p0(3) p1(3) tau0 tau1 col(3) e w  -> 13 floats, 6 verts (corner id added in shader by gl_VertexID)
+let EW = [], EF = [];   // energy timelines for the street illumination (wings, fire), 0.01 s bins
+for (let i = 0; i <= 1000; i++) { EW.push(0); EF.push(0); }
+const addE = (arr, tau, e) => { const k = Math.min(1000, Math.max(0, Math.round(tau * 100))); arr[k] += e; };
+const mix3 = (a, b, s) => [a[0] + (b[0] - a[0]) * s, a[1] + (b[1] - a[1]) * s, a[2] + (b[2] - a[2]) * s];
+function tubeSweep(t0, dur, piv, len, a0, a1, cA, cB, power, drift, seed = 0) {
+  const N = Math.max(16, Math.round(dur * 320));
+  const pos = (k) => {
+    let u = k / N;
+    u = clamp(u + 0.035 * Math.sin(2 * Math.PI * 3 * u + seed) * Math.sin(Math.PI * u));   // the hand never sweeps at an even speed
+    const e = E.inOutSine(u);
+    const a = lerp(a0, a1, e);
+    const pv = [piv[0] + drift[0] * u, piv[1] + drift[1] * Math.sin(Math.PI * u), piv[2] + drift[2] * u];
+    const d = [Math.cos(a), Math.sin(a), 0];
+    const curl = 0.10 * Math.sin(Math.PI * u);                         // the wrist bends the tube along the arc
+    return [pv, [pv[0] + d[0] * len - d[1] * curl * len * 0.3, pv[1] + d[1] * len + d[0] * curl * len * 0.3, pv[2]]];
+  };
+  let prev = pos(0);
+  for (let k = 1; k <= N; k++) {
+    const cur = pos(k), tau = t0 + (k / N) * dur;
+    const dt = dur / N;
+    // swept area of the quad (two triangles)
+    const ar = (a, b, c) => 0.5 * Math.hypot(...crs([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [c[0] - a[0], c[1] - a[1], c[2] - a[2]]));
+    const area = ar(prev[0], prev[1], cur[1]) + ar(prev[0], cur[1], cur[0]) + 1e-4;
+    const e = Math.min(power * dt / area, 12);
+    const fade = 0.75 + 1.4 * Math.exp(-(k - 1) / 4) + 1.4 * Math.exp(-(N - k) / 4);   // the hand dwells at both ends: the straight edges burn brightest
+    const V = [[prev[0], 0], [prev[1], 1], [cur[1], 1], [prev[0], 0], [cur[1], 1], [cur[0], 0]];
+    for (const [p, v] of V) RIB.push(...p, tau, ...mix3(cA, cB, v), e * fade, v);
+    addE(EW, tau, power * dt);
+    prev = cur;
+  }
+}
+function line(pts, taus, col, power, width, energyArr, eScale = 1) {
+  for (let k = 1; k < pts.length; k++) {
+    const p0 = pts[k - 1], p1 = pts[k];
+    const L = Math.hypot(p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]) + 0.004;
+    const dt = taus[k] - taus[k - 1];
+    const c = typeof col === 'function' ? col(k / (pts.length - 1)) : col;
+    const pw = typeof power === 'function' ? power(k / (pts.length - 1)) : power;
+    LIN.push(...p0, ...p1, taus[k - 1], taus[k], ...c, Math.min(pw * dt / L, 30), width);
+    if (energyArr) addE(energyArr, taus[k], pw * dt * eScale);
+  }
+}
+
+/* 1. phoenix wings: fourteen LED-tube feathers, alternating sides on the sixteenths, fanning up from the shoulders */
+function buildWings() {
+  const sh = [0, 1.9, 5.75];
+  const n = 7;
+  // accelerando into the ignition: two on quarters, then eighths, the last two on sixteenths
+  const T0 = [0.0, 0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.625];
+  const DUR = [0.4, 0.4, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.12, 0.13];
+  const Rw = Reel.rng(339);
+  for (let i = 0; i < n; i++) {
+    for (const side of [1, -1]) {          // world +x is screen left
+      const k = i * 2 + (side > 0 ? 0 : 1);
+      const u = i / (n - 1);
+      const jit = (a) => 1 + (Rw() - 0.5) * 2 * a;
+      const ang = (-24 + u * 84) * Math.PI / 180 * jit(0.06) + (side > 0 ? 0.02 : -0.03);
+      const a0 = side > 0 ? ang : Math.PI - ang;
+      const sweep = 0.16 * jit(0.25) * (side > 0 ? 1 : -1);
+      const len = [1.85, 2.1, 2.2, 2.05, 1.8, 1.55, 1.3][i] * jit(0.06) * (side > 0 ? 1.0 : 0.96);
+      const piv = [side * (0.2 + 0.12 * u) + (Rw() - 0.5) * 0.06, sh[1] + 0.32 * u + (Rw() - 0.5) * 0.05, sh[2] + 0.015 * k];
+      const gold = [1.0, 0.55, 0.12], rose = [1.0, 0.12, 0.38], violet = [0.45, 0.2, 1.0], cyan = [0.1, 0.6, 1.0];
+      const cA = gold, cB = u < 0.5 ? mix3(rose, violet, u * 2) : mix3(violet, cyan, (u - 0.5) * 2);
+      tubeSweep(T0[k], DUR[k], piv, len, a0, a0 + sweep, cA, cB, 1.15 * (0.22 / DUR[k]) ** 0.35, [side * 0.06 + (Rw() - 0.5) * 0.05, 0.05, 0], Rw() * 6.28);
+    }
+  }
+}
+
+/* 2. steel wool: spinning whisk + spiral sparks that bounce off the paving */
+const WOOL = { c: [0, 2.08, 5.6], r: 0.86, w: 2 * Math.PI * 2.6, t0: 4.0, t1: 6.6 };
+const burn = (tau) => clamp((tau - WOOL.t0) / 0.25) * (1 - clamp((tau - (WOOL.t1 - 0.45)) / 0.45)) * (0.85 + 0.15 * Math.sin(tau * 23));
+function woolPos(tau) {
+  const a = WOOL.w * (tau - WOOL.t0) + 0.4;
+  const yaw = 0.35 * Math.sin((tau - WOOL.t0) * 1.6);
+  const x = Math.cos(a) * WOOL.r, y = Math.sin(a) * WOOL.r;
+  return [WOOL.c[0] + x * Math.cos(yaw), WOOL.c[1] + y, WOOL.c[2] + x * Math.sin(yaw)];
+}
+function buildWool() {
+  // the whisk's own glowing path
+  const pts = [], taus = [];
+  for (let tau = WOOL.t0; tau <= WOOL.t1; tau += 1 / 600) { pts.push(woolPos(tau)); taus.push(tau); }
+  line(pts, taus, (u) => mix3([1, 0.55, 0.18], [1, 0.42, 0.1], u), (u) => 2.3 * burn(WOOL.t0 + u * (WOOL.t1 - WOOL.t0)), 4.2, EF, 0.5);
+  // sparks
+  const NS = 2000;
+  for (let i = 0; i < NS; i++) {
+    let tau = WOOL.t0 + R() * (WOOL.t1 - WOOL.t0);
+    if (R() > burn(tau)) continue;
+    const p = woolPos(tau), p2 = woolPos(tau + 0.001);
+    const v = [(p2[0] - p[0]) / 0.001, (p2[1] - p[1]) / 0.001, (p2[2] - p[2]) / 0.001];
+    const sp = 0.45 + R() * 0.55;
+    let vel = [v[0] * sp + (R() - 0.5) * 2.5, v[1] * sp + (R() - 0.5) * 2.5, v[2] * sp + (R() - 0.5) * 7];
+    let pos = p.slice();
+    const life = 0.25 + Math.pow(R(), 1.6) * 1.4;
+    const heat = 0.6 + R() * 0.8;
+    const sp_pts = [pos.slice()], sp_t = [tau];
+    const dt = 1 / 240;
+    for (let a = 0; a < life; a += dt) {
+      vel[1] -= 9.8 * dt;
+      const drag = Math.exp(-1.2 * dt); vel = vel.map((c) => c * drag);
+      pos = [pos[0] + vel[0] * dt, pos[1] + vel[1] * dt, pos[2] + vel[2] * dt];
+      if (pos[1] < 0.005) { pos[1] = 0.005; vel[1] = -vel[1] * 0.38; vel[0] *= 0.7; vel[2] *= 0.7; }
+      sp_pts.push(pos.slice()); sp_t.push(tau + a + dt);
+      if (sp_pts.length > 400) break;
+    }
+    // thin the polyline for speed (keep every 3rd point)
+    const P2 = [], T2 = [];
+    for (let k = 0; k < sp_pts.length; k += 3) { P2.push(sp_pts[k]); T2.push(sp_t[k]); }
+    if (P2.length < 2) continue;
+    line(P2, T2, (u) => mix3([1, 0.75, 0.38], [1, 0.25, 0.05], Math.min(1, u * 1.3)), (u) => heat * 1.5 * Math.exp(-u * 2.8), 1.6, EF, 0.04);
+  }
+}
+
+/* 3. the pen light draws the phoenix: neck and crested head, a faint covered move, then the long curling tail */
+function catmull(P, nPer) {
+  const out = [];
+  for (let i = 0; i < P.length - 1; i++) {
+    const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+    for (let k = 0; k < nPer; k++) {
+      const u = k / nPer, u2 = u * u, u3 = u2 * u;
+      out.push([0, 1].map((j) => 0.5 * ((2 * p1[j]) + (-p0[j] + p2[j]) * u + (2 * p0[j] - 5 * p1[j] + 4 * p2[j] - p3[j]) * u2 + (-p0[j] + 3 * p1[j] - 3 * p2[j] + p3[j]) * u3)));
+    }
+  }
+  out.push(P[P.length - 1].slice());
+  return out;
+}
+function penStroke(P, t0, t1, col, power, width, z) {
+  const pts = catmull(P, 24);
+  // arc length -> time, slower through the tight turns
+  const seg = [0];
+  for (let i = 1; i < pts.length; i++) {
+    const d = Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]);
+    let turn = 0;
+    if (i > 1) { const a = Math.atan2(pts[i][1] - pts[i - 1][1], pts[i][0] - pts[i - 1][0]), b2 = Math.atan2(pts[i - 1][1] - pts[i - 2][1], pts[i - 1][0] - pts[i - 2][0]); turn = Math.abs(((a - b2 + 9.42) % 6.283) - 3.14); }
+    seg.push(seg[i - 1] + d * (1 + turn * 6));
+  }
+  const tot = seg[seg.length - 1];
+  const W3 = [], T = [];
+  // a dwell at the start (bright dot), the stroke with a little hand tremor, a dwell at the end
+  const dwell = 0.06;
+  for (let i = 0; i < pts.length; i++) {
+    const u = seg[i] / tot;
+    const tr = 0.006 * Math.sin(i * 1.7) + 0.004 * Math.sin(i * 0.43 + 2);
+    const nx = i ? -(pts[i][1] - pts[i - 1][1]) : 0, ny = i ? pts[i][0] - pts[i - 1][0] : 0, nl = Math.hypot(nx, ny) || 1;
+    W3.push([pts[i][0] + nx / nl * tr, pts[i][1] + ny / nl * tr, z]);
+    T.push(lerp(t0 + dwell, t1 - dwell, u));
+  }
+  W3.unshift(W3[0].map((v, j) => v + (j === 0 ? 0.002 : 0))); T.unshift(t0);
+  W3.push(W3[W3.length - 1].map((v, j) => v + (j === 0 ? 0.002 : 0))); T.push(t1);
+  line(W3, T, col, power, width, null);
+}
+function buildPhoenix() {
+  const Z = 5.55, S = 1.35;                          // drawn in the plane where the painter stands; world +x = screen left
+  const H = (x, y) => [x * S * 0.9, 2.95 + (y - 2.95) * 0.86];
+  const cold = [0.55, 0.85, 1.0], cold2 = [0.75, 0.92, 1.0];
+  // neck rising from the top of the fire ring, S-curved, into the crested head with a hooked beak (facing screen left)
+  const neck = [[0.0, 2.96], [0.12, 3.18], [0.1, 3.42], [-0.04, 3.62], [-0.07, 3.84], [-0.02, 3.98],
+    [-0.16, 4.16], [-0.34, 4.34], [-0.24, 4.13], [-0.4, 4.22], [-0.2, 4.03],        // crest plumes
+    [0.02, 4.06], [0.17, 4.02], [0.36, 3.92], [0.3, 3.89], [0.16, 3.87], [0.06, 3.8], [0.04, 3.72]].map(([x, y]) => H(x, y));
+  penStroke(neck, 6.5, 7.06, cold, 13, 4.2, Z);
+  // the eye: a quick dab of light
+  penStroke([H(0.1, 3.95), H(0.11, 3.955)], 7.06, 7.13, cold2, 6, 4.0, Z);
+  // the pen is cupped while it travels down: only a faint ghost of the move remains
+  penStroke([H(0.11, 3.95), H(-0.55, 3.0), H(-0.3, 1.6), H(0.0, 1.14)], 7.13, 7.25, cold, 0.9, 2.2, Z);
+  // the long tail flung out low to screen right, ending in a spiral curl
+  const tail = [[0.0, 1.14], [-0.25, 0.82], [-0.75, 0.52], [-1.4, 0.36], [-2.05, 0.42], [-2.62, 0.7], [-2.95, 1.12], [-2.92, 1.52],
+    [-2.66, 1.7], [-2.4, 1.58], [-2.4, 1.34], [-2.6, 1.3]].map(([x, y]) => [x, y]);
+  penStroke(tail, 7.25, 7.92, cold, 15, 4.6, Z);
+  // a second, shorter plume beside it
+  penStroke([[-0.15, 1.02], [-0.7, 0.82], [-1.3, 0.76], [-1.8, 0.88], [-2.05, 1.12], [-1.92, 1.3], [-1.74, 1.2]], 7.6, 7.93, [0.45, 0.75, 1.0], 9, 3.4, Z);
+}
+
+/* ---------------- GL: trail programs ---------------- */
+const RIBV = `#version 300 es
+precision highp float;
+in vec3 aP; in float aTau; in vec3 aCol; in float aE; in float aV;
+uniform mat4 uVP; uniform float uT; uniform float uMirror;
+out vec3 vCol; out float vE; out float vV; out float vZ;
+void main(){
+  vec3 p = aP; if (uMirror > .5) p.y = -p.y;
+  vCol = aCol; vE = aTau <= uT ? aE : 0.; vV = aV;
+  gl_Position = aTau <= uT ? uVP*vec4(p, 1.) : vec4(2., 2., 2., 1.);
+  vZ = gl_Position.w;
+}`;
+const RIBF = `#version 300 es
+precision highp float;
+in vec3 vCol; in float vE; in float vV; in float vZ;
+uniform sampler2D uAux; uniform vec2 uRes; uniform float uMirror;
+out vec4 o;
+void main(){
+  if (uMirror < .5 && texture(uAux, gl_FragCoord.xy/uRes).g < vZ - .3) discard;
+  float leds = .9 + .1*sin(vV*3.14159);                            // diffused tube: smooth across its length
+  float edge = smoothstep(0., .04, vV)*smoothstep(1., .96, vV);
+  o = vec4(vCol*vE*leds*edge, 1.);
+}`;
+const LINV = `#version 300 es
+precision highp float;
+in vec3 aP0, aP1; in vec2 aTau; in vec3 aCol; in vec2 aEW;
+uniform mat4 uVP; uniform float uT; uniform vec2 uRes; uniform float uMirror;
+out vec3 vCol; out float vE; out float vV; out float vZ;
+void main(){
+  int c = gl_VertexID % 6;
+  float along = (c == 1 || c == 2 || c == 4) ? 1. : 0.;
+  float side = (c == 2 || c == 4 || c == 5) ? 1. : -1.;
+  vec3 p0 = aP0, p1 = aP1;
+  if (uMirror > .5) { p0.y = -p0.y; p1.y = -p1.y; }
+  float ok = step(aTau.x, uT);
+  float f = clamp((uT - aTau.x)/max(aTau.y - aTau.x, 1e-5), 0., 1.);
+  p1 = mix(p0, p1, f);
+  vec4 c0 = uVP*vec4(p0, 1.), c1 = uVP*vec4(p1, 1.);
+  vec2 s0 = c0.xy/c0.w*uRes*.5, s1 = c1.xy/c1.w*uRes*.5;
+  vec2 d = s1 - s0; float L = length(d); d = L > 1e-4 ? d/L : vec2(1., 0.);
+  vec2 nn = vec2(-d.y, d.x);
+  float w = aEW.y*uRes.x/1920. + 1.;
+  vec4 cc = along > .5 ? c1 : c0;
+  vec2 s = (along > .5 ? s1 + d*w*.5 : s0 - d*w*.5) + nn*side*w;
+  gl_Position = ok > .5 ? vec4(s/(uRes*.5)*cc.w, cc.z, cc.w) : vec4(2., 2., 2., 1.);
+  vCol = aCol; vE = aEW.x*ok; vV = side; vZ = cc.w;
+}`;
+const LINF = `#version 300 es
+precision highp float;
+in vec3 vCol; in float vE; in float vV; in float vZ;
+uniform sampler2D uAux; uniform vec2 uRes; uniform float uMirror;
+out vec4 o;
+void main(){
+  if (uMirror < .5 && texture(uAux, gl_FragCoord.xy/uRes).g < vZ - .3) discard;
+  float g = exp(-vV*vV*4.5);
+  o = vec4(vCol*vE*g, 1.);
+}`;
+function compile(vs, fs, attribs) {
+  const sh = (type, src) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) { console.error(gl.getShaderInfoLog(s)); throw gl.getShaderInfoLog(s); } return s; };
+  const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  attribs.forEach((a, i) => gl.bindAttribLocation(p, i, a));
+  gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw gl.getProgramInfoLog(p);
+  const loc = {}; const u = (n) => (loc[n] === undefined ? (loc[n] = gl.getUniformLocation(p, n)) : loc[n]);
+  return { p, u };
+}
+let pRib, pLin, vaoR, vaoL, nR, nL, bgFB, tMoon, tFire, tAux, trailT, reflT;
+const M4 = {
+  persp(fy, asp, n, f) { const t = 1 / Math.tan(fy / 2); return [t / asp, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, (2 * f * n) / (n - f), 0]; },
+  look(e, a, up) {
+    const z = nrm([e[0] - a[0], e[1] - a[1], e[2] - a[2]]), x = nrm(crs(up, z)), y = crs(z, x);
+    return [x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -(x[0] * e[0] + x[1] * e[1] + x[2] * e[2]), -(y[0] * e[0] + y[1] * e[1] + y[2] * e[2]), -(z[0] * e[0] + z[1] * e[1] + z[2] * e[2]), 1];
+  },
+  mul(a, b) { const o = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; },
+};
+const HD = `#version 300 es
+precision highp float; in vec2 uv; out vec4 o;
+`;
+function setupGL() {
+  // background MRT
+  const mk = () => G.texture(W, H, { float: true });
+  tMoon = mk(); tFire = mk(); tAux = mk();
+  bgFB = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, bgFB);
+  [tMoon, tFire, tAux].forEach((t, i) => gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, t.tex, 0));
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2]);
+  const bg = G.program(BGF.replace('precision highp float; in vec2 uv; layout', 'precision highp float; in vec2 uv; layout'));
+  const fy = CAM.fovy;
+  bg.use().set('uCP', CAM.p).set('uCF', CB.f).set('uCR', CB.r).set('uCU', CB.u).set('uTan', Math.tan(fy / 2)).set('uAsp', W / H).set('uFireP', WOOL.c);
+  gl.enable(gl.SCISSOR_TEST);
+  for (let b = 0; b < 12; b++) { gl.scissor(0, Math.floor(b * H / 12), W, Math.ceil(H / 12) + 1); bg.draw({ fb: bgFB, w: W, h: H }); gl.finish(); }
+  gl.disable(gl.SCISSOR_TEST);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  // trails
+  pRib = compile(RIBV, RIBF, ['aP', 'aTau', 'aCol', 'aE', 'aV']);
+  pLin = compile(LINV, LINF, ['aP0', 'aP1', 'aTau', 'aCol', 'aEW']);
+  vaoR = gl.createVertexArray(); gl.bindVertexArray(vaoR);
+  const bR = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bR); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(RIB), gl.STATIC_DRAW);
+  let off = 0; [3, 1, 3, 1, 1].forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, 9 * 4, off * 4); off += n; });
+  nR = RIB.length / 9;
+  vaoL = gl.createVertexArray(); gl.bindVertexArray(vaoL);
+  // expand segments to 6 vertices each
+  const NSEG = LIN.length / 13, data = new Float32Array(NSEG * 6 * 13);
+  for (let s = 0; s < NSEG; s++) for (let k = 0; k < 6; k++) data.set(LIN.slice(s * 13, s * 13 + 13), (s * 6 + k) * 13);
+  const bL = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bL); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW);
+  off = 0; [3, 3, 2, 3, 2].forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, 13 * 4, off * 4); off += n; });
+  nL = NSEG * 6;
+  gl.bindVertexArray(null);
+  trailT = G.target(W, H, { float: true }); reflT = G.target(W / 2 | 0, H / 2 | 0, { float: true });
+}
+const dw = W / 4 | 0, dh = H / 4 | 0;
+const BA = G.target(dw, dh, { float: true }), BB = G.target(dw, dh, { float: true }), BA2 = G.target(dw / 2 | 0, dh / 2 | 0, { float: true }), BB2 = G.target(dw / 2 | 0, dh / 2 | 0, { float: true });
+const sceneT = G.target(W, H, { float: true });
+const compScene = G.program(HD + `
+uniform sampler2D uMoon, uFire, uAux, uTrail, uRefl; uniform vec2 uRes;
+uniform float uExpo, uEW, uEF, uGhost; uniform vec3 uWC, uFC;
+uniform vec3 uCP, uCF, uCR, uCU; uniform float uTan, uAsp; uniform float uDbg;
+float sdCap(vec2 p, vec2 a, vec2 b, float r){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba)/dot(ba, ba), 0., 1.); return length(pa - ba*h) - r; }
+float smin2(float a, float b, float k){ float h = clamp(.5 + .5*(b - a)/k, 0., 1.); return mix(b, a, h) - k*h*(1. - h); }
+// the spinner, seen from the front (x = world +x = screen left, y up): soft organic silhouette, right arm raised to the spin
+float person(vec2 q){            // stands ~0.8 m behind the ring plane, a little off centre; the raised arm reaches up to the spin
+  float head = (length((q - vec2(.0, 1.64))/vec2(.108, .13)) - 1.)*.11;
+  float neck = sdCap(q, vec2(0., 1.55), vec2(0., 1.41), .07);
+  float sh = sdCap(q, vec2(-.2, 1.37), vec2(.2, 1.37), .08);
+  float chest = sdCap(q, vec2(0., 1.3), vec2(0., 1.07), .16);
+  float waist = sdCap(q, vec2(0., 1.07), vec2(0., .9), .13);
+  float legA = sdCap(q, vec2(.07, .87), vec2(.11, .47), .078), legA2 = sdCap(q, vec2(.11, .47), vec2(.13, .06), .06);
+  float legB = sdCap(q, vec2(-.07, .87), vec2(-.12, .47), .078), legB2 = sdCap(q, vec2(-.12, .47), vec2(-.17, .06), .06);
+  float armU = sdCap(q, vec2(-.2, 1.4), vec2(-.36, 1.74), .055), armF = sdCap(q, vec2(-.36, 1.74), vec2(-.07, 2.1), .046);
+  float hand = length(q - vec2(-.04, 2.13)) - .05;
+  float arm2 = sdCap(q, vec2(.2, 1.37), vec2(.24, 1.1), .052), arm2f = sdCap(q, vec2(.24, 1.1), vec2(.2, .9), .046);
+  float d = smin2(head, neck, .07);
+  d = smin2(d, sh, .1); d = smin2(d, chest, .08); d = smin2(d, waist, .08);
+  d = smin2(d, min(legA, legA2), .05); d = smin2(d, min(legB, legB2), .05);
+  d = smin2(d, armU, .05); d = smin2(d, armF, .04); d = smin2(d, hand, .03);
+  d = smin2(d, arm2, .07); d = smin2(d, arm2f, .07);
+  return d;
+}
+void main(){
+  vec4 aux = texture(uAux, uv);
+  vec3 col = texture(uMoon, uv).rgb*uExpo + texture(uFire, uv).rgb*(uWC*uEW + uFC*uEF);
+  // the painter: a ghost, half there — lit orange from the front while the wool burns
+  vec2 p = uv*2. - 1.;
+  vec3 rd = normalize(uCF + uCR*p.x*uTan*uAsp + uCU*p.y*uTan);
+  float tz = (6.4 - uCP.z)/rd.z; vec3 P = uCP + rd*tz;
+  // smeared over the exposure (the spinner sways a little as they turn): soft, semi-transparent,
+  // lit warm from the fire in front and burning brighter along the edges
+  float body = 0., bodyUp = 0.;
+  for (int i=0;i<3;i++){
+    float fi = float(i) - 1.; float o = fi*.03, rz = fi*.02, w = i == 1 ? .44 : .28;
+    vec2 q = P.xy - vec2(o, 0.); q = vec2(q.x*cos(rz) - (q.y - 1.)*sin(rz), q.x*sin(rz) + (q.y - 1.)*cos(rz) + 1.);
+    body += (1. - smoothstep(-.028, .028, person(q)))*w;
+    bodyUp += (1. - smoothstep(-.028, .028, person(q - vec2(.01, .05))))*w;
+  }
+  float rim = clamp(body*(1. - body)*4., 0., 1.);
+  float topRim = clamp((body - bodyUp)*2.2, 0., 1.);                    // edges facing up to the fire burn brightest
+  float vis = step(tz, aux.g + .2)*clamp(uGhost, 0., 1.);
+  float front = .35 + .65*smoothstep(.9, 1.8, P.y);                    // the fire is above and in front: head and shoulders catch most
+  // a ghost: the spinner moved through the exposure, so only ~40 % of them is on the sensor, front-lit by the fire
+  col = mix(col, col*.45 + uFC*(.06 + .08*front), body*vis*.4);
+  col += uFC*vis*(rim*.04 + topRim*(.12 + .24*front));
+  // light trails
+  col += texture(uTrail, uv).rgb;
+  // wet paving reflects them, streaked vertically
+  if (aux.r > 0.) {
+    vec3 rf = vec3(0.); float wsum = 0.;
+    for (int i=-3;i<=3;i++){ float wt = exp(-float(i*i)*.12); rf += texture(uRefl, uv + vec2(0., float(i)*3.5/uRes.y)).rgb*wt; wsum += wt; }
+    rf /= wsum;
+    float fres = .25 + .75*pow(1. - abs(rd.y), 5.);
+    col += rf.rgb*aux.r*fres*.85;
+  }
+  if (uDbg > .5) col = uDbg < 1.5 ? texture(uMoon, uv).rgb*4. : texture(uFire, uv).rgb;
+  o = vec4(col, 1.);
+}`);
+const brightP = G.program(HD + `uniform sampler2D s; uniform vec2 px; uniform float th;
+void main(){ vec3 c = vec3(0.); for (int i=-1;i<=1;i++) for (int j=-1;j<=1;j++) c += texture(s, uv + vec2(i, j)*px).rgb; c /= 9.;
+  float l = max(c.r, max(c.g, c.b)); o = vec4(c*smoothstep(th, th*2., l)/max(l, 1e-3)*min(l, 30.), 1.); }`);
+const blurP = G.program(HD + `uniform sampler2D s; uniform vec2 dir;
+void main(){ vec3 c = texture(s, uv).rgb*.227;
+  c += (texture(s, uv + dir*1.3846).rgb + texture(s, uv - dir*1.3846).rgb)*.3162; c += (texture(s, uv + dir*3.2308).rgb + texture(s, uv - dir*3.2308).rgb)*.0703; o = vec4(c, 1.); }`);
+const finalP = G.program(HD + `uniform sampler2D s, b1, b2; uniform float frame, dip; uniform vec2 res;
+float h12(vec2 p){ vec3 p3 = fract(vec3(p.xyx)*.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y)*p3.z); }
+vec3 aces(vec3 x){ return clamp((x*(2.51*x + .03))/(x*(2.43*x + .59) + .14), 0., 1.); }
+void main(){
+  vec2 d = uv - .5; float k = 1.2/res.x;
+  vec3 c = vec3(texture(s, uv - d*k*2.).r, texture(s, uv).g, texture(s, uv + d*k*2.).b);
+  vec3 bl = texture(b1, uv).rgb*.55 + texture(b2, uv).rgb*.9;
+  c += bl*.55;
+  c = aces(c*1.1*dip);
+  c = pow(c, vec3(1./2.2));
+  c *= 1. - .3*smoothstep(.4, 1.05, length(d*vec2(1.3, 1.)));
+  float l = dot(c, vec3(.2126, .7152, .0722));
+  c += (h12(gl_FragCoord.xy + frame*13.7) - .5)*mix(.05, .02, l) + (h12(gl_FragCoord.xy*.5 + 3.) - .5)*.01;   // sensor noise, stronger in the shadows
+  o = vec4(clamp(c, 0., 1.), 1.);
+}`);
+
+let cumW = [], cumF = [];
+const DUR = 10;
+Reel.scene({
+  duration: DUR, fps: 30,
+  cues: [
+    { t: 0.0, sfx: 'shutter_open', gain: 0.8 },
+    ...[0.0, 0.5, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.625].map((t, k) => ({ t, sfx: k > 11 ? 'tube_flick' : 'tube_swoosh', gain: 0.4, pan: k % 2 ? -0.4 : 0.4 })),
+    { t: 3.875, sfx: 'wool_ignite', gain: 0.8 },
+    { t: 4.0, sfx: 'wool_spin', gain: 0.95 },
+    { t: 6.5, sfx: 'pen_click', gain: 0.6 },
+    { t: 6.5, sfx: 'pen_write', gain: 0.5 },
+    { t: 8.0, sfx: 'shutter_close', gain: 0.9 },
+  ],
+  async setup() {
+    buildWings(); buildWool(); buildPhoenix();
+    // cumulative light energy for the street illumination
+    let a = 0, b = 0; for (let i = 0; i <= 1000; i++) { a += EW[i]; b += EF[i]; cumW.push(a); cumF.push(b); }
+    setupGL();
+  },
+  render(tReal) {
+    // the shutter closes on 8.0: from then on nothing more is recorded — we are looking at the photograph
+    const t = Math.min(tReal, TEND);
+    const k = Math.min(1000, Math.max(0, Math.floor(t * 100)));
+    // tripod-locked during the exposure; only once it is a photo do we lean in (2 %), then hold
+    const push = 1 + 0.02 * E.inOutSine(clamp((tReal - 8.1) / 0.8));
+    const dip = tReal >= TEND && tReal < TEND + 2 / 30 ? 0.97 : 1;      // mirror slap: a 2-frame dip
+    const fy = 2 * Math.atan(Math.tan(CAM.fovy / 2) / push);
+    const jit = Reel.jit || [0, 0];
+    const P = M4.persp(fy, W / H, 0.1, 200); P[8] -= 2 * jit[0] / W; P[9] += 2 * jit[1] / H;
+    const V = M4.look(CAM.p, [CAM.p[0] + CB.f[0], CAM.p[1] + CB.f[1], CAM.p[2] + CB.f[2]], [0, 1, 0]);
+    const VP = M4.mul(P, V);
+    // 1. trails (additive HDR)
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.disable(gl.DEPTH_TEST);
+    for (const [tgt, mir] of [[trailT, 0], [reflT, 1]]) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, tgt.fb); gl.viewport(0, 0, tgt.w, tgt.h);
+      gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+      for (const [pr, vao, n] of [[pRib, vaoR, nR], [pLin, vaoL, nL]]) {
+        gl.useProgram(pr.p); gl.bindVertexArray(vao);
+        gl.uniformMatrix4fv(pr.u('uVP'), false, VP); gl.uniform1f(pr.u('uT'), t); gl.uniform1f(pr.u('uMirror'), mir);
+        gl.uniform2f(pr.u('uRes'), tgt.w, tgt.h);
+        gl.activeTexture(gl.TEXTURE4); gl.bindTexture(gl.TEXTURE_2D, tAux.tex); gl.uniform1i(pr.u('uAux'), 4);
+        gl.drawArrays(gl.TRIANGLES, 0, n);
+      }
+    }
+    gl.bindVertexArray(null); gl.disable(gl.BLEND); gl.activeTexture(gl.TEXTURE0);
+    // 2. composite the exposure
+    const eW = cumW[k] * 0.06, eF = cumF[k] * 0.12;
+    const ghost = clamp((t - 4.1) / 1.2) * (1 - 0.35 * clamp((t - 6.8) / 2));
+    compScene.use().set('uMoon', { tex: tMoon.tex, unit: 0 }).set('uFire', { tex: tFire.tex, unit: 1 }).set('uAux', { tex: tAux.tex, unit: 2 })
+      .set('uTrail', { tex: trailT.tex, unit: 3 }).set('uRefl', { tex: reflT.tex, unit: 5 }).set('uRes', [W, H])
+      .set('uExpo', (0.6 + 0.5 * clamp(t / 10)) * dip).set('uEW', eW).set('uEF', eF).set('uGhost', ghost)
+      .set('uWC', [0.9, 0.45, 0.7]).set('uFC', [1.0, 0.45, 0.14])
+      .set('uCP', CAM.p).set('uCF', CB.f).set('uCR', CB.r).set('uCU', CB.u).set('uTan', Math.tan(fy / 2)).set('uAsp', W / H).set('uDbg', DBG)
+      .draw(sceneT);
+    brightP.use().set('s', { tex: sceneT.tex, unit: 0 }).set('px', [1 / W, 1 / H]).set('th', 0.9).draw(BA);
+    blurP.use().set('s', { tex: BA.tex, unit: 0 }).set('dir', [1 / dw, 0]).draw(BB);
+    blurP.use().set('s', { tex: BB.tex, unit: 0 }).set('dir', [0, 1 / dh]).draw(BA);
+    blurP.use().set('s', { tex: BA.tex, unit: 0 }).set('dir', [2 / dw, 0]).draw(BB2);
+    blurP.use().set('s', { tex: BB2.tex, unit: 0 }).set('dir', [0, 2 / dh]).draw(BA2);
+    blurP.use().set('s', { tex: BA2.tex, unit: 0 }).set('dir', [3 / dw, 0]).draw(BB2);
+    blurP.use().set('s', { tex: BB2.tex, unit: 0 }).set('dir', [0, 3 / dh]).draw(BA2);
+    finalP.use().set('s', { tex: sceneT.tex, unit: 0 }).set('b1', { tex: BA.tex, unit: 1 }).set('b2', { tex: BA2.tex, unit: 2 })
+      .set('frame', Math.floor(t * 30)).set('res', [W, H]).set('dip', dip).draw(null);
+    gl.finish();
+  },
+});
+</script></body></html>

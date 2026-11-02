@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>35 字符画 · ASCII Art</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 35 字符画 · ASCII Art =====
+   Real world: an amber monochrome CRT terminal on a desk in a dark room. Beige plastic casing, curved glass that
+   reflects a far window, P3 amber phosphor with afterglow, 12 raster lines per character row.
+   0.3s power-on (dot -> line -> raster). Characters rain down and lock into a rotating ASCII Earth.
+   4s (hook): the camera dives into the glass until single characters fill the frame — every one is a real glyph,
+   drawn line by line by the beam. Pull back; the globe rains away; the command line types the title, which prints
+   as FIGlet-style banners. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#000');
+Reel.ownJitter = true;
+const C = Reel.cfg({ cmd: 'type world.txt' });
+const COLS = 96, ROWS = 36;
+
+/* ---------------- glyph atlas (16 x 8 slots, 48 x 96 px) ---------------- */
+const GW = 48, GH = 96;
+const atlas = Object.assign(document.createElement('canvas'), { width: GW * 16, height: GH * 8 });
+const CJK = {};       // char -> left slot index
+function buildAtlas() {
+  const g = atlas.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, atlas.width, atlas.height);
+  g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'alphabetic';
+  g.font = '700 78px "DejaVu Sans Mono"';
+  const slot = (i) => [(i % 16) * GW, Math.floor(i / 16) * GH];
+  for (let c = 33; c < 127; c++) { const [x, y] = slot(c - 32); g.fillText(String.fromCharCode(c), x + GW / 2, y + 70); }
+  // block shades
+  [[95, 1], [96, 0.72], [97, 0.48], [98, 0.24]].forEach(([i, a]) => { const [x, y] = slot(i); g.globalAlpha = a; g.fillRect(x + 2, y + 6, GW - 4, GH - 12); g.globalAlpha = 1; });
+  // double-width CJK glyphs (left/right halves in adjacent slots)
+  let k = 100;
+  for (const ch of []) {
+    const [x, y] = slot(k); g.font = '700 84px "Noto Sans CJK SC"'; g.fillText(ch, x + GW, y + 76); CJK[ch] = k; k += 2;
+  }
+}
+const ASC = (ch) => { const c = ch.charCodeAt(0); return c >= 32 && c < 127 ? c - 32 : 0; };
+
+/* ---------------- world map (very rough continents, equirectangular) ---------------- */
+const MAPW = 180, MAPH = 90;
+let landMap;
+function buildMap() {
+  const cv = Object.assign(document.createElement('canvas'), { width: MAPW, height: MAPH });
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, MAPW, MAPH); g.fillStyle = '#fff';
+  const X = (lon) => (lon + 180) / 360 * MAPW, Y = (lat) => (90 - lat) / 180 * MAPH;
+  const polys = [
+    [[-168, 65], [-140, 70], [-110, 72], [-80, 72], [-62, 60], [-55, 50], [-66, 44], [-76, 35], [-81, 26], [-90, 29], [-97, 21], [-105, 21], [-115, 31], [-124, 40], [-125, 49], [-137, 58], [-152, 59], [-165, 61]],
+    [[-97, 21], [-91, 16], [-84, 10], [-78, 8], [-84, 14], [-91, 18]],
+    [[-80, 10], [-62, 11], [-50, 0], [-35, -6], [-40, -22], [-57, -37], [-67, -55], [-74, -50], [-72, -32], [-81, -5]],
+    [[-55, 60], [-44, 60], [-20, 70], [-24, 82], [-60, 82], [-72, 77]],
+    [[-10, 36], [-1, 43], [-4, 48], [3, 51], [9, 55], [5, 62], [15, 70], [30, 71], [42, 67], [47, 55], [32, 46], [26, 37], [16, 38], [11, 44], [3, 43]],
+    [[-17, 21], [-10, 31], [10, 37], [32, 31], [43, 12], [51, 12], [41, -4], [40, -15], [34, -26], [20, -35], [15, -28], [10, -5], [6, 5], [-9, 5], [-17, 14]],
+    [[30, 45], [40, 67], [70, 74], [100, 78], [140, 73], [180, 69], [172, 61], [157, 51], [141, 41], [122, 31], [120, 22], [108, 20], [105, 9], [100, 2], [96, 16], [91, 22], [81, 15], [77, 8], [72, 21], [61, 25], [52, 28], [44, 13], [35, 29], [28, 37], [30, 42]],
+    [[95, 5], [106, -7], [121, -9], [141, -6], [131, 1], [118, 6]],
+    [[114, -22], [130, -12], [142, -11], [153, -25], [150, -38], [140, -38], [130, -32], [115, -35]],
+    [[130, 31], [140, 35], [143, 44], [139, 40]],
+    [[-6, 50], [2, 51], [-2, 58], [-6, 56]],
+    [[44, -13], [50, -15], [47, -25], [43, -22]],
+    [[166, -46], [174, -36], [178, -40], [168, -47]],
+  ];
+  for (const pl of polys) { g.beginPath(); pl.forEach(([lo, la], i) => (i ? g.lineTo(X(lo), Y(la)) : g.moveTo(X(lo), Y(la)))); g.closePath(); g.fill(); }
+  g.fillRect(0, Y(-70), MAPW, MAPH);   // Antarctica
+  const d = g.getImageData(0, 0, MAPW, MAPH).data; landMap = new Float32Array(MAPW * MAPH);
+  for (let i = 0; i < MAPW * MAPH; i++) landMap[i] = d[i * 4] / 255;
+}
+const land = (lon, lat) => { const x = ((lon / (2 * Math.PI) + 0.5) % 1 + 1) % 1 * MAPW, y = clamp((0.5 - lat / Math.PI)) * (MAPH - 1); return landMap[Math.floor(y) * MAPW + Math.floor(x) % MAPW]; };
+
+/* ---------------- banners: text rasterised onto the character grid ---------------- */
+const RAMP = ' .:-=+*#%@';
+let BANNERS = [];
+function banner(text, font, row0, rows, sub = 8) {
+  const W = COLS * sub, H = rows * sub * 2;
+  const cv = Object.assign(document.createElement('canvas'), { width: W, height: H });
+  const g = cv.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#000'; g.fillRect(0, 0, W, H); g.fillStyle = '#fff'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.font = font; g.fillText(text, W / 2, H / 2 + H * 0.04);
+  const d = g.getImageData(0, 0, W, H).data, cells = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < COLS; c++) {
+    let s = 0; for (let y = 0; y < sub * 2; y++) for (let x = 0; x < sub; x++) s += d[((r * sub * 2 + y) * W + c * sub + x) * 4];
+    const cov = s / (sub * sub * 2 * 255);
+    if (cov > 0.06) cells.push([r + row0, c, RAMP[Math.min(9, Math.round(cov * 9.4))]]);
+  }
+  return cells;
+}
+
+/* ---------------- the screen state at time t ---------------- */
+const glyph = new Uint8Array(COLS * ROWS), bright = new Float32Array(COLS * ROWS);
+const R = Reel.rng(35);
+const COLDROP = Array.from({ length: COLS }, () => { const t0 = 0.5 + R() * 0.75, sp = 24 + R() * 22;
+  return { t0, sp, drops: [[t0, sp, 6 + Math.floor(R() * 9)], [t0 + 0.7 + R() * 0.5, 26 + R() * 20, 5 + Math.floor(R() * 8)], [t0 + 1.5 + R() * 0.6, 28 + R() * 20, 4 + Math.floor(R() * 6)]] }; });
+const hsh = (a, b) => { const s = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return s - Math.floor(s); };
+const RAINCH = '0123456789ABCDEF<>/\\|=+*#%@$&?;:.';
+function gsample(c, r, t) {
+  const cx = (c + 0.5 - COLS / 2) / (COLS * 0.31), cy = -(r + 0.5 - ROWS / 2 - 0.3) / (ROWS * 0.42);
+  const d2 = cx * cx + cy * cy; if (d2 >= 1) return { out: true, d2, cx, cy };
+  const z = Math.sqrt(1 - d2);
+  const tl = 0.4, ct = Math.cos(tl), st = Math.sin(tl);
+  const y2 = cy * ct - z * st, z2 = cy * st + z * ct;
+  const lat = Math.asin(clamp(y2, -1, 1)), lon = Math.atan2(cx, z2) + t * 0.55 - 1.2;
+  const L = [-0.55, 0.45, 0.7], ln = Math.hypot(...L);
+  const dif = Math.max(0, (cx * L[0] + cy * L[1] + z * L[2]) / ln);
+  return { out: false, d2, cx, cy, z, land: land(lon, lat) > 0.5, lit: 0.16 + 0.84 * dif, spec: Math.pow(Math.max(0, z * 0.5 + dif * 0.5), 12) };
+}
+const RAMP_L = ':-=+*#%@', RAMP_O = ' .,-~';
+function edgeChar(gx, gy) {        // gradient points towards the land / the inside; the drawn edge runs across it
+  if (gx && !gy) return '|';
+  if (gy && !gx) return gy > 0 ? '_' : '-';
+  return gx * gy > 0 ? '/' : '\\';
+}
+function globeCell(c, r, t) {
+  const g = gsample(c, r, t);
+  if (g.out) {
+    if (g.d2 > 1.13) return null;
+    // the limb: a ring of direction strokes just outside the sphere
+    const nx = Math.round(-g.cx / Math.sqrt(g.d2) * 1.4), ny = Math.round(g.cy / Math.sqrt(g.d2) * 1.4);
+    return { ch: edgeChar(clamp(nx, -1, 1), clamp(ny, -1, 1)), b: 0.22 + 0.25 * (1.13 - g.d2) / 0.13 };
+  }
+  const nb = [gsample(c - 1, r, t), gsample(c + 1, r, t), gsample(c, r - 1, t), gsample(c, r + 1, t)];
+  const isL = (q) => (q.out ? 0 : q.land ? 1 : 0);
+  if (g.land) {
+    const gx = isL(nb[1]) - isL(nb[0]), gy = isL(nb[3]) - isL(nb[2]);
+    if (gx || gy) return { ch: edgeChar(gx, gy), b: 0.75 + 0.3 * g.lit };          // coastline
+    const k = Math.min(7, Math.floor(g.lit * 8.2)); return { ch: RAMP_L[k], b: 0.5 + 0.5 * g.lit };
+  }
+  const k = Math.min(4, Math.floor(g.lit * 4.4 + g.spec * 2)); return { ch: RAMP_O[k], b: 0.3 + 0.45 * g.lit + g.spec * 0.6 };
+}
+// the unrolled globe: a 72 x 22 ASCII world map
+const MAPC = 72, MAPR = 22, MAP_C0 = 12, MAP_R0 = 6;
+let WORLD = null;
+function buildWorld() {
+  const L = (mc, mr) => (mc < 0 || mc >= MAPC || mr < 0 || mr >= MAPR) ? 0 : land(-Math.PI + (mc + 0.5) / MAPC * 2 * Math.PI, (0.5 - (mr + 0.5) / MAPR) * Math.PI * 0.76 + 0.06) > 0.5 ? 1 : 0;
+  WORLD = [];
+  for (let mr = 0; mr < MAPR; mr++) { const row = [];
+    for (let mc = 0; mc < MAPC; mc++) {
+      let ch = ' ', b = 0;
+      if (L(mc, mr)) {
+        const gx = L(mc + 1, mr) - L(mc - 1, mr), gy = L(mc, mr + 1) - L(mc, mr - 1);
+        if (gx || gy) { ch = edgeChar(gx, gy); b = 1.0; }
+        else { ch = '#%@'[Math.floor(hsh(mc, mr) * 3)]; b = 0.85; }
+      } else if ((mc + mr * 2) % 4 === 0) { ch = hsh(mc * 3, mr) > 0.8 ? '~' : '.'; b = 0.38; }
+      row.push([ch, b]);
+    }
+    WORLD.push(row);
+  }
+}
+function put(r, c, ch, b) {
+  if (r < 0 || r >= ROWS || c < 0 || c >= COLS) return; const i = r * COLS + c;
+  const code = ch.charCodeAt(0);
+  if (code > 255 && CJK[ch] !== undefined) { glyph[i] = CJK[ch]; bright[i] = b; if (c + 1 < COLS) { glyph[i + 1] = CJK[ch] + 1; bright[i + 1] = b; } }
+  else { glyph[i] = ASC(ch); bright[i] = b; }
+}
+function putStr(r, c, s, b, n = 1e9) { let k = 0; for (const ch of s) { if (k >= n) break; put(r, c, ch, b); c += ch.charCodeAt(0) > 255 ? 2 : 1; k++; } return c; }
+const T_TERM = 6.5;
+function screen(t) {
+  glyph.fill(0); bright.fill(0);
+  if (t < 0.5) return;
+  if (t < 6.0) {
+    for (let c = 0; c < COLS; c++) {
+      const d = COLDROP[c];
+      for (let r = 0; r < ROWS; r++) {
+        // the globe locks in once the first drop has passed this cell
+        const gc = globeCell(c, r, t);
+        if (gc && t > 2.0 + r / ROWS * 0.42 + hsh(c, r) * 0.05) { put(r, c, gc.ch, gc.b); continue; }
+        let b = 0;
+        for (const [t0, sp, len] of d.drops) { const dh = (t - t0) * sp - r; if (dh >= 0 && dh < len) b = Math.max(b, dh < 1 ? 1.15 : 0.85 * (1 - dh / len)); }
+        if (b > 0) put(r, c, RAINCH[Math.floor(hsh(c * 7 + r, Math.floor(t * 14)) * RAINCH.length)], b);
+      }
+    }
+    return;
+  }
+  if (t < T_TERM) {
+    // the globe rains away: every character falls from where it was, the bottom first
+    for (let c = 0; c < COLS; c++) for (let r0 = 0; r0 < ROWS; r0++) {
+      const ft = 6.0 + hsh(c, 3) * 0.18 + r0 * 0.009;
+      const gc = globeCell(c, r0, Math.min(t, ft)); if (!gc) continue;
+      if (t < ft) { put(r0, c, gc.ch, gc.b); continue; }
+      const y = r0 + 0.5 * 150 * (t - ft) * (t - ft);
+      if (y < ROWS) put(Math.round(y), c, gc.ch, gc.b * 0.95);
+    }
+    return;
+  }
+  // terminal: prompt, a command typed at human speed (32nds, a half-beat pause), Enter on 7.5,
+  // the map prints row by row 7.5 -> 8.0, then a fresh prompt with the cursor blinking on the beat
+  const R0 = 3, C0 = MAP_C0;
+  const cmd = C.cmd;
+  let cEnd = putStr(R0, C0, 'C:\\>', 1);
+  cEnd += 1;
+  let n = 0;
+  for (let i = 0; i < cmd.length; i++) if (t >= KEYT[i]) n = i + 1;
+  cEnd = putStr(R0, cEnd, cmd, 1, n);
+  const blink = (t0) => Math.floor((t - t0) * 2 + 1e-6) % 2 === 0;
+  if (t < 7.5 && (n < cmd.length || blink(6.5))) put(R0, cEnd, '_', 1);
+  if (t >= 7.5) {
+    for (let mr = 0; mr < MAPR; mr++) { if (t < 7.5 + (mr + 1) * 0.5 / MAPR) break;
+      const row = WORLD[mr]; for (let mc = 0; mc < MAPC; mc++) if (row[mc][1] > 0) put(MAP_R0 + mr, MAP_C0 + mc, row[mc][0], row[mc][1]); }
+  }
+  if (t >= 8.0) { const c2 = putStr(MAP_R0 + MAPR + 2, C0, 'C:\\>', 1); if (blink(8.0)) put(MAP_R0 + MAPR + 2, c2 + 1, '_', 1); }
+}
+// keystroke times: "type" in 32nds from 6.625, a half-beat pause, "world.txt" 7.0 -> 7.44, Enter on 7.5
+const KEYT = (() => { const k = []; for (let i = 0; i < 4; i++) k.push(6.625 + i * 0.0625); k.push(6.875); for (let i = 0; i < 9; i++) k.push(7.0 + i * 0.0556); return k; })();
+// two buffers: (glyph, bright) x 4 layers — now, 0.033 s, 0.07 s and 0.12 s ago (phosphor afterglow)
+const BUF = new Uint8Array(COLS * ROWS * 4), BUF2 = new Uint8Array(COLS * ROWS * 4);
+let MEANB = 0;
+function fillBuf(t) {
+  const lay = [[0, BUF, 0], [0.033, BUF, 2], [0.07, BUF2, 0], [0.12, BUF2, 2]];
+  let mean = 0;
+  for (const [dt, B, o] of lay) {
+    screen(Math.max(0, t - dt));
+    let m = 0;
+    for (let i = 0; i < COLS * ROWS; i++) { B[i * 4 + o] = glyph[i]; B[i * 4 + o + 1] = Math.round(clamp(bright[i] / 1.2) * 255); m += bright[i]; }
+    mean += m / (COLS * ROWS) * (dt === 0 ? 0.5 : dt < 0.05 ? 0.3 : 0.1);
+  }
+  MEANB = mean;
+}
+
+/* ---------------- renderer ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.55, th: 0.95, expo: 1.0, vig: 0.45, grain: 0.035, ca: 0.7, contrast: 1.05, sat: 1.0, bands: 4,
+  uniforms: `
+uniform sampler2D uAtlas; uniform highp sampler2D uBuf, uBuf2; uniform float uDist, uBump;
+uniform vec3 uRo, uTa; uniform float uFL;
+uniform vec4 uPow;        // power-on phase, overall raster brightness, screen light, flicker`,
+  scene: `
+const vec3 AMBER = vec3(1., .58, .12);
+const vec2 OPEN = vec2(.5, .385); const float OY = .03;
+const vec2 RAST = vec2(.455, .34);
+float sdCase(vec3 p){
+  float body = sdRoundBox(p - vec3(0., 0., -.42), vec3(.64, .52, .5), .07);
+  float back = sdRoundBox(p - vec3(0., .02, -1.02), vec3(.46, .4, .3), .12);
+  float d = smin(body, back, .1);
+  float hole = sdRoundBox(p - vec3(0., OY, .12), vec3(OPEN + .035, .2), .05);
+  d = smax(d, -hole, .035);
+  float foot = sdRoundBox(p - vec3(0., -.56, -.4), vec3(.36, .05, .32), .03);
+  return min(d, foot);
+}
+float mapS(vec3 p){ return min(sdCase(p), p.y + .61); }
+vec3 nrmS(vec3 p){ vec2 e = vec2(.0008, 0.); return normalize(vec3(mapS(p + e.xyy) - mapS(p - e.xyy), mapS(p + e.yxy) - mapS(p - e.yxy), mapS(p + e.yyx) - mapS(p - e.yyx))); }
+vec3 env(vec3 r){
+  vec3 c = vec3(.004, .004, .005);
+  // a far window, cool moonlight, behind the camera to the left
+  vec3 wc = normalize(vec3(-.8, .55, .5)); float cz = dot(r, wc);
+  if (cz > 0.) { vec3 u = normalize(cross(vec3(0., 1., 0.), wc)), v = cross(wc, u); vec2 q = vec2(dot(r, u), dot(r, v)) / cz;
+    vec2 e = smoothstep(vec2(.22, .3) + .04, vec2(.22, .3) - .04, abs(q));
+    float bars = smoothstep(.006, .014, abs(q.x)) * smoothstep(.006, .014, abs(q.y - .05));
+    c += vec3(.55, .65, .85) * .34 * e.x * e.y * bars; }
+  return c;
+}
+// the phosphor image at raster coordinates (s in [0,1]^2, origin top-left)
+vec3 phosphor(vec2 s, vec2 ds){
+  vec2 g = s * vec2(${COLS}., ${ROWS}.);
+  vec2 cell = floor(g), f = fract(g);
+  if (any(lessThan(cell, vec2(0.))) || any(greaterThanEqual(cell, vec2(${COLS}., ${ROWS}.)))) return vec3(0.);
+  vec4 B = texelFetch(uBuf, ivec2(cell), 0), B2 = texelFetch(uBuf2, ivec2(cell), 0);
+  float edgeD = dot(s - .5, s - .5) * 4.;                    // 0 centre .. ~2 corners: the beam defocuses at the edges
+  // 12 raster lines per character row: the beam draws the glyph line by line
+  float lines = 12.;
+  float li = floor(f.y * lines), lf = fract(f.y * lines);
+  float fy = (li + .5) / lines;
+  float px = length(ds * vec2(${ROWS}. * lines, 0.)) ;
+  float lineFoot = abs(ds.y) * ${ROWS}. * lines;      // raster lines per screen pixel
+  vec2 dg = ds * vec2(${COLS}., ${ROWS}.) / vec2(16., 8.);
+  vec3 col = vec3(0.);
+  for (int k = 0; k < 4; k++) {
+    vec2 gb = k == 0 ? B.rg : k == 1 ? B.ba : k == 2 ? B2.rg : B2.ba;
+    float gi = floor(gb.x * 255. + .5), br = gb.y * 1.2;
+    float wk = k == 0 ? 1. : k == 1 ? .45 : k == 2 ? .25 : .12;
+    if (br < .004) continue;
+    vec2 slot = vec2(mod(gi, 16.), floor(gi / 16.));
+    vec2 auv = (slot + vec2(f.x, fy)) / vec2(16., 8.);
+    auv.y = 1. - auv.y;
+    float cov = textureGrad(uAtlas, auv, vec2(dg.x, 0.), vec2(0., dg.y)).r;
+    float wsh = clamp(dg.x * ${16 * 48}. * .6, .03, .5);          // magnified: keep the glyph edge crisp
+    cov = smoothstep(.5 - wsh, .5 + wsh, cov);
+    // brighter = more beam current = a fatter spot; the corners defocus
+    float sig = .3 * (1. + .4 * min(br, 1.)) * (1. + .35 * edgeD);
+    float prof = exp(-pow((lf - .5) / sig, 2.));
+    prof = mix(prof, .55 + .15 * min(br, 1.), smoothstep(.25, .7, lineFoot));
+    col += AMBER * br * cov * prof * 2.7 * wk;
+  }
+  return col;
+}
+vec3 glassShade(vec3 P, vec3 rd){
+  vec2 q = vec2(P.x, P.y - OY);
+  vec2 s = (q / RAST) * vec2(.5, -.5) + .5;
+  { vec2 d = s - .5; s = .5 + d * (1. + .045 * uDist * dot(d, d) * 4.); }
+  vec3 n = normalize(P - vec3(0., OY, -2.4));
+  float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+  // power-on: dot -> horizontal line -> raster
+  float ph = uPow.x;
+  vec2 c = (s - .5) * vec2(1., .75);
+  float mask = 0.;
+  if (ph > 0.) {
+    float dotR = .004 + .02 * smoothstep(0., .25, ph);
+    float lineW = smoothstep(.2, .5, ph) * .7, lineH = mix(.002, .5, smoothstep(.5, .85, ph));
+    float m1 = exp(-dot(c, c) / (dotR * dotR)) * (1. - smoothstep(.3, .55, ph));
+    float m2 = step(.2, ph) * smoothstep(lineW + .01, lineW - .01, abs(c.x)) * smoothstep(lineH + .006, lineH - .006, abs(c.y));
+    mask = max(m1 * 4., m2);
+  }
+  float flash = 1. + .9 * exp(-pow((ph - .78) / .06, 2.)) * step(.5, ph);
+  vec3 col = vec3(0.);
+  vec2 cq = max(abs(s - .5) - (.5 - .055), 0.); float corner = smoothstep(.055, .045, length(cq * vec2(1., .75)));
+  bool inR = all(lessThan(abs(s - .5), vec2(.5)));
+  vec2 ds = vec2(length(dFdx(s)), length(dFdy(s)));
+  if (inR) col += phosphor(s, ds) * uPow.y * corner * uBump;
+  // raster bias glow + edge falloff of the tube
+  float edge = smoothstep(.5, .38, max(abs(s.x - .5), abs(s.y - .5) * 1.05));
+  col += AMBER * .018 * mask * edge;
+  col *= mask * flash * (.6 + .4 * edge) * uPow.w;
+  // glass: dark grey-green body, reflections
+  col += vec3(.012, .014, .012) + env(reflect(rd, n)) * F * 1.3 + vec3(.02, .015, .01) * F;
+  return col;
+}
+vec3 screenLight(vec3 P, vec3 n){
+  vec3 S = vec3(0., OY, .1); vec3 L = S - P; float d2 = dot(L, L); L /= sqrt(d2);
+  float cs = max(dot(normalize(P - S), vec3(0., 0., 1.)), 0.);
+  return AMBER * uPow.z * max(dot(n, L), 0.) * (.2 + cs) / (d2 * 3. + .08);
+}
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 ro = uRo; vec3 rd = camMat(ro, uTa, 0.) * normalize(vec3(uv, uFL));
+  // glass: sphere cap clipped to the opening
+  float tG = 1e9; vec3 Pg;
+  { vec3 c = vec3(0., OY, -2.4); float R = 2.47; vec3 oc = ro - c; float b = dot(oc, rd), h = b * b - dot(oc, oc) + R * R;
+    if (h > 0.) { float t = -b - sqrt(h); vec3 P = ro + rd * t; if (t > 0. && abs(P.x) < OPEN.x + .01 && abs(P.y - OY) < OPEN.y + .01) { tG = t; Pg = P; } } }
+  float t = 0.; bool hit = false;
+  for (int i = 0; i < 160; i++) { float d = mapS(ro + rd * t); if (d < .0004 * (1. + t)) { hit = true; break; } t += d * .9; if (t > 12. || t > tG) break; }
+  if (tG < 1e8 && (!hit || tG < t)) { gDepth = tG; return glassShade(Pg, rd); }
+  if (!hit) { gDepth = 12.; return vec3(.002, .002, .003); }
+  gDepth = t;
+  vec3 P = ro + rd * t, n = nrmS(P);
+  vec3 r = reflect(rd, n);
+  if (P.y < -.6) {
+    // desk: dark walnut, lit by the tube
+    float gr = fbm2(vec2(P.x * 3., P.z * 40.)) * .7 + fbm2(P.xz * 9.) * .3;
+    vec3 alb = mix(vec3(.05, .025, .012), vec3(.12, .065, .03), gr);
+    vec3 c = alb * (screenLight(P, n) * 1.6 + vec3(.01, .012, .016));
+    float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    c += env(r) * F * .5;
+    return c;
+  }
+  // beige plastic casing, slightly yellowed, fine texture
+  float tex = vnoise2(P.xy * 300.) * .5 + vnoise2(P.zy * 300.) * .5;
+  vec3 alb = vec3(.56, .51, .42) * (.94 + .06 * tex);
+  float ao = clamp(mapS(P + n * .03) / .03, 0., 1.) * .5 + .5;
+  vec3 rim = vec3(.55, .65, .85) * .2 * pow(max(dot(n, normalize(vec3(-.8, .45, .4))), 0.), 2.) + vec3(.02, .022, .028) * max(n.y, 0.);
+  vec3 c = alb * (screenLight(P, n) * 1.2 + rim + vec3(.008, .009, .011)) * ao;
+  float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+  c += env(r) * F * .35;
+  return c;
+}`,
+});
+const gl = rm.canvas.getContext('webgl2');
+let texAtlas, texBuf, texBuf2;
+function mkTex(unit, filterMip) {
+  const t = gl.createTexture(); gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filterMip ? gl.LINEAR_MIPMAP_LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filterMip ? gl.LINEAR : gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0); return t;
+}
+
+/* ---------------- camera ----------------
+   One continuous move. log(z) is a C1 track: a slow push from the 3/4 view, the dive accelerating into the glass
+   and braking to arrive exactly on the 5.0 beat (a small damped bounce), a slow lateral drift across the glyphs,
+   the pull-back easing in from 5.5 and settling for the terminal. x/y/target keep moving through 5.0. */
+let CLOSE = [0.0, 0.06];
+let ZT = null, XT = null, AT = null;
+function buildCam() {
+  const [cx, cy] = CLOSE;
+  ZT = Track([
+    { t: 0.0, v: [Math.log(1.75), 2.2] }, { t: 1.8, v: [Math.log(1.55), 2.2] }, { t: 3.4, v: [Math.log(1.3), 2.22] },
+    { t: 4.35, v: [Math.log(0.42), 2.32] }, { t: 5.0, v: [Math.log(0.115), 2.4], stop: true }, { t: 5.5, v: [Math.log(0.111), 2.4] },
+    { t: 6.6, v: [Math.log(0.72), 2.25] }, { t: 7.3, v: [Math.log(0.5), 2.3] }, { t: 8.0, v: [Math.log(0.9), 2.2] }, { t: 10.0, v: [Math.log(0.885), 2.2] },
+  ]);
+  XT = Track([
+    { t: 0.0, v: [0.5, 0.12] }, { t: 1.8, v: [0.33, 0.085] }, { t: 3.4, v: [0.13, 0.055] }, { t: 4.35, v: [cx + 0.03, cy + 0.004] },
+    { t: 5.0, v: [cx + 0.012, cy] }, { t: 5.5, v: [cx - 0.03, cy - 0.004] }, { t: 6.6, v: [-0.07, 0.2] }, { t: 7.3, v: [-0.12, 0.262] }, { t: 8.0, v: [0.0, 0.045] }, { t: 10.0, v: [-0.012, 0.042] },
+  ]);
+  AT = Track([
+    { t: 0.0, v: [0.0, -0.02, 0.0] }, { t: 1.8, v: [0.0, 0.0, 0.0] }, { t: 3.4, v: [0.0, 0.02, -0.05] }, { t: 4.35, v: [cx + 0.02, cy, -0.3] },
+    { t: 5.0, v: [cx + 0.012, cy, -0.3] }, { t: 5.5, v: [cx - 0.03, cy - 0.004, -0.3] }, { t: 6.6, v: [-0.07, 0.2, -0.3] }, { t: 7.3, v: [-0.12, 0.262, -0.3] }, { t: 8.0, v: [0.0, 0.04, 0.0] }, { t: 10.0, v: [0.0, 0.04, 0.0] },
+  ]);
+}
+function cam(t) {
+  const [lz, fl] = ZT(t), [x, y] = XT(t), a = AT(t);
+  let z = Math.exp(lz);
+  if (t > 5.0) z *= 1 - 0.05 * Math.exp(-(t - 5.0) * 9) * Math.sin((t - 5.0) * 24);   // a weighty little rebound
+  return { p: [x, y, z], a, fl };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  fonts: ['700 78px "DejaVu Sans Mono"'],
+  async setup() {
+    buildAtlas(); buildMap();
+    buildWorld();
+    let best = null, bd = 1e9;
+    for (let r = 8; r < 28; r++) for (let c = 30; c < 66; c++) {
+      let n = 0; for (let dr = -2; dr <= 2; dr++) for (let dc = -4; dc <= 4; dc++) { const g = globeCell(c + dc, r + dr, 5.0); if (g && '*#%@/\\|_-'.includes(g.ch)) n++; }
+      const d = Math.hypot(c - 48, (r - 17) * 2) - n * 1.5;
+      if (n >= 30 && d < bd) { bd = d; best = [c, r]; }
+    }
+    if (best) {
+      const x = ((best[0] + 0.5) / COLS - 0.5) * 0.91, y = 0.03 + (0.5 - (best[1] + 0.5) / ROWS) * 0.68;
+      CLOSE = [x, y];
+    }
+    buildCam();
+    texAtlas = mkTex(5, true);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texAtlas);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlas); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    texBuf = mkTex(6, false); texBuf2 = mkTex(7, false); gl.activeTexture(gl.TEXTURE0);
+  },
+  cues: [
+    { t: 0.25, sfx: 'crt_on', gain: 0.9 }, { t: 0.5, sfx: 'rain_ticks', gain: 0.5 }, { t: 1.25, sfx: 'rain_ticks', gain: 0.45 },
+    { t: 2.0, sfx: 'lock', gain: 0.55 }, { t: 3.75, sfx: 'dive', gain: 0.85 }, { t: 5.0, sfx: 'crt_hum_close', gain: 0.6 }, { t: 6.0, sfx: 'rain_out', gain: 0.6 },
+    ...[6.625, 6.6875, 6.75, 6.8125, 6.875, ...Array.from({ length: 9 }, (_, i) => 7.0 + i * 0.0556)].map((t) => ({ t, sfx: 'key', gain: 0.5 })),
+    { t: 7.5, sfx: 'key_enter', gain: 0.6 }, { t: 7.5, sfx: 'printout', gain: 0.7 }, { t: 8.0, sfx: 'beep_ok', gain: 0.5 },
+  ],
+  render(t) {
+    fillBuf(t);
+    const c = cam(t);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, texBuf);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, COLS, ROWS, 0, gl.RGBA, gl.UNSIGNED_BYTE, BUF);
+    gl.activeTexture(gl.TEXTURE7); gl.bindTexture(gl.TEXTURE_2D, texBuf2);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, COLS, ROWS, 0, gl.RGBA, gl.UNSIGNED_BYTE, BUF2);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, texAtlas); gl.activeTexture(gl.TEXTURE0);
+    const ph = clamp((t - 0.25) / 0.5);
+    const fl = 1 + 0.015 * Math.sin(t * 377) + 0.01 * Math.sin(t * 61);
+    // the tube is the only light in the room: it follows what is on the screen
+    const screenLight = 0.05 + 1.6 * MEANB;
+    const bump = 1 + 0.12 * Math.exp(-Math.pow((t - 8.03) / 0.05, 2));    // the beam load "breathes" as the last row lands
+    rm.set('uAtlas', { __ints: 1, v: 5 }).set('uBuf', { __ints: 1, v: 6 }).set('uBuf2', { __ints: 1, v: 7 })
+      .set('uDist', clamp((c.p[2] - 0.15) / 0.5)).set('uBump', bump)
+      .set('uRo', c.p).set('uTa', c.a).set('uFL', c.fl)
+      .set('uPow', [ph, 1.0, ph > 0 ? screenLight * (ph < 1 ? ph : 1) : 0, fl]);
+    const fd = Math.hypot(c.p[0] - c.a[0], c.p[1] - c.a[1], c.p[2] - 0.08);
+    rm.render(t, { focus: Math.max(0.03, c.p[2] - 0.07), aperture: c.p[2] < 0.5 ? 2 : 18, maxCoc: 10, bloom: lerp(0.22, 0.55, clamp((c.p[2] - 0.12) / 0.5)) * (t > 6.4 ? 0.72 : 1) });
+  },
+});
+</script></body></html>

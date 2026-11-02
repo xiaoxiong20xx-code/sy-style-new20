@@ -1,0 +1,605 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>24 湿拓流彩 · Paper Marbling</title>
+<script src="../../lib/core.js"></script><script src="../../lib/track.js"></script><script src="../../lib/gl.js"></script><script src="../../lib/rm.js"></script>
+</head><body><div id="stage"></div>
+<script>
+/* ===== 24 湿拓流彩 · Paper Marbling (ebru) =====
+   Real world: a shallow tray of thickened size (carrageenan water). Paint drops float and spread; every new drop
+   pushes the older paint outward into concentric rings (the exact inverse map from "mathematical marbling":
+   p = c + (p'-c)·sqrt(1 - r²/|p'-c|²)). A steel-pin comb drags the rings into chevrons, then a fine comb
+   draws the peacock. A sheet of laid paper is laid down, soaks up the paint and is lifted by its near edge toward the
+   camera: its underside carries the mirrored pattern and a white tulip (lale) painted beforehand in gum resist
+   (yazılı ebru). Cut on 8.5 to the dried print on slate.
+   Shot 1 (0-8s): overhead macro -> crane up over the tray. Hook 4.0s: the comb. Shot 2 (8-10s): the print. */
+const { E, clamp, inv, lerp } = Reel;
+const stage = Reel.makeStage('#0b0a09');
+Reel.ownJitter = true;
+const C = Reel.cfg({});
+
+/* ---------------- the marbling program: drops + comb strokes, in time order ---------------- */
+const hex = (h) => { const n = parseInt(h.slice(1), 16); return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255].map((v) => Math.pow(v, 2.2)); };
+const PAL = {
+  indigo: hex('#2c3850'), ivory: hex('#e4dac4'), red: hex('#983f30'), ochre: hex('#b38a4b'), teal: hex('#56796b'), ink: hex('#3a2e28'), rose: hex('#bf907f'),
+};
+const R = Reel.rng(24);
+const OPS = [];
+const drop = (x, z, r, t0, col, dur = 0.5, pip = 0) => OPS.push({ k: 0, x, z, r, t0, col, dur, seed: R() * 100, pip });
+// the macro bullseye: one drop on every beat, same spot
+const C0 = [0.02, 0.0];
+[['ivory', -0.22], ['indigo', 0.5], ['ochre', 1.0], ['red', 1.5], ['ivory', 2.0]].forEach(([c, t], i) => drop(C0[0] + 0.004 * i, C0[1] - 0.003 * i, i ? 0.2 : 0.23, t, PAL[c], 0.5, 1));
+// the rest of the tray: a loose hand-placed grid of bullseyes, one drop per centre on each beat (2.0 .. 3.5)
+const SEQS = [['indigo', 'ivory', 'red', 'ochre'], ['teal', 'ochre', 'indigo', 'rose'], ['red', 'ivory', 'indigo', 'ochre'], ['indigo', 'ochre', 'red', 'teal'], ['ink', 'rose', 'ochre', 'indigo']];
+const CENT = [];
+for (let row = -3; row <= 3; row++) {
+  for (let col = -4; col <= 4; col++) {
+    const x = (col + (row & 1 ? 0.5 : 0)) * 0.84 + (R() - 0.5) * 0.18, z = row * 0.73 + (R() - 0.5) * 0.16;
+    if (Math.hypot(x - C0[0], z - C0[1]) < 0.8 || Math.abs(x) > 3.5) continue;
+    CENT.push([x, z]);
+  }
+}
+CENT.forEach(([x, z], k) => {
+  const seq = SEQS[(k * 7 + (k >> 2)) % 5];
+  for (let j = 0; j < 4; j++) {
+    const t0 = 2.0 + j * 0.5 + (R() - 0.5) * 0.07;
+    drop(x + (R() - 0.5) * 0.02, z + (R() - 0.5) * 0.02, (j === 0 ? 0.37 : 0.225) * (0.92 + R() * 0.16), t0, PAL[seq[j]], 0.45);
+  }
+});
+// comb strokes: rake down (gel-git), rake back up between the first lines, then a fine wavy comb across (peacock)
+const PASSES = [
+  { M: [0, 1], s: 0.4, off: 0.0, a: 0.34, lam: 0.045, wave: 0, fr: 0, ph: 0, f0: -2.6, f1: 2.6, t0: 4.0, t1: 4.5 },
+  { M: [0, -1], s: 0.4, off: 0.2, a: 0.34, lam: 0.045, wave: 0, fr: 0, ph: 0, f0: -2.6, f1: 2.6, t0: 4.5, t1: 5.0 },
+  { M: [1, 0], s: 0.13, off: 0.03, a: 0.075, lam: 0.018, wave: 0.07, fr: 6.5, ph: 0.6, f0: -3.6, f1: 3.6, t0: 5.0, t1: 5.75 },
+];
+PASSES.forEach((p) => OPS.push(Object.assign({ k: 1 }, p)));
+OPS.sort((a, b) => a.t0 - b.t0);
+const NOPS = OPS.length; console.log('ops', NOPS);
+
+/* ---------------- renderer ---------------- */
+const rm = Reel.RM(stage, {
+  bloom: 0.2, th: 1.3, expo: 1.04, vig: 0.32, grain: 0.022, ca: 0.45, contrast: 1.04, sat: 0.93, bands: 4,
+  uniforms: `
+uniform highp sampler2D uOps; uniform int uN; uniform sampler2D uTxt;
+uniform vec3 uRo, uTa; uniform float uFL, uRoll, uT, uShot, uTPrint;
+uniform vec4 uComb; uniform vec4 uCombD;
+uniform vec4 uSh; uniform vec4 uSh2; uniform vec4 uSoak; uniform vec4 uLift;`,
+  scene: `
+const vec3 WATER = vec3(.021,.026,.04);   // the tray carries a floated ground of deep night-blue
+const vec3 LDIR = normalize(vec3(-.45,.8,-.38));
+const vec2 PH = vec2(1.2, .8);
+vec4 OP(int i, int r){ return texelFetch(uOps, ivec2(i, r), 0); }
+
+/* inverse marbling map: walk the operations backwards until the point lands inside a drop */
+float gPaint = 1.;
+vec3 marble(vec2 p, float T){
+  gPaint = 1.;
+  for (int i = 511; i >= 0; i--) {
+    if (i >= uN) continue;
+    vec4 a = OP(i,0), b = OP(i,1);
+    if (b.w < .5) {
+      float age = T - a.w; if (age <= 0.) continue;
+      vec4 c = OP(i,2);
+      float u = clamp(age / c.x, 0., 1.);
+      vec2 v = p - a.xy; float L2 = dot(v, v);
+      float th = atan(v.y, v.x);
+      float irg = 1. + .035 * sin(3. * th + c.y) + .022 * sin(5. * th + c.y * 1.7) + .012 * sin(9. * th + c.y * 2.3);
+      float r = a.z * irg * (.86 * (1. - exp(-age / .035)) + .14 * (1. - exp(-age / .35)));
+      if (L2 < r*r) {
+        float rr = sqrt(L2) / max(r, 1e-4);
+        vec3 col = b.rgb;
+        vec2 sp = v / a.z;
+        // a film a few microns thick: flat colour, only a slow density drift stretched along with the paint
+        col *= .95 + .1 * fbm2(sp * 3. + c.y);
+        col *= 1. - .62 * smoothstep(.972, .996, rr);          // pigment collects in a hairline at the edge
+        col = mix(col, col * 1.06 + .012, smoothstep(.93, .965, rr) * (1. - smoothstep(.965, .975, rr)) * .5);   // faint ox-gall halo
+        float lu = dot(col, vec3(.2126,.7152,.0722)); col = mix(vec3(lu), col, .82);
+        return mix(WATER, col, .96);
+      }
+      p = a.xy + v * sqrt(max(1. - r*r / L2, 0.));
+    } else {
+      vec4 c = OP(i,2);
+      if (T <= c.z) continue;
+      vec4 d4 = OP(i,3);
+      float u = clamp((T - c.z) / (c.w - c.z), 0., 1.);
+      float f = mix(c.x, c.y, u * u * (3. - 2. * u));
+      vec2 M = a.xy, N = vec2(-M.y, M.x);
+      float m = dot(p, M), n = dot(p, N), s = a.z;
+      float nn = n - a.w - b.z * sin(m * d4.x + d4.y);
+      float dd = abs(mod(nn + .5*s, s) - .5*s);
+      float z = b.x * b.y * (1. / (dd + b.y) + 1. / (s - dd + b.y));
+      float g = smoothstep(-.02, .1, f - m) * smoothstep(c.x - .3, c.x + .1, m);
+      p -= M * z * g;
+    }
+  }
+  gPaint = 1.;
+  return WATER * (.9 + .2 * fbm2(p * 5.));
+}
+
+/* capillary ring waves from every impact -> surface gradient */
+vec2 ripple(vec2 p, float T){
+  vec2 g = vec2(0.);
+  for (int i = 0; i < 512; i++) {
+    if (i >= uN) break;
+    vec4 a = OP(i,0), b = OP(i,1);
+    if (b.w > .5) continue;
+    float age = T - a.w; if (age < 0. || age > 1.4) continue;
+    vec2 v = p - a.xy; float r = length(v) + 1e-4;
+    float x = r - (.05 + .95 * age);
+    float env = exp(-age * 2.6) * exp(-x*x / (.004 + .03*age));
+    g += v / r * (-env * sin(x * 70.) * .035);
+    // the spreading paint lens bulges a little at its front
+    float rf = a.z * (.86 * (1. - exp(-age / .035)) + .14 * (1. - exp(-age / .35)));
+    float y = r - rf; g += v / r * (-y * exp(-y*y / .0012) * 1.2 * exp(-age * 6.));
+  }
+  if (uComb.z > .5) {
+    vec2 M = uCombD.xy, N = vec2(-M.y, M.x);
+    float dm = uComb.x - dot(p, M), n = dot(p, N) - uCombD.w - uComb.y, s = uCombD.z;
+    float nr = mod(n + .5 * s, s) - .5 * s;
+    if (dm > 0. && dm < 1.2) {
+      float arm = abs(nr) - dm * .42, w = .004 + .012 * dm;
+      float h = exp(-dm * 2.5) * exp(-arm * arm / (w * w));
+      g += N * sign(nr) * (-2. * arm / (w * w)) * h * .0035;
+    }
+  }
+  return g;
+}
+
+vec3 rectEnv(vec3 r){
+  // the studio: dim room, one big north window (2x3 panes) up-left-behind the tray
+  vec3 c = vec3(.028,.026,.024) * (.6 + .4 * smoothstep(-.2, .8, r.y));
+  vec3 wc = normalize(vec3(-.6,.7,-.42));
+  float cz = dot(r, wc);
+  if (cz > 0.) {
+    vec3 u = normalize(cross(vec3(0.,1.,0.), wc)), v = cross(wc, u);
+    vec2 q = vec2(dot(r,u), dot(r,v)) / cz;
+    vec2 hs = vec2(.22, .15);
+    vec2 e = smoothstep(hs + .03, hs - .03, abs(q));
+    float bars = smoothstep(.005, .011, abs(q.x)) * smoothstep(.005, .011, abs(abs(q.y) - .07)) * smoothstep(.005,.011, abs(q.x - .15)) * smoothstep(.005,.011, abs(q.x + .15));
+    c += vec3(1.,.97,.92) * 11. * e.x * e.y * (.55 + .45 * bars) * (.85 + .15 * smoothstep(-.3, .3, q.y));
+  }
+  return c;
+}
+float irr(vec2 s){ return 1.02 - .1 * s.x - .06 * s.y - .025 * dot(s, s); }
+
+/* ---- comb: oiled wooden bar with steel pins ---- */
+float combSdf(vec3 p, out float isPin){
+  vec2 M = uCombD.xy, N = vec2(-M.y, M.x);
+  float m = dot(p.xz, M) - uComb.x, n = dot(p.xz, N) - uCombD.w - uComb.y;
+  float s = uCombD.z;
+  float nr = mod(n + .5*s, s) - .5*s;
+  float pin = max(length(vec2(m, nr)) - .011, abs(p.y - .09) - .12);
+  float bar = sdRoundBox(vec3(m + .005, p.y - .25, n), vec3(.06, .045, 40.), .014);
+  isPin = step(pin, bar);
+  return min(pin, bar);
+}
+float combHit(vec3 ro, vec3 rd, float tmax){
+  if (uComb.z < .5) return -1.;
+  vec2 M = uCombD.xy;
+  // slab test: y in [-.03,.31], m in [-.08,.08]
+  float t0 = 0., t1 = tmax;
+  { float a = (-.03 - ro.y) / rd.y, b = (.31 - ro.y) / rd.y; t0 = max(t0, min(a,b)); t1 = min(t1, max(a,b)); }
+  { float mo = dot(ro.xz, M) - uComb.x, md = dot(rd.xz, M);
+    if (abs(md) > 1e-5) { float a = (-.08 - mo) / md, b = (.08 - mo) / md; t0 = max(t0, min(a,b)); t1 = min(t1, max(a,b)); }
+    else if (abs(mo) > .08) return -1.; }
+  if (t1 <= t0) return -1.;
+  float t = t0, ip;
+  for (int i = 0; i < 64; i++) { float h = combSdf(ro + rd*t, ip); if (h < .0006) return t; t += h; if (t > t1) break; }
+  return -1.;
+}
+vec3 shadeComb(vec3 p, vec3 rd){
+  float ip; vec2 k = vec2(.0007, 0.);
+  float d0 = combSdf(p, ip);
+  vec3 n = normalize(vec3(combSdf(p+k.xyy,ip) - combSdf(p-k.xyy,ip), combSdf(p+k.yxy,ip) - combSdf(p-k.yxy,ip), combSdf(p+k.yyx,ip) - combSdf(p-k.yyx,ip)));
+  combSdf(p, ip);
+  vec3 r = reflect(rd, n);
+  float dif = max(dot(n, LDIR), 0.) * .8 + .2 * (.5 + .5 * n.y);
+  if (ip > .5) {   // steel pin
+    float F = .6 + .4 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    return rectEnv(r) * F * vec3(.9,.92,.95) + vec3(.03) * dif;
+  }
+  vec2 N2 = vec2(-uCombD.y, uCombD.x);
+  float along = dot(p.xz, N2);
+  float grain = fbm2(vec2(along * 3., p.y * 60. + dot(p.xz, uCombD.xy) * 60.)) ;
+  vec3 wood = mix(vec3(.16,.075,.03), vec3(.36,.19,.08), grain);
+  wood *= .85 + .15 * sin(along * 40. + grain * 6.);
+  float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+  return wood * dif * 1.1 + rectEnv(r) * F * .7;
+}
+float combShadow(vec3 p){
+  if (uComb.z < .5) return 1.;
+  float m = dot(p.xz, uCombD.xy) - uComb.x;
+  if (abs(m) > .7) return 1.;
+  float res = 1., t = .02, ip;
+  for (int i = 0; i < 24; i++) { float h = combSdf(p + LDIR*t, ip); res = min(res, 9. * h / t); t += clamp(h, .01, .08); if (t > 1.) break; }
+  return .45 + .55 * clamp(res, 0., 1.);
+}
+
+/* ---- paper sheet: flat part [Xl,Xmid] at height y0, a right part tilted up by aR, a left part lifted by aL ---- */
+const float SHZ = 1.3333, SHX = 2.0, SCL = 1.6667;   // sheet half-depth / half-width; sheet units per print unit
+const float IX = 3.05, IZ = 2.05, OX = 3.2, OZ = 2.2, RH = .07, TY = -.09;          // the tray: inner / outer rim, rim height, table
+vec3 sheetHit(vec3 ro, vec3 rd, out float part, out float ux){
+  part = -1.; ux = 0.;
+  if (uSh2.w < .5) return vec3(-1.);
+  float best = 1e9; vec3 bp = vec3(-1.);
+  // flat
+  float zMax = uLift.z > .5 ? uLift.x : SHZ + .01*sin(1.);
+  if (abs(rd.y) > 1e-5) { float t = (uSh2.x - ro.y) / rd.y; vec3 q = ro + rd*t;
+    if (t > 0. && q.x > uSh.x && q.x < uSh.y && abs(q.z) < SHZ + .01*sin(q.x*23.) && q.z < zMax) { best = t; bp = q; part = 0.; ux = q.x; } }
+  // the near part, lifted by its edge toward the camera, hinged at z = Zh
+  if (uLift.z > .5) { vec3 O = vec3(0., 0., uLift.x), U = vec3(0., sin(uLift.y), cos(uLift.y)), Nn = vec3(0., cos(uLift.y), -sin(uLift.y));
+    float dn = dot(rd, Nn); if (abs(dn) > 1e-5) { float t = dot(O - ro, Nn) / dn; vec3 q = ro + rd*t; float u = dot(q - O, U);
+      if (t > 0. && t < best && u > 0. && u < SHZ - uLift.x && q.x > -SHX + .01*sin(u*19.) && q.x < SHX + .01*sin(u*23.)) { best = t; bp = vec3(q.x, 0., uLift.x + u); part = 3.; ux = u; } } }
+  // right (tilted) part
+  if (uSh2.z > .001) { vec3 O = vec3(uSh.y, uSh2.x, 0.), U = vec3(cos(uSh.w), sin(uSh.w), 0.), Nn = vec3(-U.y, U.x, 0.);
+    float dn = dot(rd, Nn); if (abs(dn) > 1e-5) { float t = dot(O - ro, Nn) / dn; vec3 q = ro + rd*t; float u = dot(q - O, U);
+      if (t > 0. && t < best && u > 0. && u < uSh2.z && abs(q.z) < SHZ + .01*sin(u*23.)) { best = t; bp = q; part = 1.; ux = u; } } }
+  // left (lifting) part
+  if (uSh2.y > .001) { vec3 O = vec3(uSh.x, uSh2.x, 0.), U = vec3(-cos(uSh.z), sin(uSh.z), 0.), Nn = vec3(U.y, -U.x, 0.);
+    float dn = dot(rd, Nn); if (abs(dn) > 1e-5) { float t = dot(O - ro, Nn) / dn; vec3 q = ro + rd*t; float u = dot(q - O, U);
+      if (t > 0. && t < best && u > 0. && u < uSh2.y && abs(q.z) < SHZ + .01*sin(u*23.)) { best = t; bp = q; part = 2.; ux = u; } } }
+  return vec3(best, bp.x, bp.z);
+}
+vec3 paperAlbedo(vec2 q){
+  float fib = fbm2(q * vec2(40., 9.)) * .5 + fbm2(q * 160.) * .5;
+  float laid = .985 + .015 * sin(q.x * 380.);           // laid lines
+  float chain = 1. - .025 * smoothstep(.006, 0., abs(mod(q.x, .42) - .21));
+  return vec3(.9,.87,.81) * (.93 + .1 * fib) * laid * chain;
+}
+
+/* the gum resist: the paint crept up to the gum unevenly, so the white edge is soft and ragged,
+   and the pigment it pushed against left a thin dark line just outside */
+float resist(vec2 uv, vec2 q, out float hair){
+  float m = textureLod(uTxt, uv, .8).r;
+  float nE = (vnoise2(q * 70.) - .5) * .6 + (vnoise2(q * 240.) - .5) * .3;
+  float mm = m + nE * .42;
+  float res = smoothstep(.42, .58, mm);
+  hair = (1. - res) * smoothstep(.03, .3, mm) * (.7 + .3 * vnoise2(q * 50.));
+  res *= 1. - .14 * (1. - smoothstep(.58, .95, mm)) * (.5 + .5 * vnoise2(q * 90.));   // pigment haze creeping onto the gum
+  return res;
+}
+vec3 renderTray(vec3 ro, vec3 rd){
+  float T = uT;
+  float tS = rd.y < 0. ? -ro.y / rd.y : 1e9;
+  float part, ux;
+  vec3 sh = sheetHit(ro, rd, part, ux);
+  float tSh = sh.x > 0. ? sh.x : 1e9;
+  float tC = combHit(ro, rd, min(tS, tSh));
+  // falling drops
+  float tD = 1e9; vec3 dcol = vec3(0.), dn = vec3(0.);
+  for (int i = 0; i < 512; i++) {
+    if (i >= uN) break;
+    vec4 a = OP(i,0), b = OP(i,1);
+    if (b.w > .5) continue;
+    float pre = a.w - T; if (pre <= 0. || pre > .32) continue;
+    if (OP(i,2).z < .5) continue;
+    vec3 c = vec3(a.x, .5 * 52. * pre * pre + .018, a.y);
+    float rr = .026 + .012 * a.z;
+    vec3 oc = ro - c; float B = dot(oc, rd), Cq = dot(oc, oc) - rr*rr, h = B*B - Cq;
+    if (h > 0.) { float t = -B - sqrt(h); if (t > 0. && t < tD) { tD = t; dcol = b.rgb; dn = normalize(ro + rd*t - c); } }
+  }
+  // the tray: the size surface only inside the rim; rim top, inner / outer walls, the table outside
+  float tT = 1e9; int kind = 0; vec3 tN = vec3(0., 1., 0.);
+  if (tS < 1e8) { vec3 P = ro + rd * tS; if (abs(P.x) < IX && abs(P.z) < IZ) tT = tS; }
+  { float t = (RH - ro.y) / rd.y; vec3 P = ro + rd * t; if (t > 0. && t < tT && abs(P.x) < OX && abs(P.z) < OZ && (abs(P.x) > IX || abs(P.z) > IZ)) { tT = t; kind = 1; } }
+  { float t = (TY - ro.y) / rd.y; vec3 P = ro + rd * t; if (t > 0. && t < tT && (abs(P.x) > OX || abs(P.z) > OZ)) { tT = t; kind = 3; } }
+  for (int k = 0; k < 4; k++) {
+    float sx = k == 0 ? 1. : k == 1 ? -1. : 0., sz = k == 2 ? 1. : k == 3 ? -1. : 0.;
+    // inner walls (seen from inside the tray)
+    if (sx != 0. && rd.x * sx > 0.) { float t = (sx * IX - ro.x) / rd.x; vec3 P = ro + rd * t; if (t > 0. && t < tT && P.y > 0. && P.y < RH && abs(P.z) < IZ) { tT = t; kind = 2; tN = vec3(-sx, 0., 0.); } }
+    if (sz != 0. && rd.z * sz > 0.) { float t = (sz * IZ - ro.z) / rd.z; vec3 P = ro + rd * t; if (t > 0. && t < tT && P.y > 0. && P.y < RH && abs(P.x) < IX) { tT = t; kind = 2; tN = vec3(0., 0., -sz); } }
+    // outer walls
+    if (sx != 0. && rd.x * sx < 0.) { float t = (sx * OX - ro.x) / rd.x; vec3 P = ro + rd * t; if (t > 0. && t < tT && P.y > TY && P.y < RH && abs(P.z) < OZ) { tT = t; kind = 4; tN = vec3(sx, 0., 0.); } }
+    if (sz != 0. && rd.z * sz < 0.) { float t = (sz * OZ - ro.z) / rd.z; vec3 P = ro + rd * t; if (t > 0. && t < tT && P.y > TY && P.y < RH && abs(P.x) < OX) { tT = t; kind = 4; tN = vec3(0., 0., sz); } }
+  }
+  tS = kind == 0 ? tT : 1e9;
+  float tmin = min(min(tT, tSh), min(tC > 0. ? tC : 1e9, tD));
+  gDepth = tmin;
+  if (kind != 0 && tT <= tmin) {
+    vec3 P = ro + rd * tT;
+    vec3 n = kind == 1 || kind == 3 ? vec3(0., 1., 0.) : tN;
+    if (kind == 3) {   // a dark slate worktop
+      float sl = fbm2(P.xz * vec2(2., 5.)) * .6 + fbm2(P.xz * 20.) * .4;
+      vec3 c = vec3(.04, .042, .046) * (.75 + .5 * sl) * (.6 + .5 * irr(P.xz * .6));
+      float d = max(abs(P.x) - OX, abs(P.z) - OZ);
+      c *= .55 + .45 * smoothstep(0., .25, d);          // contact shadow of the tray
+      return c + rectEnv(reflect(rd, n)) * .006;
+    }
+    // oiled oak rim
+    float along = abs(n.x) > .5 || (kind == 1 && abs(P.x) > IX) ? P.z : P.x;
+    float gr = fbm2(vec2(along * 3., (P.x + P.z) * 40. + P.y * 60.));
+    vec3 wood = mix(vec3(.11, .055, .025), vec3(.26, .14, .06), gr);
+    float dif = .25 + .75 * max(dot(n, LDIR), 0.);
+    if (kind == 2) { wood *= .55; dif *= .8; }          // the wet inner wall
+    vec3 c = wood * dif * irr(P.xz);
+    float F = .04 + .96 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    return c + rectEnv(reflect(rd, n)) * F * .4;
+  }
+  if (tD <= tmin) {
+    vec3 r = reflect(rd, dn); float F = .04 + .96 * pow(1. - max(dot(dn, -rd), 0.), 5.);
+    return dcol * (.25 + .9 * max(dot(dn, LDIR), 0.)) + rectEnv(r) * F * 1.4;
+  }
+  if (tC > 0. && tC <= tmin) return shadeComb(ro + rd*tC, rd);
+  if (tSh <= tmin && tSh < 1e8) {
+    vec3 q = vec3(sh.y, 0., sh.z);
+    vec3 alb = paperAlbedo(q.xz);
+    vec3 n = part < .5 ? vec3(0.,1.,0.) : part < 1.5 ? vec3(-sin(uSh.w), cos(uSh.w), 0.) : part < 2.5 ? vec3(sin(uSh.z), cos(uSh.z), 0.) : vec3(0., cos(uLift.y), -sin(uLift.y));
+    if (part > 2.5 && dot(n, rd) > 0.) {
+      // the underside: the print side, wet, carrying the (mirror) pattern and the white resist tulip
+      vec3 nu = -n;
+      nu = normalize(nu + vec3(fbm2(q.xz * 2.) - .5, 0., fbm2(q.xz * 2. + 3.) - .5) * .06);
+      vec2 qp = vec2(q.x, -q.z) / SCL;
+      vec2 tuv = vec2((qp.x + PH.x) / (2. * PH.x), 1. - (qp.y + PH.y) / (2. * PH.y));
+      float hair; float res = resist(tuv, qp, hair);
+      vec3 pat = marble(q.xz, uTPrint) * (1. - .62 * hair);
+      vec3 a2 = mix(pat, alb * .92, res);
+      vec3 fill = vec3(.32, .31, .3) + vec3(.35, .33, .3) * max(dot(nu, normalize(vec3(.2, .4, .9))), 0.);
+      vec3 cU = a2 * fill * 1.15;
+      float F = .03 + .97 * pow(1. - max(dot(nu, -rd), 0.), 5.);
+      cU += rectEnv(reflect(rd, nu)) * F * .9 + vec3(.02) * (1. - res);
+      float ed2 = min(SHZ - q.z, min(SHX - abs(q.x), 1.));
+      return cU * (.85 + .15 * smoothstep(0., .02, ed2));
+    }
+    float dif = .26 + .62 * max(dot(n, LDIR), 0.);
+    // laid paper is not a flat white card: slow cockle in the light, fibres, a cooler fall-off away from the window
+    float ck = fbm2(q.xz * 1.6 + 4.) - .5;
+    dif *= .93 + .14 * ck;
+    vec3 col = alb * .9 * dif * irr(q.xz) * mix(vec3(1.), vec3(.92, .94, 1.), smoothstep(-1., 2.5, q.x + q.z));
+    if (part < .5 && uSh2.x < .01) {
+      // wet paper turns translucent: the pattern ghosts through, softly
+      // the wet front advances behind the contact line with a ragged, capillary edge
+      float front = (uSoak.x - (q.x - uSoak.y) * uSoak.z) + (fbm2(q.xz * 5.) - .5) * .16 + (vnoise2(q.xz * 30.) - .5) * .04;
+      float soak = smoothstep(0., .5, front);
+      float mott = .8 + .2 * fbm2(q.xz * 7. + 11.);               // the paper takes the water unevenly
+      // through the wet sheet the pattern is soft (scattered by the fibres), darker and lower in contrast
+      vec2 o = vec2(.022, .0);
+      vec3 pat = (marble(q.xz, uTPrint) * 2. + marble(q.xz + o.xy, uTPrint) + marble(q.xz - o.xy, uTPrint) + marble(q.xz + o.yx * 1.3, uTPrint) + marble(q.xz - o.yx * 1.3, uTPrint)) / 6.;
+      vec3 wet = alb * .74 * mix(vec3(1.), pat * 1.6 + .04, .74 * mott);
+      wet *= 1. - .1 * smoothstep(.0, .15, front) * (1. - smoothstep(.15, .45, front));   // a darker damp band right at the front
+      col = mix(col, wet * dif * irr(q.xz), soak * uSoak.w);
+      // contact crease where the sheet bends up
+      col *= 1. - .25 * exp(-abs(q.x - uSh.y) * 40.) * step(.001, uSh2.z);
+    }
+    if (part > 2.5) {   // the top of the lifted flap: wet, the pattern still ghosts through
+      vec3 pat = marble(q.xz, uTPrint);
+      col = alb * .78 * mix(vec3(1.), pat * 1.5 + .05, .55) * dif;
+    }
+    // the deckle edge
+    float ed = SHZ - abs(sh.z);
+    col *= .82 + .18 * smoothstep(0., .02, ed);
+    return col;
+  }
+  if (tS < 1e8) {
+    vec3 P = ro + rd * tS; vec2 s = P.xz;
+    float meni = exp(-min(IX - abs(s.x), IZ - abs(s.y)) * 60.);   // the meniscus climbing the rim
+    vec2 gr = ripple(s, T);
+    vec3 n = normalize(vec3(-gr.x, 1., -gr.y));
+    vec3 base = marble(s - gr * .004, T);
+    // where the paper was lifted off, most of the paint went with it
+    if (uLift.z > .5 && s.y > uLift.x && s.y < SHZ && abs(s.x) < SHX) base = mix(WATER * .98, base, .14);
+    float shade = combShadow(P);
+    // soft shadow of the hovering / tilted sheet
+    if (uSh2.w > .5) {
+      float p2, u2; vec3 h2 = sheetHit(P + vec3(0., .001, 0.), LDIR, p2, u2);
+      if (h2.x > 0. && h2.x < 1e8) shade *= mix(.4, .93, smoothstep(.0, 1.1, h2.x));
+    }
+    vec3 col = base * irr(s) * shade * vec3(1.,.985,.96);
+    vec3 r = reflect(rd, n);
+    float F = .02 + .98 * pow(1. - max(dot(n, -rd), 0.), 5.);
+    col += rectEnv(r) * F * mix(1., .6, step(.5, uSh2.w) * step(s.x, uSh.y) * step(uSh.x, s.x));
+    col += rectEnv(reflect(rd, normalize(vec3(sign(s.x) * meni * .8, 1., 0.)))) * .05 * meni;
+    return col;
+  }
+  return vec3(0.);
+}
+
+/* ---- shot 2: the finished print on slate ---- */
+float cockle(vec2 q){ return .0045 * sin(q.x * 3.1 + 1.) * sin(q.y * 4.3 + .4) + .003 * (fbm2(q * 2.2) - .5) + .002 * sin(q.x*7.+q.y*3.); }
+vec3 renderPrint(vec3 ro, vec3 rd){
+  float t = -ro.y / rd.y; vec3 P = ro + rd * t; gDepth = t;
+  vec2 q = P.xz;
+  vec3 L = normalize(vec3(-.78, .52, -.34));
+  float dk = (vnoise2(q.yx * 30.) - .5) * .008 + (vnoise2(q * 90.) - .5) * .003;
+  vec2 ed = PH + dk - abs(q);
+  float inside = smoothstep(-.0012, .0012, min(ed.x, ed.y));
+  // slate
+  float sl = fbm2(q * vec2(3., 7.)) * .6 + fbm2(q * 30.) * .4;
+  vec3 slate = vec3(.045,.05,.056) * (.8 + .4 * sl);
+  vec2 qs = q + L.xz * .02;
+  vec2 es = PH - abs(qs);
+  float shadow = 1. - .55 * smoothstep(-.03, .01, min(es.x, es.y));
+  vec3 cs = slate * (.35 + .9 * max(L.y, 0.)) * shadow;
+  { vec3 r = reflect(rd, vec3(0.,1.,0.)); cs += rectEnv(r) * .004 * (.6 + .4 * sl); }
+  if (inside < .001) return cs;
+  // paper with cockles
+  vec2 k = vec2(.004, 0.);
+  float h0 = cockle(q);
+  vec3 n = normalize(vec3(-(cockle(q + k.xy) - h0) / k.x, 1., -(cockle(q + k.yx) - h0) / k.x));
+  vec2 uv = vec2((q.x + PH.x) / (2. * PH.x), 1. - (q.y + PH.y) / (2. * PH.y));
+  vec4 tx = texture(uTxt, uv);
+  float blurR = textureLod(uTxt, uv, 2.5).r;
+  vec3 alb = paperAlbedo(q * 1.3);
+  vec2 ma = vec2(1.12, .73);
+  float mx = .015 * (vnoise2(q * 20.) - .5);
+  float inMarb = 1.;
+  vec2 s = vec2(q.x, -q.y) * SCL;
+  vec3 pat = marble(s, uTPrint);
+  float hair; float res = resist(uv, q, hair);
+  float bank2 = clamp((textureLod(uTxt, uv, 3.4).r - tx.r) * 2.5, 0., 1.) * (1. - res);
+  pat *= 1. - .62 * hair - .12 * bank2;     // paint banks up against the gum in a thin dark line
+  { vec2 e2 = vec2(1. / 2400., 0.);
+    float gx = textureLod(uTxt, uv + e2.xy * 3., 1.).r - textureLod(uTxt, uv - e2.xy * 3., 1.).r;
+    float gy = textureLod(uTxt, uv + e2.yx * 4.5, 1.).r - textureLod(uTxt, uv - e2.yx * 4.5, 1.).r;
+    n = normalize(n + vec3(-gx, 0., gy) * .12 * inMarb); }
+  float paint = inMarb * (1. - res) * gPaint;
+  vec3 a = mix(alb * mix(1., 1.07, res), pat, paint);
+  // pencil: graphite catches only the tops of the paper tooth
+  float pen = 0.;
+  float dif = .28 + 1.05 * max(dot(n, L), 0.);
+  vec3 col = a * dif * vec3(1.,.97,.93);
+  vec3 r = reflect(rd, n);
+  float F = .03 + .97 * pow(1. - max(dot(n, -rd), 0.), 5.);
+  col += rectEnv(r) * F * (paint * .3 + .05);
+  return mix(cs, col, inside);
+}
+
+vec3 render(vec2 fc){
+  vec2 uv = (2. * fc - uRes) / uRes.y;
+  vec3 w = normalize(uTa - uRo), u = normalize(cross(w, vec3(sin(uRoll), 0., -cos(uRoll)))), v = cross(u, w);
+  vec3 rd = mat3(u, v, w) * normalize(vec3(uv, uFL));
+  return uShot < .5 ? renderTray(uRo, rd) : renderPrint(uRo, rd);
+}`,
+});
+
+/* ops -> float texture (4 rows) */
+const gl = rm.canvas.getContext('webgl2');
+const OPW = 512;
+const opData = new Float32Array(OPW * 4 * 4);
+OPS.forEach((o, i) => {
+  const put = (row, v) => opData.set(v, (row * OPW + i) * 4);
+  if (o.k === 0) { put(0, [o.x, o.z, o.r, o.t0]); put(1, [...o.col, 0]); put(2, [o.dur, o.seed, o.pip, 0]); }
+  else { put(0, [o.M[0], o.M[1], o.s, o.off]); put(1, [o.a, o.lam, o.wave, 1]); put(2, [o.f0, o.f1, o.t0, o.t1]); put(3, [o.fr, o.ph, 0, 0]); }
+});
+const opTex = gl.createTexture();
+gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, opTex);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, OPW, 4, 0, gl.RGBA, gl.FLOAT, opData);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.activeTexture(gl.TEXTURE0);
+
+/* title (gum resist) + pencil signature, drawn in paper space */
+const TW = 2400, TH = 1600;
+const txc = document.createElement('canvas'); txc.width = TW; txc.height = TH;
+let txTex = null;
+const TULIP_DX = -40;
+function buildText() {
+  const g = txc.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, TW, TH);
+  // gum-resist lale, Ottoman style: an almond cup of three petals (the outer two hug the centre one and flick out
+  // into needle points), a tapering S-curved stem, two lanceolate leaves rising close along it; freehand, a little tilted
+  g.save(); g.filter = 'blur(5px)';
+  g.fillStyle = '#f00'; g.strokeStyle = '#f00'; g.lineCap = 'round'; g.lineJoin = 'round';
+  g.translate(TW / 2 + TULIP_DX, 760); g.rotate(-0.04); g.scale(1.14, 1.14);
+  const P = (cmds) => { g.beginPath(); cmds.forEach(([c, ...v]) => g[c](...v)); g.closePath(); g.fill(); };
+  P([['moveTo', 0, 8], ['bezierCurveTo', -40, 8, -70, -30, -76, -100], ['bezierCurveTo', -80, -160, -72, -220, -62, -262],
+     ['bezierCurveTo', -70, -282, -84, -300, -106, -318], ['bezierCurveTo', -80, -306, -60, -292, -44, -270],
+     ['bezierCurveTo', -36, -300, -20, -330, 0, -352], ['bezierCurveTo', 20, -330, 34, -298, 42, -266],
+     ['bezierCurveTo', 58, -288, 78, -302, 100, -312], ['bezierCurveTo', 80, -294, 66, -276, 60, -254],
+     ['bezierCurveTo', 72, -210, 80, -150, 76, -96], ['bezierCurveTo', 70, -30, 40, 8, 0, 8]]);
+  // the petals' overlaps: thin unpainted seams the colour runs into
+  g.globalCompositeOperation = 'destination-out'; g.filter = 'blur(2px)'; g.lineWidth = 11;
+  g.beginPath(); g.moveTo(-14, -14); g.bezierCurveTo(-30, -90, -42, -190, -44, -262); g.stroke();
+  g.beginPath(); g.moveTo(16, -14); g.bezierCurveTo(32, -90, 42, -186, 42, -258); g.stroke();
+  g.globalCompositeOperation = 'source-over'; g.filter = 'blur(5px)';
+  // a gently S-curved stem that tapers to a fine point
+  const stem = (u) => [14 * Math.sin(u * Math.PI * 1.35), 6 + u * 402];
+  for (let i = 0; i <= 80; i++) { const u = i / 80, [x, y] = stem(u); g.beginPath(); g.arc(x, y, Math.max(0.4, 9 * Math.pow(1 - u, 0.8)), 0, 7); g.fill(); }
+  // lanceolate leaves: base on the stem, the midrib rises close along it, then curves up and slightly out
+  function leaf(u0, C, T, W) {
+    const B = stem(u0), N = 40, L = [], Rr = [];
+    for (let i = 0; i <= N; i++) {
+      const k = i / N, v = 1 - k;
+      const p = [v * v * B[0] + 2 * v * k * C[0] + k * k * T[0], v * v * B[1] + 2 * v * k * C[1] + k * k * T[1]];
+      const d = [2 * v * (C[0] - B[0]) + 2 * k * (T[0] - C[0]), 2 * v * (C[1] - B[1]) + 2 * k * (T[1] - C[1])], dl = Math.hypot(...d) || 1;
+      const w = W * Math.pow(Math.sin(Math.PI * Math.min(1, k * 1.08)), 0.75) * (1 - 0.35 * k);
+      L.push([p[0] - d[1] / dl * w, p[1] + d[0] / dl * w]); Rr.push([p[0] + d[1] / dl * w, p[1] - d[0] / dl * w]);
+    }
+    g.beginPath(); L.forEach((q, i) => (i ? g.lineTo(...q) : g.moveTo(...q))); Rr.reverse().forEach((q) => g.lineTo(...q)); g.closePath(); g.fill();
+  }
+  leaf(0.9, [-14, 190], [-90, 26], 22);      // the long leaf, left
+  leaf(0.74, [26, 226], [76, 96], 19);       // the shorter one, right
+  g.restore();
+  txTex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, txTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, txc);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.activeTexture(gl.TEXTURE0);
+}
+
+/* ---------------- timeline ---------------- */
+// cameras as continuous tracks: position, target, focal length; no stop at any key
+const CAM1 = Track([
+  { t: 0.0, v: [0.12, 0.92, 0.36, 0.03, 0, 0.02, 2.3] },
+  { t: 1.9, v: [0.06, 1.05, 0.42, 0.02, 0, 0.0, 2.3] },
+  { t: 3.7, v: [0.14, 3.15, 0.95, 0.02, 0, -0.06, 2.35] },
+  { t: 5.15, v: [0.04, 3.1, 0.86, 0.0, 0, -0.04, 2.35] },
+  { t: 5.85, v: [0.0, 4.75, 0.7, 0.0, 0, -0.08, 2.35] },
+  { t: 6.7, v: [0.0, 4.7, 0.75, 0.0, 0, -0.06, 2.35] },
+  { t: 7.3, v: [0.0, 4.35, 1.05, 0.0, 0, 0.0, 2.35] },
+  { t: 8.5, v: [0.04, 1.55, 3.2, 0.0, 0.75, -0.25, 2.3] },
+], { easeOut: false });
+const CAM2 = Track([
+  { t: 8.5, v: [-0.08, 2.06, 0.55, 0.0, 0, 0.03, 2.3] },
+  { t: 10.0, v: [-0.08, 2.06, 0.55, 0.0, 0, 0.03, 2.3] },
+]);   // locked off from the cut
+const camAt = (T, t) => { const v = T(t); return { p: v.slice(0, 3), a: v.slice(3, 6), fl: v[6] }; };
+const D2R = Math.PI / 180;
+function sheet(t) {
+  // returns uSh (Xl, Xmid, aL, aR), uSh2 (y0, Lleft, Lright, on), soak, lift (Zh, angle, on)
+  const L = 4.0, X0 = -2.0, off = { sh: [0, 0, 0, 0], sh2: [0, 0, 0, 0], soak: [0, 0, 0, 0], lift: [0, 0, 0, 0] };
+  if (t < 5.25) return off;
+  if (t < 6.0) {   // the sheet is carried in slowly from off-frame left (following the comb out), its left edge low, and lowered
+    const u = Track.easeRange(t, 5.25, 6.0), x = lerp(-6.6, X0, u);
+    return { sh: [x, x, 0, lerp(12, 9, u) * D2R], sh2: [lerp(0.3, 0.0, u), 0, L, 1], soak: [0, 0, 0, 0], lift: [0, 0, 0, 0] };
+  }
+  if (t < 7.25) {   // left edge touches first, the contact rolls across
+    const u = inv(6.0, 6.75, t), xmid = lerp(X0, X0 + L, E.inOutSine(u));
+    return { sh: [X0, xmid, 0, lerp(9, 2.5, u) * D2R], sh2: [0, 0, X0 + L - xmid, 1], soak: [t - 6.0, X0, 0.75 / L, 1], lift: [0, 0, 0, 0] };
+  }
+  // the lift: the near edge comes up toward the camera, the hinge rolls back across the tray
+  const u = E.inOutSine(inv(7.25, 8.5, t));
+  return { sh: [X0, X0 + L, 0, 0], sh2: [0, 0, 0, 1], soak: [t - 6.0, X0, 0.75 / L, 1], lift: [lerp(1.3333, -0.45, u), lerp(3, 84, u) * D2R, 1, 0] };
+}
+function comb(t) {
+  for (const p of PASSES) {
+    if (t > p.t0 - 0.12 && t < p.t1 + 0.12) {
+      const u = clamp((t - p.t0) / (p.t1 - p.t0)), f = lerp(p.f0, p.f1, u * u * (3 - 2 * u));
+      const shift = p.wave * Math.sin(f * p.fr + p.ph);
+      return { c: [f, shift, 1, 0], d: [p.M[0], p.M[1], p.s, p.off] };
+    }
+  }
+  return { c: [0, 0, 0, 0], d: [0, 1, 1, 0] };
+}
+
+Reel.scene({
+  duration: 10, fps: 30,
+  async setup() { buildText(); },
+  cues: [
+    { t: 0.0, sfx: 'drip', gain: 0.35 }, { t: 0.5, sfx: 'drip', gain: 0.7 }, { t: 1.0, sfx: 'drip', gain: 0.7 }, { t: 1.5, sfx: 'drip', gain: 0.7 },
+    { t: 2.0, sfx: 'drip_volley', gain: 0.75 }, { t: 2.5, sfx: 'drip_volley', gain: 0.65 }, { t: 3.0, sfx: 'drip_volley', gain: 0.65 }, { t: 3.5, sfx: 'drip_volley', gain: 0.65 },
+    { t: 4.0, sfx: 'comb_drag', gain: 0.95 }, { t: 4.5, sfx: 'comb_drag', gain: 0.85 }, { t: 5.0, sfx: 'comb_fine', gain: 0.75 },
+    { t: 5.25, sfx: 'paper_lay', gain: 0.6 }, { t: 6.0, sfx: 'wet_contact', gain: 0.8 }, { t: 7.25, sfx: 'paper_peel_long', gain: 0.85 }, { t: 8.5, sfx: 'reveal_shimmer', gain: 0.55 },
+  ],
+  render(t) {
+    // the cut belongs to the output frame (frame 255 = 8.5 s), never to a motion-blur sub-frame
+    const shot2 = Math.round(t * 30) >= 255;
+    const cam = shot2 ? camAt(CAM2, t) : camAt(CAM1, t);
+    const hk = shot2 ? 0 : 1;   // locked off for the final hold
+    const hx = hk * (0.006 * Math.sin(t * 1.1) + 0.003 * Math.sin(t * 2.7 + 1)), hz = hk * 0.005 * Math.sin(t * 1.4 + 2);
+    const ro = [cam.p[0] + hx, cam.p[1], cam.p[2] + hz];
+    const s = sheet(t), c = comb(t);
+    rm.set('uOps', { __ints: 1, v: 5 }).set('uTxt', { __ints: 1, v: 6 }).set('uN', { __ints: 1, v: NOPS })
+      .set('uRo', ro).set('uTa', cam.a).set('uFL', cam.fl).set('uRoll', shot2 ? 0 : 0.0)
+      .set('uT', Math.min(t, 6.0) + (t > 6.0 ? 0 : 0)).set('uTPrint', 6.0).set('uShot', shot2 ? 1 : 0)
+      .set('uComb', c.c).set('uCombD', c.d).set('uSh', s.sh).set('uSh2', s.sh2).set('uSoak', s.soak).set('uLift', s.lift);
+    gl.activeTexture(gl.TEXTURE5); gl.bindTexture(gl.TEXTURE_2D, opTex);
+    gl.activeTexture(gl.TEXTURE6); gl.bindTexture(gl.TEXTURE_2D, txTex);
+    gl.activeTexture(gl.TEXTURE0);
+    // focus: the paint surface (shot 1) / the title (shot 2)
+    let focus, ap;
+    if (!shot2) {
+      focus = Math.hypot(ro[0] - cam.a[0], ro[1], ro[2] - cam.a[2]); ap = lerp(46, 20, inv(1.9, 3.7, t));
+      // the comb's entry: pull focus to the pin tips, then back to the paint
+      const kc = Math.sin(Math.PI * inv(3.85, 4.4, t));
+      if (kc > 0) { const cz = comb(t).c[0]; focus = lerp(focus, Math.hypot(ro[0], ro[1] - 0.15, ro[2] - cz), kc); }
+      // the lift: focus rides the rising flap
+      const kl = Track.easeRange(t, 7.25, 8.3);
+      if (kl > 0) { const L = s.lift; const mid = [0, Math.sin(L[1]) * (1.333 - L[0]) * 0.6, L[0] + Math.cos(L[1]) * (1.333 - L[0]) * 0.6]; focus = lerp(focus, Math.hypot(ro[0] - mid[0], ro[1] - mid[1], ro[2] - mid[2]), kl); }
+    }
+    else { focus = Math.hypot(ro[0], ro[1], ro[2] - 0.0); ap = 26; }
+    rm.render(t, { focus, aperture: ap, maxCoc: 12 });
+  },
+});
+</script></body></html>
